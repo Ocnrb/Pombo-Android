@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The foreground PNG already carries its safe-zone padding, and it has to:
+     the system scales whatever drawable it gets to fill the 108dp viewport, so
+     padding expressed as a layer-list item size (what this used to do) is
+     scaled away with everything else and the circular mask clips the bird. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_fg" />
+</adaptive-icon>

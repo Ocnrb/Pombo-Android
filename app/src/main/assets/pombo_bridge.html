@@ -1,0 +1,1678 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script>
+// Installed BEFORE the vendor bundle (its loggers capture console.* at load).
+// onConsoleMessage only sees the first argument's toString(), so an object
+// logged by the SDK reaches logcat as "[object Object]" — flatten everything
+// to one JSON line instead. Debugging aid only; no behaviour change.
+(function () {
+    function flat(a) {
+        if (a instanceof Error) return a.stack || (a.name + ': ' + a.message);
+        if (typeof a === 'object' && a !== null) {
+            try { return JSON.stringify(a); } catch (e) { return String(a); }
+        }
+        return String(a);
+    }
+    ['error', 'warn'].forEach(function (level) {
+        const orig = console[level].bind(console);
+        console[level] = function () {
+            orig(Array.prototype.map.call(arguments, flat).join(' '));
+        };
+    });
+})();
+</script>
+<!-- Web-app bundle (Streamr SDK + ethers + qrcode) served from assets via
+     shouldInterceptRequest — identical versions to the Pombo web. -->
+<script src="pombo-vendor.bundle.js"></script>
+</head>
+<body>
+<script>
+'use strict';
+
+// Token substituted by Kotlin before load (empty = no identity yet).
+const BRIDGE_PK = '__BRIDGE_PK__';
+
+// Polygon RPCs. The user's preference (Settings → API) is injected by Kotlin;
+// when nothing is injected we fall back to the endpoints that answer CORS in
+// a WebView (origin https://pombo.local) — some (e.g. meowrpc) don't send the
+// headers and spam the console. Kotlin already appends these safe ones after
+// the chosen preset, so a CORS-broken pick still falls through to a working
+// endpoint instead of killing the connection.
+let BRIDGE_RPCS = [];
+try { BRIDGE_RPCS = JSON.parse('__BRIDGE_RPCS__'); } catch (e) { /* not injected */ }
+const DEFAULT_RPCS = [
+    'https://polygon.drpc.org',
+    'https://polygon-bor-rpc.publicnode.com',
+    'https://rpc.ankr.com/polygon'
+];
+const RPCS = (Array.isArray(BRIDGE_RPCS) && BRIDGE_RPCS.length ? BRIDGE_RPCS : DEFAULT_RPCS)
+    .map(function (url) { return { url: url }; });
+
+// Ethereum mainnet RPCs for ENS reverse lookup (same list as the web config).
+const ENS_RPCS = [
+    'https://ethereum-rpc.publicnode.com',
+    'https://eth.drpc.org',
+    'https://cloudflare-eth.com'
+];
+let ensProviders = null;
+
+let client = null;   // StreamrClient (only with an identity)
+let wallet = null;   // ethers.Wallet of the active identity
+const subs = new Map();       // 'streamId|partition' -> subscription
+const pubChains = new Map();  // 'streamId|partition' -> promise chain (publish order)
+// 'streamId|partition' -> channel password, for BINARY payloads only (see
+// api.subscribe). Held here rather than passed per message because a
+// subscription callback has no other way to learn which channel it belongs to.
+const subPasswords = new Map();
+// Pre-agreed Streamr-layer key for /Pombo-DM-* streams (web CONFIG.dm).
+const DM_KEY_ID = 'pombo-dm-v1';
+const DM_KEY_HEX = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2';
+const dmPublishKeySet = new Set();
+// peerPublicKeyHex -> Promise<CryptoKey> (derived AES key; see api._dmKey).
+const dmSharedKeyCache = {};
+// peerAddress (lowercase) -> compressed public key hex. Registered from Kotlin
+// so the binary receive path can unwrap DM pieces WITHOUT a per-piece bridge
+// round-trip: the piece arrives on MY inbox -2/P2 and the only hint of which
+// key opens it is the publisher's address (web dm.js routeInboxMedia does the
+// same lookup).
+const dmPeerKeys = {};
+// "streamId|publisherId" pairs already put through DM decrypt recovery, so a
+// publisher that stays undecryptable does not loop the resend forever.
+const dmKeyRecovered = new Set();
+// Push wake-signal constants (web CONFIG.push). tagBytes=1 keeps 256 possible
+// tags, which is what gives K-anonymity while the user base is small.
+const PUSH_TAG_BYTES = 1;
+const PUSH_POW_DIFFICULTY = 4;
+const PUSH_POW_MAX_MS = 15000;
+
+// ---- base64 <-> UTF-8 ----
+function b64ToUtf8(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(u8);
+}
+function utf8ToB64(s) {
+    const u8 = new TextEncoder().encode(s);
+    let bin = '';
+    for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+    return btoa(bin);
+}
+function subKey(streamId, partition) { return streamId + '|' + partition; }
+
+// ---- binary <-> base64 (media data on -2/P2) ----
+// JSON cannot carry bytes: a Uint8Array put through JSON.stringify comes out
+// as {"0":12,"1":255,…} — roughly 6x the size and an object, not bytes, on the
+// far side. Every binary payload crosses this bridge as base64 instead.
+function b64ToU8(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+}
+// Chunked at 0x8000: String.fromCharCode.apply spreads the array into
+// arguments, so a whole 240 KB piece in one call overflows the stack.
+function u8ToB64(u8) {
+    let s = '';
+    const CH = 0x8000;
+    for (let i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+    return btoa(s);
+}
+// ---- password-channel crypto for binary payloads ----
+//
+// Same wire format as web crypto.js encryptBinary/decryptBinary: the raw bytes
+// salt[16] || iv[12] || AES-GCM ciphertext+tag. NOT base64 — unlike the JSON
+// path, a binary payload stays binary on the wire.
+//
+// This lives here rather than in Kotlin for the reason already documented on
+// pwDecryptBatch: PBKDF2-310k through Bouncy Castle costs ~1s per call on a
+// phone, while Chromium runs it in native BoringSSL. At one derivation per
+// piece the Kotlin route would spend minutes of CPU on a single file.
+const PW_ITERATIONS = 310000;
+const PW_KEY_CACHE_MAX = 10;
+const pwKeyCache = new Map(); // 'password|saltHex' -> Promise<CryptoKey> (LRU)
+
+// PERFORMANCE NOTE — worth revisiting.
+// Both this cache and the web's (crypto.js getCachedKey) are keyed by
+// password AND salt, and every encrypt generates a FRESH RANDOM salt. So for
+// outgoing pieces the cache never hits, and for incoming ones it only hits if
+// the sender happened to reuse a salt. Every single piece therefore pays a
+// full 310k-iteration derivation on both sides.
+//
+// The fix is for a sender to derive ONE salt per file and reuse it across that
+// file's pieces, keeping the IV random per piece. That is wire-compatible
+// (nothing in the format demands a unique salt) and cryptographically sound:
+// what must never repeat under one key is the IV, not the salt, and a per-file
+// random salt still blocks precomputation across channels. It would make the
+// cache hit for every piece after the first and cut key derivation to once per
+// file, on both sides.
+//
+// Not done yet because it changes the WEB's publish path too, and both ends
+// must agree before it is worth anything. See MediaController.kt.
+async function pwDeriveKey(password, salt) {
+    let saltHex = '';
+    for (let i = 0; i < salt.length; i++) saltHex += salt[i].toString(16).padStart(2, '0');
+    const cacheKey = password + '|' + saltHex;
+    const hit = pwKeyCache.get(cacheKey);
+    if (hit) {
+        // Re-insert so the Map's insertion order stays the LRU order.
+        pwKeyCache.delete(cacheKey);
+        pwKeyCache.set(cacheKey, hit);
+        return hit;
+    }
+    const promise = (async function () {
+        const km = await crypto.subtle.importKey(
+            'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+        return crypto.subtle.deriveKey(
+            { name: 'PBKDF2', salt: salt, iterations: PW_ITERATIONS, hash: 'SHA-256' },
+            km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    })();
+    pwKeyCache.set(cacheKey, promise);
+    // A rejected derivation must not be cached, or the failure is permanent.
+    promise.catch(function () { pwKeyCache.delete(cacheKey); });
+    if (pwKeyCache.size > PW_KEY_CACHE_MAX) {
+        pwKeyCache.delete(pwKeyCache.keys().next().value);
+    }
+    return promise;
+}
+
+async function pwEncryptBinary(data, password) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await pwDeriveKey(password, salt);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, data));
+    const out = new Uint8Array(16 + 12 + ct.length);
+    out.set(salt, 0);
+    out.set(iv, 16);
+    out.set(ct, 28);
+    return out;
+}
+
+// Text/JSON variants of the same scheme, for the media SIGNAL partition.
+// Wire form is base64(salt||iv||ct) — a JSON string on the wire, exactly what
+// PomboCrypto.encryptString and web cryptoManager.encrypt produce.
+//
+// These exist so signals stop paying Bouncy Castle's ~1s PBKDF2 in Kotlin.
+// One signal per file would not matter; one piece_request PER PIECE does —
+// a 113 MB file is ~512 pieces, which is over eight minutes of key derivation
+// spent only on ASKING for the data.
+async function pwEncryptString(plaintext, password) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await pwDeriveKey(password, salt);
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: iv }, key, new TextEncoder().encode(plaintext)));
+    const out = new Uint8Array(16 + 12 + ct.length);
+    out.set(salt, 0);
+    out.set(iv, 16);
+    out.set(ct, 28);
+    return u8ToB64(out);
+}
+
+async function pwDecryptString(b64, password) {
+    const u8 = b64ToU8(b64);
+    if (u8.length < 28 + 16) throw new Error('payload too short to be encrypted');
+    const key = await pwDeriveKey(password, u8.slice(0, 16));
+    const pt = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: u8.slice(16, 28) }, key, u8.slice(28));
+    return new TextDecoder().decode(pt);
+}
+
+async function pwDecryptBinary(buf, password) {
+    // 28 bytes of header and a GCM tag of 16: anything shorter cannot be a
+    // valid payload, and slicing it would hand AES-GCM nonsense to reject
+    // slowly instead of rejecting it here.
+    if (buf.length < 28 + 16) throw new Error('binary payload too short to be encrypted');
+    const key = await pwDeriveKey(password, buf.slice(0, 16));
+    const plain = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: buf.slice(16, 28) }, key, buf.slice(28));
+    return new Uint8Array(plain);
+}
+
+// The SDK may hand back a Uint8Array, an ArrayBuffer or a Buffer-like view
+// depending on the path; returns null for anything that is not bytes, which is
+// how the subscribe callback tells binary from JSON.
+function asU8(content) {
+    if (content instanceof Uint8Array) return content;
+    if (content instanceof ArrayBuffer) return new Uint8Array(content);
+    if (content && content.buffer instanceof ArrayBuffer && typeof content.byteLength === 'number') {
+        return new Uint8Array(content.buffer, content.byteOffset || 0, content.byteLength);
+    }
+    return null;
+}
+
+// ---- API exposed to Kotlin via bridgeCall ----
+const api = {
+
+    // ===== ethers (identity) — work without a connected client =====
+
+    async createWallet() {
+        const w = window.ethers.Wallet.createRandom();
+        return { address: w.address, privateKey: w.privateKey, mnemonic: w.mnemonic ? w.mnemonic.phrase : null };
+    },
+
+    async walletFromPrivateKey(a) {
+        const w = new window.ethers.Wallet(String(a.privateKey).trim());
+        return { address: w.address, privateKey: w.privateKey };
+    },
+
+    async walletFromMnemonic(a) {
+        const w = window.ethers.Wallet.fromPhrase(String(a.phrase).trim());
+        return { address: w.address, privateKey: w.privateKey };
+    },
+
+    // Signs the Pombo canonical hash: keccak256(utf8(data)) -> personal_sign of the hex.
+    // Byte-compatible with identityManager.createMessageHash + authManager.signMessage.
+    async signCanonical(a) {
+        if (!wallet) throw new Error('no identity');
+        const hash = window.ethers.keccak256(window.ethers.toUtf8Bytes(a.data));
+        const signature = await wallet.signMessage(hash);
+        return { hash: hash, signature: signature };
+    },
+
+    async verifyCanonical(a) {
+        const hash = window.ethers.keccak256(window.ethers.toUtf8Bytes(a.data));
+        const address = window.ethers.verifyMessage(hash, a.signature);
+        return { address: address };
+    },
+
+    // ===== Streamr (transport) =====
+
+    // `a.password` (optional) encrypts the payload here instead of in Kotlin.
+    // Only the media signal partition passes it — every other caller keeps
+    // sealing in PomboCrypto and hands us the finished string, so nothing else
+    // changes behaviour. The reason is the same one behind pwDecryptBatch:
+    // BoringSSL, not Bouncy Castle, on a path that runs once per piece.
+    async publish(a) {
+        if (!client) throw new Error('client not connected');
+        const key = subKey(a.streamId, a.partition);
+        const content = a.password
+            ? await pwEncryptString(JSON.stringify(a.content), String(a.password))
+            : a.content;
+        const prev = pubChains.get(key) || Promise.resolve();
+        const next = prev.catch(function () {}).then(function () {
+            return client.publish({ streamId: a.streamId, partition: a.partition }, content);
+        });
+        pubChains.set(key, next);
+        const msg = await next;
+        // The network-assigned timestamp — the storage-file announce confirm loop
+        // matches the published announce against stored rows by timestamp. Shapes
+        // vary across SDK versions; fall back to null (caller uses local time).
+        var ts = null;
+        if (msg && typeof msg.timestamp === 'number') ts = msg.timestamp;
+        else if (msg && msg.streamMessage && typeof msg.streamMessage.getTimestamp === 'function') ts = msg.streamMessage.getTimestamp();
+        return { ok: true, timestamp: ts };
+    },
+
+    // `a.password` is used ONLY for binary payloads (-2/P2 pieces), which are
+    // unwrapped in the callback below. JSON messages keep being decrypted in
+    // Kotlin (PomboCrypto) as before — they are low-rate and already work, and
+    // moving them would be a behaviour change for every existing flow.
+    async subscribe(a) {
+        if (!client) throw new Error('client not connected');
+        const key = subKey(a.streamId, a.partition);
+        if (a.password) subPasswords.set(key, String(a.password));
+        // Idempotent, which is what lets Kotlin call ensureMediaPartitions
+        // freely without keeping its own registry of what is open. The password
+        // is still refreshed above, so re-subscribing can correct it.
+        if (subs.has(key)) return { ok: true, already: true };
+        const sub = await client.subscribe({ streamId: a.streamId, partition: a.partition }, function (content, meta) {
+            try {
+                // Publisher identity the way web streamr.js reads it:
+                // getPublisherId() FIRST, the bare property only as fallback.
+                // The two are not always the same value, and the difference is
+                // not cosmetic — media transfers address a named seeder, so a
+                // wrong publisher id makes every piece_request name a peer that
+                // is not the one holding the file, and every request is ignored.
+                var pid = null;
+                try {
+                    if (meta && typeof meta.getPublisherId === 'function') pid = meta.getPublisherId();
+                    else if (meta && meta.publisherId != null) pid = meta.publisherId;
+                } catch (e) { pid = (meta && meta.publisherId) || null; }
+                if (pid != null && meta && meta.publisherId != null &&
+                    String(pid).toLowerCase() !== String(meta.publisherId).toLowerCase()) {
+                    console.warn('publisherId mismatch on ' + a.streamId + '#' + a.partition +
+                        ': getPublisherId=' + pid + ' property=' + meta.publisherId);
+                }
+                const metaOut = {
+                    publisherId: pid != null ? String(pid) : null,
+                    timestamp: meta ? meta.timestamp : null,
+                    sequenceNumber: meta ? meta.sequenceNumber : null
+                };
+                // Binary (file pieces on -2/P2) goes to its own callback so the
+                // bytes never touch JSON.stringify. Checked first: a Uint8Array
+                // IS stringifiable, so the JSON path would silently accept and
+                // mangle it rather than fail.
+                const bin = asU8(content);
+                if (bin) {
+                    // Decrypted here, not in Kotlin, and not via a follow-up
+                    // bridge call: the bytes are already in this context, so
+                    // doing it now avoids bouncing every piece back and forth
+                    // (base64 out, base64 in) just to unwrap it.
+                    const pw = subPasswords.get(key);
+                    const deliver = function (u8) {
+                        Native.binary(a.streamId, a.partition,
+                            u8ToB64(u8),
+                            utf8ToB64(JSON.stringify(metaOut)));
+                    };
+                    if (pw) {
+                        pwDecryptBinary(bin, pw).then(function (u8) {
+                            deliver(u8);
+                        }, function (e) {
+                            // A piece we cannot open is dropped, not delivered:
+                            // handing the ciphertext up would fail its hash
+                            // check and get the sender blamed as a bad seeder.
+                            console.warn('binary decrypt failed on ' + a.streamId +
+                                '#' + a.partition + ': ' + (e && e.message || e));
+                        });
+                    } else if (wallet && String(a.streamId).toLowerCase() ===
+                            wallet.address.toLowerCase() + '/pombo-dm-2') {
+                        // A binary on MY OWN DM inbox is a piece sealed with the
+                        // pair's ECDH key ([12B iv][ct+tag], dmCrypto format).
+                        // The only hint of which key opens it is the publisher —
+                        // Kotlin registers each conversation's public key via
+                        // registerDmPeerKey; an unregistered sender is dropped
+                        // (same silence as an unopenable password piece).
+                        const pub = metaOut.publisherId ? String(metaOut.publisherId).toLowerCase() : '';
+                        const peerPk = dmPeerKeys[pub];
+                        if (!peerPk) {
+                            console.warn('DM piece from unregistered peer ' + pub + ' — dropped');
+                            return;
+                        }
+                        api._dmKey(peerPk).then(function (key) {
+                            return crypto.subtle.decrypt(
+                                { name: 'AES-GCM', iv: bin.slice(0, 12) }, key, bin.slice(12));
+                        }).then(function (pt) {
+                            deliver(new Uint8Array(pt));
+                        }, function (e) {
+                            console.warn('DM binary decrypt failed from ' + pub + ': ' +
+                                (e && e.message || e));
+                        });
+                    } else {
+                        deliver(bin);
+                    }
+                    return;
+                }
+                // A password registered for THIS subscription means the payload
+                // is a sealed base64 string. Only the media partitions register
+                // one, so every other stream still reaches Kotlin sealed and is
+                // opened there as before.
+                //
+                // Without this, media signals on a password channel arrived as
+                // an opaque string, failed the JSONObject cast in the media
+                // controller and were dropped in silence — a download would sit
+                // on "looking for seeders" forever while the seeder was in fact
+                // answering every single request.
+                const signalPw = subPasswords.get(key);
+                if (signalPw && typeof content === 'string') {
+                    pwDecryptString(content, signalPw).then(function (plain) {
+                        Native.message(a.streamId, a.partition,
+                            utf8ToB64(plain), utf8ToB64(JSON.stringify(metaOut)));
+                    }, function (e) {
+                        console.warn('signal decrypt failed on ' + a.streamId + '#' +
+                            a.partition + ': ' + (e && e.message || e));
+                    });
+                    return;
+                }
+                Native.message(a.streamId, a.partition,
+                    utf8ToB64(JSON.stringify(content)),
+                    utf8ToB64(JSON.stringify(metaOut)));
+            } catch (e) { /* never let the SDK callback throw */ }
+        });
+        subs.set(key, sub);
+        // Live decrypt failures never reach the message callback and are
+        // silent without this. On DM streams they are recoverable (a first
+        // message from an unknown publisher), so route them to the handler.
+        try {
+            if (typeof sub.on === 'function') {
+                sub.on('error', function (err) { api._onSubError(err, a.streamId, a.partition); });
+            }
+        } catch (e) { /* older SDKs without subscription events */ }
+        return { ok: true };
+    },
+
+    // Web streamr.js handleDMDecryptError: a DECRYPT_ERROR on a /Pombo-DM-*
+    // stream means a publisher we never registered the fixed Pombo key for
+    // (subscribeMyInbox only registers self + existing DM peers). Register it
+    // and replay the window FROM STORAGE — the key is local, so this works
+    // even when the publisher is offline or unicast-unreachable, which is
+    // exactly when the SDK's own key request dies.
+    async _onSubError(err, streamId, partition) {
+        try {
+            var msg = err && err.message ? String(err.message) : String(err);
+            if (String(streamId).toLowerCase().indexOf('/pombo-dm-') === -1) {
+                console.warn('subscription error on ' + streamId + '#' + partition + ': ' + msg);
+                return;
+            }
+            var mid = err ? err.messageId : null;
+            if (typeof mid === 'string') { try { mid = JSON.parse(mid); } catch (e) { mid = null; } }
+            var pub = mid && mid.publisherId ? String(mid.publisherId) : null;
+            if (!pub) {
+                var m = msg.match(/(0x[0-9a-fA-F]{40})/);
+                pub = m ? m[1] : null;
+            }
+            if (!pub) { console.warn('DM subscription error (no publisher): ' + msg); return; }
+            pub = pub.toLowerCase();
+            var recKey = streamId + '#' + partition + '|' + pub;
+            if (dmKeyRecovered.has(recKey)) return;
+            dmKeyRecovered.add(recKey);
+            console.warn('DM decrypt recovery: registering key for ' + pub + ' on ' + streamId + '#' + partition);
+            await api.addDMDecryptKey({ publisherId: pub });
+            var ts = (mid && mid.timestamp) || Date.now();
+            // Small delay so the key store settles before the replay (web: 500ms).
+            setTimeout(async function () {
+                try {
+                    var stream = await client.resend(
+                        { streamId: streamId, partition: partition },
+                        { from: { timestamp: ts - 60000 }, to: { timestamp: ts + 60000 } });
+                    var n = 0;
+                    await api._drainResend(stream, function (m2) {
+                        if (String(m2.publisherId).toLowerCase() !== pub) return;
+                        try {
+                            Native.message(streamId, partition,
+                                utf8ToB64(JSON.stringify(m2.content)),
+                                utf8ToB64(JSON.stringify({
+                                    publisherId: String(m2.publisherId),
+                                    timestamp: m2.timestamp,
+                                    sequenceNumber: null
+                                })));
+                            n++;
+                        } catch (e) { /* keep draining */ }
+                    }, Date.now() + 15000);
+                    console.warn('DM decrypt recovery: replayed ' + n + ' message(s) from ' + pub);
+                } catch (e) {
+                    console.warn('DM decrypt recovery failed: ' + (e && e.message ? e.message : e));
+                }
+            }, 500);
+        } catch (e) { /* an error handler must never throw */ }
+    },
+
+    async unsubscribe(a) {
+        const key = subKey(a.streamId, a.partition);
+        subPasswords.delete(key);
+        const sub = subs.get(key);
+        if (sub) { subs.delete(key); await sub.unsubscribe(); }
+        return { ok: true };
+    },
+
+    // Drain a resend stream the way the web's fetchHistory does: a manual
+    // iterator with a per-message try/catch, skipping DECRYPT_ERROR and
+    // carrying on. A `for await` loop aborts on the FIRST message it cannot
+    // decrypt — and only after the SDK has waited out its group-key request to
+    // the publisher — so one foreign key made a private room hang for ~30s and
+    // then show nothing at all instead of the rest of its history.
+    // `deadlineAt` (epoch ms) is a soft budget: when the drain overruns it —
+    // key-request waits on messages from offline members are the usual cause —
+    // iteration stops and whatever was already collected is RETURNED instead
+    // of the whole page dying in the caller's hard timeout with nothing to
+    // show. Returns true when the drain was cut short.
+    // `ctx` ({streamId, partition}, optional): on DM streams a skipped
+    // DECRYPT_ERROR is handed to the same recovery as live errors, so a stored
+    // invite/DM from a publisher we never registered still gets replayed once
+    // the fixed key is in place.
+    async _drainResend(stream, push, deadlineAt, ctx) {
+        const iterator = stream[Symbol.asyncIterator]();
+        let done = false;
+        while (!done) {
+            if (deadlineAt && Date.now() > deadlineAt) {
+                try { if (iterator.return) iterator.return(); } catch (e) { /* best effort */ }
+                return true;
+            }
+            try {
+                const result = await iterator.next();
+                done = result.done;
+                if (done) break;
+                push(result.value);
+            } catch (iterError) {
+                if (iterError && (iterError.code === 'DECRYPT_ERROR' ||
+                    (iterError.message && iterError.message.indexOf('encryption key') !== -1))) {
+                    if (ctx && String(ctx.streamId).toLowerCase().indexOf('/pombo-dm-') !== -1) {
+                        api._onSubError(iterError, ctx.streamId, ctx.partition);
+                    }
+                    continue;
+                }
+                console.warn('resend iteration error: ' +
+                    (iterError && iterError.message ? iterError.message : String(iterError)));
+                continue;
+            }
+        }
+        return false;
+    },
+
+    // Batch password decrypt via WebCrypto (same wire format as web crypto.js:
+    // base64(salt16 || iv12 || GCM ct+tag), PBKDF2-SHA256 310k -> AES-256).
+    // Kotlin's PBKDF2WithHmacSHA256 comes from Bouncy Castle in pure Java and
+    // costs ~1s per message on a phone — a 50-message page took 7.5s even
+    // decrypted in parallel. Chrome runs PBKDF2 in native BoringSSL, which is
+    // why the PWA is fast on the same CPU; doing the page here restores that,
+    // and issuing every derivation before awaiting lets Chromium's worker pool
+    // overlap them. Entries that fail (wrong key, corrupt payload) return null.
+    async pwDecryptBatch(a) {
+        const pwKey = await api._pwKey(a.password);
+        const plain = await Promise.all(a.items.map(function (b64) {
+            return api._pwOpen(pwKey, b64);
+        }));
+        return { plain: plain };
+    },
+
+    _pwKey(password) {
+        return crypto.subtle.importKey(
+            'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+    },
+
+    // One sealed payload -> plaintext string, or null on any failure (wrong
+    // key, corrupt payload, not actually sealed).
+    async _pwOpen(pwKey, b64) {
+        try {
+            const bin = atob(b64);
+            const u8 = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+            const salt = u8.slice(0, 16), iv = u8.slice(16, 28), ct = u8.slice(28);
+            const key = await crypto.subtle.deriveKey(
+                { name: 'PBKDF2', salt: salt, iterations: 310000, hash: 'SHA-256' },
+                pwKey, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+            const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ct);
+            return new TextDecoder().decode(pt);
+        } catch (e) { return null; }
+    },
+
+    // Opens sealed rows AS THEY ARRIVE off the resend iterator, instead of after
+    // the whole page has landed.
+    //
+    // A password channel used to pay for the page crossing the bridge THREE
+    // times: the ciphertext out to Kotlin, the same ciphertext back in for
+    // pwDecryptBatch, then the plaintext out again — and no PBKDF2 could start
+    // until the last row of the resend had arrived. Here each row's derivation
+    // begins the moment it is drained, so 310k iterations per message overlap
+    // the network wait for the rows still coming.
+    //
+    // _drainResend's push must stay synchronous (crypto.subtle is async), so
+    // each promise is parked and awaited once at the end.
+    //
+    // A decrypted row carries a PARSED object in `content`. That is what lets
+    // the Kotlin side pass it straight through: its predecrypt only re-decrypts
+    // rows whose content is still a string. Rows that fail lose `content`
+    // altogether and are dropped downstream, exactly as a null batch entry was.
+    _sealedOpener(pwKey) {
+        const jobs = [];
+        return {
+            take: function (rec) {
+                if (!pwKey || typeof rec.content !== 'string') return;
+                jobs.push(api._pwOpen(pwKey, rec.content).then(function (txt) {
+                    if (txt == null) { delete rec.content; return; }
+                    try { rec.content = JSON.parse(txt); } catch (e) { delete rec.content; }
+                }));
+            },
+            done: function () { return jobs.length ? Promise.all(jobs) : Promise.resolve(); }
+        };
+    },
+
+    // History via storage-node resend (last N) — returns everything in an array.
+    // With `password`, sealed rows are opened during the drain (see
+    // _sealedOpener) and come back as parsed objects.
+    async resend(a) {
+        if (!client) throw new Error('client not connected');
+        const pwKey = a.password ? await api._pwKey(a.password) : null;
+        const stream = await client.resend(
+            { streamId: a.streamId, partition: a.partition },
+            { last: a.last || 50 }
+        );
+        const out = [];
+        const opener = api._sealedOpener(pwKey);
+        const t0 = Date.now();
+        const partial = await api._drainResend(stream, function (msg) {
+            const rec = {
+                content: msg.content,
+                meta: {
+                    publisherId: msg.publisherId != null ? String(msg.publisherId) : null,
+                    timestamp: msg.timestamp
+                }
+            };
+            out.push(rec);
+            opener.take(rec);
+        }, Date.now() + (a.budgetMs || 40000), { streamId: a.streamId, partition: a.partition });
+        const tDrain = Date.now();
+        await opener.done();
+        // drainMs = network. decryptMs = the crypto TAIL only, i.e. the part
+        // that found no network wait left to hide behind. A large tail means
+        // PBKDF2 is the wall, not the storage node.
+        return {
+            messages: out, partial: partial,
+            drainMs: tDrain - t0, decryptMs: Date.now() - tDrain
+        };
+    },
+
+    // Older history for scroll-up pagination — mirror of streamr.js
+    // `fetchOlderHistory`: range resend from epoch to `before` (INCLUSIVE upper
+    // bound; the caller dedups the boundary message by id, so messages sharing
+    // the boundary millisecond are never skipped), then keep only the newest
+    // `last` entries. hasMore is true when the range held more than that.
+    async resendRange(a) {
+        if (!client) throw new Error('client not connected');
+        const pwKey = a.password ? await api._pwKey(a.password) : null;
+        const stream = await client.resend(
+            { streamId: a.streamId, partition: a.partition },
+            { from: { timestamp: 0 }, to: { timestamp: a.before } }
+        );
+        const all = [];
+        const opener = api._sealedOpener(pwKey);
+        const partial = await api._drainResend(stream, function (msg) {
+            const rec = {
+                content: msg.content,
+                meta: {
+                    publisherId: msg.publisherId != null ? String(msg.publisherId) : null,
+                    timestamp: msg.timestamp
+                }
+            };
+            all.push(rec);
+            opener.take(rec);
+        }, Date.now() + (a.budgetMs || 40000), { streamId: a.streamId, partition: a.partition });
+        await opener.done();
+        // The resend iterator order is not guaranteed; sort ASC before slicing.
+        all.sort((x, y) => (x.meta.timestamp || 0) - (y.meta.timestamp || 0));
+        const count = a.last || 50;
+        const start = Math.max(0, all.length - count);
+        // A cut-short drain cannot prove exhaustion — keep pagination alive.
+        return { messages: all.slice(start), hasMore: all.length > count || partial, partial: partial };
+    },
+
+    // Bounded time-window resend, for DM pagination (streamr.js
+    // fetchOlderHistoryWindowed). A DM inbox holds every peer's messages, so a
+    // count-based `last: N` would be swallowed by busier conversations; a time
+    // window returns whatever this peer actually sent in that range, even if
+    // that is nothing.
+    async resendWindow(a) {
+        if (!client) throw new Error('client not connected');
+        const windowStart = Math.max(0, a.before - a.windowMs);
+        const windowEnd = a.before - 1;
+        const stream = await client.resend(
+            { streamId: a.streamId, partition: a.partition },
+            { from: { timestamp: windowStart }, to: { timestamp: windowEnd } }
+        );
+        const out = [];
+        const partial = await api._drainResend(stream, function (msg) {
+            out.push({
+                content: msg.content,
+                meta: {
+                    publisherId: msg.publisherId != null ? String(msg.publisherId) : null,
+                    timestamp: msg.timestamp
+                }
+            });
+        }, Date.now() + (a.budgetMs || 40000), { streamId: a.streamId, partition: a.partition });
+        // Reaching epoch means there is nothing older left to scan.
+        return { messages: out, hasMore: windowStart > 0 || partial, windowStart: windowStart, partial: partial };
+    },
+
+    // Owner-only channel edit — one on-chain tx that rewrites the Pombo JSON
+    // held in the stream description (streamr.js updateStreamMetadata).
+    async updateStreamMetadata(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        if (!stream) throw new Error('Stream not found');
+        let meta = {};
+        try {
+            const desc = await stream.getDescription();
+            meta = desc ? JSON.parse(desc) : {};
+        } catch (e) { meta = {}; }
+        if (typeof a.name === 'string') meta.n = a.name;
+        if (typeof a.description === 'string') meta.d = a.description;
+        await stream.setDescription(JSON.stringify(meta));
+        return { ok: true };
+    },
+
+    // Storage assignment for a stream (nodes + retention).
+    async getStreamStorageInfo(a) {
+        if (!client) throw new Error('client not connected');
+        try {
+            const stream = await client.getStream(a.streamId);
+            const res = stream.getStorageNodes();
+            let nodes = [];
+            if (Array.isArray(res)) nodes = res;
+            else if (res && typeof res.then === 'function') nodes = await res;
+            else if (res && typeof res[Symbol.asyncIterator] === 'function') {
+                for await (const n of res) nodes.push(n);
+            } else if (res && typeof res[Symbol.iterator] === 'function') nodes = [...res];
+            // Retention only exists once a node is assigned, and the call fails
+            // outright when the node never had a TTL set — hence best-effort.
+            let storageDays = null;
+            if (nodes.length > 0) {
+                try {
+                    const d = await stream.getStorageDayCount();
+                    if (d !== null && d !== undefined) {
+                        storageDays = typeof d === 'bigint' ? Number(d) : Number(d);
+                    }
+                } catch (e) { /* TTL not set on this node */ }
+            }
+            return {
+                enabled: nodes.length > 0,
+                nodes: nodes.map(function (n) { return String(n); }),
+                storageDays: storageDays
+            };
+        } catch (e) {
+            return { enabled: false, nodes: [], storageDays: null };
+        }
+    },
+
+    async removeFromStorageNode(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        await stream.removeFromStorageNode(a.nodeAddress);
+        return { ok: true };
+    },
+
+    async setStorageDays(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        await stream.setStorageDayCount(a.storageDays);
+        return { ok: true };
+    },
+
+    // Delete one stream on-chain. Mirrors streamr.js deleteStream's per-stream
+    // half: "stream does not exist" counts as success, because the caller may
+    // be retrying after a partial delete or the channel may predate -3.
+    // The caller deletes -1/-2/-3 separately so a failure on one is visible
+    // rather than silently aborting the rest.
+    async deleteStream(a) {
+        if (!client) throw new Error('client not connected');
+        try {
+            await client.deleteStream(a.streamId);
+            return { ok: true, deleted: true };
+        } catch (e) {
+            const msg = String(e?.reason || e?.message || e || '');
+            if (/streamDoesNotExist|stream.*does.*not.*exist|stream.*not.*found/i.test(msg)) {
+                return { ok: true, deleted: false, alreadyGone: true };
+            }
+            throw e;
+        }
+    },
+
+    async getAddress() {
+        if (!client) throw new Error('client not connected');
+        return { address: await client.getAddress() };
+    },
+
+    // ===== ENS (mainnet reverse lookup, like identity.js resolveENS) =====
+
+    async resolveEns(a) {
+        var addr = String(a.address || '');
+        if (!ensProviders) {
+            ensProviders = ENS_RPCS.map(function (u) {
+                try { return new window.ethers.JsonRpcProvider(u, 1, { staticNetwork: true }); }
+                catch (e) { return null; }
+            }).filter(Boolean);
+        }
+        for (var i = 0; i < ensProviders.length; i++) {
+            try {
+                var name = await ensProviders[i].lookupAddress(addr);
+                if (name) return { name: name };
+            } catch (e) { /* try the next provider */ }
+        }
+        return { name: null };
+    },
+
+    // ENS avatar text record (identity.js _doResolveENSAvatar). ipfs:// is
+    // rewritten to the gateway; anything not https:/data: is rejected.
+    async resolveEnsAvatar(a) {
+        var name = String(a.name || '');
+        if (!name) return { url: null };
+        // Initialize the provider list like resolveEns does. This function
+        // used to bail out when it was null — and when every NAME was already
+        // cached on the Kotlin side (disk cache or the ensCache sync slice),
+        // the avatar lookup was the FIRST ENS call of the session, so every
+        // avatar resolved to null without ever touching the network.
+        if (!ensProviders) {
+            ensProviders = ENS_RPCS.map(function (u) {
+                try { return new window.ethers.JsonRpcProvider(u, 1, { staticNetwork: true }); }
+                catch (e) { return null; }
+            }).filter(Boolean);
+        }
+        for (var i = 0; i < ensProviders.length; i++) {
+            try {
+                var resolver = await ensProviders[i].getResolver(name);
+                if (!resolver) continue;
+                var rec = await resolver.getText('avatar');
+                if (!rec) continue;
+                var url = rec;
+                if (url.indexOf('ipfs://') === 0) {
+                    // cloudflare-ipfs.com is DEAD (gateway shut down) — it was
+                    // why fresh installs never loaded ipfs:// avatars.
+                    url = 'https://ipfs.io/ipfs/' + url.slice(7);
+                }
+                if (url.indexOf('https://') !== 0 && url.indexOf('data:') !== 0) continue;
+                return { url: url };
+            } catch (e) { /* try the next provider */ }
+        }
+        return { url: null };
+    },
+
+    // Forward ENS resolution (name -> address), for adding a member by name.
+    async resolveEnsName(a) {
+        var name = String(a.name || '').trim();
+        if (!name) return { address: null };
+        if (!ensProviders) {
+            ensProviders = ENS_RPCS.map(function (u) {
+                try { return new window.ethers.JsonRpcProvider(u, 1, { staticNetwork: true }); }
+                catch (e) { return null; }
+            }).filter(Boolean);
+        }
+        for (var i = 0; i < ensProviders.length; i++) {
+            try {
+                var addr = await ensProviders[i].resolveName(name);
+                if (addr) return { address: addr };
+            } catch (e) { /* try the next provider */ }
+        }
+        return { address: null };
+    },
+
+    // ===== DMs (E2E) — byte-compatible with dmCrypto.js =====
+
+    // ===== push notifications (wake signals) =====
+    //
+    // Mirror of pushProtocol.js. The proof-of-work loop runs here rather than
+    // in Kotlin so it uses the very same ethers keccak256 the relay validates
+    // against — reimplementing the hash natively would risk a silent mismatch,
+    // and round-tripping each iteration over the bridge would be far too slow.
+    // Tag only, no proof of work — registration does not need one, and the
+    // relay only validates PoW on wake signals.
+    async pushTag(a) {
+        var eth = window.ethers;
+        if (!eth) throw new Error('ethers not available');
+        var streamId = String(a.streamId || '').toLowerCase();
+        if (!streamId) throw new Error('Invalid streamId');
+        var prefix = a.native ? 'native:' : 'channel:';
+        var tagHexChars = 2 + (PUSH_TAG_BYTES * 2);
+        return { tag: eth.keccak256(eth.toUtf8Bytes(prefix + streamId)).slice(0, tagHexChars) };
+    },
+
+    async pushWakePayload(a) {
+        var eth = window.ethers;
+        if (!eth) throw new Error('ethers not available');
+        var streamId = String(a.streamId || '').toLowerCase();
+        if (!streamId) throw new Error('Invalid streamId');
+
+        // 'native:' ONLY for native channels; public, password AND DMs use
+        // 'channel:' (a DM wakes the peer's inbox under its channel tag —
+        // web dm.js → sendChannelWakeSignal).
+        var prefix = a.native ? 'native:' : 'channel:';
+        var tagHexChars = 2 + (PUSH_TAG_BYTES * 2);
+        var tag = eth.keccak256(eth.toUtf8Bytes(prefix + streamId)).slice(0, tagHexChars);
+
+        var difficulty = a.difficulty || PUSH_POW_DIFFICULTY;
+        var target = '0'.repeat(difficulty);
+        // 10-second epoch is entropy against replay; the relay recomputes it.
+        var epoch = Math.floor(Date.now() / 10000);
+        var startTime = Date.now();
+        var nonce = 0;
+        while (Date.now() - startTime < PUSH_POW_MAX_MS) {
+            var pow = eth.keccak256(eth.toUtf8Bytes(tag + ':' + epoch + ':' + nonce));
+            if (pow.slice(2).indexOf(target) === 0) {
+                return {
+                    payload: {
+                        type: 'notification',
+                        tag: tag,
+                        pow: pow,
+                        nonce: nonce,
+                        epoch: epoch,
+                        channelType: a.native ? 'private' : 'public',
+                        timestamp: Date.now()
+                    }
+                };
+            }
+            nonce++;
+        }
+        throw new Error('PoW timeout - could not find valid nonce');
+    },
+
+    // ===== Streamr-layer DM key =====
+    //
+    // Pombo pre-agrees one symmetric key for every /Pombo-DM-* stream instead
+    // of running Streamr key exchange. It ships in the public web bundle, so
+    // it is not a secret — the real end-to-end protection is the per-pair ECDH
+    // envelope on top. Without it we cannot read anything the web published
+    // ("Could not get encryption key pombo-dm-v1") and the web cannot read us.
+    _pomboKey() {
+        if (!window.EncryptionKey || !window.ethers) return null;
+        var bytes = window.ethers.getBytes('0x' + DM_KEY_HEX);
+        var data;
+        if (typeof Buffer !== 'undefined' && Buffer.from) {
+            data = Buffer.from(DM_KEY_HEX, 'hex');
+        } else {
+            // No Buffer global in the WebView (the web app gets one from its
+            // bundler). The SDK only gates on `Buffer.isBuffer`, which is
+            // `e._isBuffer === true`, so a tagged Uint8Array satisfies it and
+            // carries the same 32 bytes.
+            data = bytes;
+            Object.defineProperty(data, '_isBuffer', { value: true, enumerable: false });
+        }
+        return new window.EncryptionKey(DM_KEY_ID, data);
+    },
+
+    async setDMPublishKey(a) {
+        if (!client) return { ok: false };
+        var streamId = String(a.streamId || '');
+        if (streamId.toLowerCase().indexOf('/pombo-dm-') === -1) return { ok: false };
+        if (dmPublishKeySet.has(streamId)) return { ok: true };
+        try {
+            var key = api._pomboKey();
+            if (!key) return { ok: false };
+            if (typeof client.updateEncryptionKey === 'function') {
+                // 'rekey', not 'rotate', matching the web (streamr.js
+                // setDMPublishKey). A rotation announces the new key WRAPPED IN
+                // THE CURRENT ONE, so a subscriber that never held a previous
+                // key cannot unwrap it and has to fall back to a live key
+                // request to the publisher. A rekey is distributed per entitled
+                // subscriber, which is the case that matters here: the first DM
+                // from a stranger, whose publisher id the receiver has not
+                // registered yet. Both sides pre-load this same fixed key
+                // locally (addDMDecryptKey), so in practice the distribution
+                // rarely runs — but when it does, this is the one that works.
+                await client.updateEncryptionKey({ streamId: streamId, distributionMethod: 'rekey', key: key });
+                dmPublishKeySet.add(streamId);
+            }
+            return { ok: true };
+        } catch (e) {
+            // Non-fatal: a rekey can fail if one is already in flight.
+            return { ok: false, error: String(e && e.message || e) };
+        }
+    },
+
+    async addDMDecryptKey(a) {
+        if (!client) return { ok: false };
+        try {
+            var key = api._pomboKey();
+            if (!key) return { ok: false };
+            if (typeof client.addEncryptionKey === 'function') {
+                await client.addEncryptionKey(key, String(a.publisherId).toLowerCase());
+            }
+            return { ok: true };
+        } catch (e) {
+            return { ok: false, error: String(e && e.message || e) };
+        }
+    },
+
+    // Compressed public key of the active identity (33 bytes hex).
+    async getMyPublicKey() {
+        if (!wallet) throw new Error('no identity');
+        const sk = new window.ethers.SigningKey(wallet.privateKey);
+        return { publicKey: sk.compressedPublicKey };
+    },
+
+    // Reads the peer's compressed pubkey from the `pk` field of their inbox metadata.
+    async getPeerPublicKey(a) {
+        if (!client) throw new Error('client not connected');
+        const streamId = String(a.address).toLowerCase() + '/Pombo-DM-1';
+        try {
+            const stream = await client.getStream(streamId);
+            const desc = (typeof stream.getDescription === 'function')
+                ? await stream.getDescription()
+                : (stream.metadata && JSON.parse(stream.metadata || '{}').description);
+            const meta = JSON.parse(desc || '{}');
+            return { publicKey: meta.pk || null };
+        } catch (e) { return { publicKey: null }; }
+    },
+
+    // Derives the shared AES-GCM key (ECDH x-coord -> HKDF-SHA256) — same as
+    // dmCrypto.deriveSharedKey. Cached per peer (web dmCrypto.js:82-88 keeps
+    // the same cache): an inbox replay used to run 100 ECDH+HKDF derivations
+    // for the same handful of peers. The page reloads on identity switch, so
+    // the cache can never mix wallets.
+    async _dmKey(peerPublicKeyHex) {
+        var cached = dmSharedKeyCache[peerPublicKeyHex];
+        if (cached) return cached;
+        const promise = (async function () {
+            const sk = new window.ethers.SigningKey(wallet.privateKey);
+            const sharedHex = sk.computeSharedSecret(peerPublicKeyHex);
+            const sharedBytes = window.ethers.getBytes(sharedHex).slice(1, 33);
+            const km = await crypto.subtle.importKey('raw', sharedBytes, { name: 'HKDF' }, false, ['deriveKey']);
+            return crypto.subtle.deriveKey(
+                { name: 'HKDF', hash: 'SHA-256',
+                  salt: new TextEncoder().encode('pombo-dm-e2e-v1'),
+                  info: new TextEncoder().encode('aes-256-gcm') },
+                km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+        })();
+        dmSharedKeyCache[peerPublicKeyHex] = promise;
+        promise.catch(function () { delete dmSharedKeyCache[peerPublicKeyHex]; });
+        return promise;
+    },
+
+    // One evaluateJavascript round-trip for a page of signature checks (web
+    // verifies in a worker pool; the WebView is single-threaded, so the win
+    // here is the per-call bridge overhead on large resends).
+    async verifyCanonicalBatch(a) {
+        var out = [];
+        for (var i = 0; i < a.items.length; i++) {
+            try {
+                var it = a.items[i];
+                var hash = window.ethers.keccak256(window.ethers.toUtf8Bytes(it.data));
+                out.push(window.ethers.verifyMessage(hash, it.signature));
+            } catch (e) { out.push(''); }
+        }
+        return { addresses: out };
+    },
+
+    // { address, publicKey } — see dmPeerKeys above.
+    async registerDmPeerKey(a) {
+        if (!a.address || !a.publicKey) throw new Error('address and publicKey required');
+        dmPeerKeys[String(a.address).toLowerCase()] = String(a.publicKey);
+        return { ok: true };
+    },
+
+    // message (JSON obj) -> {ct, iv, e}
+    async dmEncrypt(a) {
+        if (!wallet) throw new Error('no identity');
+        const key = await api._dmKey(a.peerPublicKey);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const pt = new TextEncoder().encode(JSON.stringify(a.message));
+        const ctBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, pt);
+        function b64(buf) { const u = new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s); }
+        return { envelope: { ct: b64(ctBuf), iv: b64(iv), e: 'aes-256-gcm' } };
+    },
+
+    // {ct, iv, e} -> message (JSON obj)
+    async dmDecrypt(a) {
+        if (!wallet) throw new Error('no identity');
+        if (!a.envelope || a.envelope.e !== 'aes-256-gcm') throw new Error('unknown DM encryption');
+        const key = await api._dmKey(a.peerPublicKey);
+        function fromB64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+        const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(a.envelope.iv) }, key, fromB64(a.envelope.ct));
+        return { message: JSON.parse(new TextDecoder().decode(pt)) };
+    },
+
+    // One evaluateJavascript round-trip for a whole page of DM envelopes, the
+    // same shape as pwDecryptBatch. The inbox replay used to call dmDecrypt once
+    // per message, so a 100-message history cost 100 sequential main-thread hops
+    // — and the hop IS the cost here: the ECDH->HKDF key is cached per peer in
+    // _dmKey, leaving only an AES-GCM open per item.
+    //
+    // Entries the caller could not prepare (unknown peer key, not an envelope)
+    // arrive as null and come back as null; failures are per-item, so one bad
+    // payload never takes the page down.
+    //   { items: [{ peerPublicKey, envelope } | null] } -> { messages: [json-string|null] }
+    async dmDecryptBatch(a) {
+        if (!wallet) throw new Error('no identity');
+        function fromB64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+        const dec = new TextDecoder();
+        const out = await Promise.all((a.items || []).map(async function (it) {
+            try {
+                if (!it || !it.envelope || it.envelope.e !== 'aes-256-gcm') return null;
+                const key = await api._dmKey(String(it.peerPublicKey));
+                const pt = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: fromB64(it.envelope.iv) }, key, fromB64(it.envelope.ct));
+                return dec.decode(pt);
+            } catch (e) { return null; }
+        }));
+        return { messages: out };
+    },
+
+    // DM storage-chunk download: resend a time window from the RECEIVER's OWN
+    // inbox (a DM inbox is private at the Streamr layer, so direct HTTP would
+    // return SDK ciphertext — the download reads via SDK resend only) and open
+    // each binary chunk with the pair's ECDH key. Returns the DECRYPTED packed
+    // chunk bytes (base64) — the ECDH decrypt IS the integrity check, so a
+    // foreign/tampered row simply fails to open and is skipped.
+    //
+    // Cost note: a window can carry many 240KB chunks, so the base64 payload
+    // that crosses back can be large. This is the only correct DM path (ECDH +
+    // SDK resend both live here); password/public downloads stay native HTTP.
+    //   { streamId, partition, fromTs, toTs, peerPublicKey, budgetMs? }
+    //   -> { rows: [{ timestamp, publisherId, data: b64(packed chunk) }] }
+    async resendStorageChunksDm(a) {
+        if (!client) throw new Error('client not connected');
+        const key = await api._dmKey(String(a.peerPublicKey));
+        const stream = await client.resend(
+            { streamId: a.streamId, partition: a.partition },
+            { from: { timestamp: a.fromTs }, to: { timestamp: a.toTs } }
+        );
+        // _drainResend's push must stay synchronous — collect sealed rows first,
+        // decrypt after (crypto.subtle is async).
+        const sealed = [];
+        await api._drainResend(stream, function (msg) {
+            const u8 = asU8(msg.content);
+            if (!u8 || u8.length < 28) return; // warm-up ping / non-chunk
+            sealed.push({ ts: msg.timestamp, pub: msg.publisherId != null ? String(msg.publisherId) : null, bytes: u8 });
+        }, Date.now() + (a.budgetMs || 60000), { streamId: a.streamId, partition: a.partition });
+        const rows = [];
+        for (let i = 0; i < sealed.length; i++) {
+            try {
+                const s = sealed[i];
+                const pt = new Uint8Array(await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: s.bytes.slice(0, 12) }, key, s.bytes.slice(12)));
+                rows.push({ timestamp: s.ts, publisherId: s.pub, data: u8ToB64(pt) });
+            } catch (e) { /* foreign / tampered — skip */ }
+        }
+        return { rows: rows };
+    },
+
+    // ===== Account backup (web secureStorage.exportAccountBackup) =====
+    // Same container the web writes: a Keystore V3 for the private key plus
+    // the app state scrypt-encrypted (N=131072, r=8, p=1, dkLen=32) under
+    // AES-256-GCM with a 16-byte IV. A file made here restores on the web
+    // with the same password, and vice versa.
+
+    // { privateKey, password, payload } -> { backup }
+    async exportBackup(a) {
+        const w = new window.ethers.Wallet(String(a.privateKey).trim());
+        // Keystore V3, same scrypt cost the web keystores use.
+        const keystore = JSON.parse(await w.encrypt(String(a.password)));
+
+        const salt = window.ethers.randomBytes(32);
+        const iv = window.ethers.randomBytes(16);
+        const N = 131072, r = 8, p = 1, dkLen = 32;
+        const derivedKey = await window.ethers.scrypt(
+            window.ethers.toUtf8Bytes(String(a.password)), salt, N, r, p, dkLen);
+        const cryptoKey = await crypto.subtle.importKey(
+            'raw', window.ethers.getBytes(derivedKey), { name: 'AES-GCM' }, false, ['encrypt']);
+        const plaintext = new TextEncoder().encode(JSON.stringify(a.payload));
+        const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, cryptoKey, plaintext);
+
+        return {
+            backup: {
+                format: 'pombo-account-backup',
+                version: 1,
+                exportedAt: a.payload && a.payload.exportedAt,
+                keystore: keystore,
+                encryptedData: {
+                    kdf: 'scrypt',
+                    kdfparams: { n: N, r: r, p: p, dklen: dkLen, salt: window.ethers.hexlify(salt) },
+                    cipher: 'aes-256-gcm',
+                    cipherparams: { iv: window.ethers.hexlify(iv) },
+                    ciphertext: window.ethers.hexlify(new Uint8Array(ciphertext))
+                }
+            }
+        };
+    },
+
+    // { backup, password } -> { privateKey, address, payload }
+    async importBackup(a) {
+        const backup = a.backup;
+        if (!backup || backup.format !== 'pombo-account-backup' || backup.version !== 1) {
+            throw new Error('Invalid backup format. Expected pombo-account-backup v1');
+        }
+        let w;
+        try {
+            w = await window.ethers.Wallet.fromEncryptedJson(JSON.stringify(backup.keystore), String(a.password));
+        } catch (e) {
+            throw new Error('Incorrect password or corrupted backup');
+        }
+        const enc = backup.encryptedData;
+        const derivedKey = await window.ethers.scrypt(
+            window.ethers.toUtf8Bytes(String(a.password)),
+            window.ethers.getBytes(enc.kdfparams.salt),
+            enc.kdfparams.n, enc.kdfparams.r, enc.kdfparams.p, enc.kdfparams.dklen);
+        const cryptoKey = await crypto.subtle.importKey(
+            'raw', window.ethers.getBytes(derivedKey), { name: 'AES-GCM' }, false, ['decrypt']);
+        let payload;
+        try {
+            const pt = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: window.ethers.getBytes(enc.cipherparams.iv) },
+                cryptoKey,
+                window.ethers.getBytes(enc.ciphertext));
+            payload = JSON.parse(new TextDecoder().decode(pt));
+        } catch (e) {
+            throw new Error('Failed to decrypt backup data');
+        }
+        return { privateKey: w.privateKey, address: w.address, payload: payload };
+    },
+
+    // Creates the caller's own DM inbox (message + ephemeral streams) on-chain.
+    async createDMInbox(a) {
+        if (!client) throw new Error('client not connected');
+        const me = (await client.getAddress()).toLowerCase();
+        const messageStreamId = me + '/Pombo-DM-1';
+        const ephemeralStreamId = me + '/Pombo-DM-2';
+        const meta = JSON.stringify({ a: 'pombo', v: '1', t: 'dm-inbox', pk: a.publicKey });
+        const ephMeta = JSON.stringify({ a: 'pombo', v: '1', ln: messageStreamId });
+        async function getOrCreate(id, description, partitions) {
+            try { return await client.getStream(id); }
+            catch (e) { return await client.createStream({ id: id, description: description, partitions: partitions }); }
+        }
+        // 13 partitions: P0-P3 classic + P4-P12 storage-file chunks (mirror of
+        // MESSAGE_STREAM.DM_PARTITIONS / StreamConstants.MSG_DM_PARTITIONS).
+        await getOrCreate(messageStreamId, meta, 13);
+        await getOrCreate(ephemeralStreamId, ephMeta, 3);
+        // Public PUBLISH only (owner reads by ownership) — hides the social graph.
+        const pubOnly = [{ public: true, permissions: ['publish'] }];
+        await client.setPermissions({ streamId: messageStreamId, assignments: pubOnly });
+        await client.setPermissions({ streamId: ephemeralStreamId, assignments: pubOnly });
+        try {
+            const s = await client.getStream(messageStreamId);
+            await s.addToStorageNode('0xae340e799e8151f6a4999d245e466197aa217667');
+        } catch (e) { /* storage best-effort */ }
+        return { messageStreamId: messageStreamId, ephemeralStreamId: ephemeralStreamId };
+    },
+
+    // ===== DM inbox diagnosis & repair (web streamr.diagnoseInbox/repairInbox) =====
+
+    async diagnoseDmInbox(a) {
+        if (!client) throw new Error('client not connected');
+        const me = (await client.getAddress()).toLowerCase();
+        const messageStreamId = me + '/Pombo-DM-1';
+        const ephemeralStreamId = me + '/Pombo-DM-2';
+        const report = {
+            messageStream: { id: messageStreamId, exists: false, partitions: null, partitionsCorrect: false, metadataOk: false, publicKeyPresent: false },
+            ephemeralStream: { id: ephemeralStreamId, exists: false, partitions: null },
+            permissions: { messagePublicPublish: false, ephemeralPublicPublish: false },
+            storage: { enabled: false, provider: null, storageDays: null, nodeAddress: null, nodes: [] }
+        };
+        let messageStream = null, ephemeralStream = null;
+        try {
+            messageStream = await client.getStream(messageStreamId);
+            report.messageStream.exists = true;
+            const p = await messageStream.getPartitionCount();
+            report.messageStream.partitions = typeof p === 'bigint' ? Number(p) : p;
+            // 13 = P0-P3 classic + P4-P12 storage-file chunks (no backward compat
+            // with the old 4-partition inboxes — they are recreated).
+            report.messageStream.partitionsCorrect = report.messageStream.partitions >= 13;
+            try {
+                const desc = await messageStream.getDescription();
+                if (desc) {
+                    const meta = JSON.parse(desc);
+                    report.messageStream.metadataOk = !!(meta.a && meta.t === 'dm-inbox');
+                    report.messageStream.publicKeyPresent = !!meta.pk;
+                }
+            } catch (e) { /* metadata unreadable */ }
+        } catch (e) { /* stream missing */ }
+        try {
+            ephemeralStream = await client.getStream(ephemeralStreamId);
+            report.ephemeralStream.exists = true;
+            const p = await ephemeralStream.getPartitionCount();
+            report.ephemeralStream.partitions = typeof p === 'bigint' ? Number(p) : p;
+        } catch (e) { /* stream missing */ }
+        const SP = window.StreamPermission;
+        if (SP && messageStream) {
+            try { report.permissions.messagePublicPublish = await messageStream.hasPermission({ permission: SP.PUBLISH, public: true }); } catch (e) {}
+        }
+        if (SP && ephemeralStream) {
+            try { report.permissions.ephemeralPublicPublish = await ephemeralStream.hasPermission({ permission: SP.PUBLISH, public: true }); } catch (e) {}
+        }
+        if (messageStream) {
+            try {
+                const info = await api.getStorageInfo({ streamId: messageStreamId });
+                report.storage.enabled = info.enabled;
+                report.storage.storageDays = info.storageDays;
+                report.storage.nodes = info.nodes;
+                if (info.enabled && info.nodes.length) {
+                    const nodeAddr = String(info.nodes[0]).toLowerCase();
+                    report.storage.nodeAddress = nodeAddr;
+                    report.storage.provider = nodeAddr === '0xae340e799e8151f6a4999d245e466197aa217667' ? 'streamr' : 'custom';
+                }
+            } catch (e) { /* storage check best-effort */ }
+        }
+        return report;
+    },
+
+    // Repairs only what the diagnosis flagged, same steps as the web.
+    // { diagnosis, publicKey } -> { steps: { name: 'ok'|'skip'|'fail' } }
+    async repairDmInbox(a) {
+        if (!client) throw new Error('client not connected');
+        const d = a.diagnosis;
+        const messageStreamId = d.messageStream.id;
+        const ephemeralStreamId = d.ephemeralStream.id;
+        const steps = {
+            messageStream: 'skip', ephemeralStream: 'skip', partitions: 'skip',
+            metadata: 'skip', messagePermissions: 'skip', ephemeralPermissions: 'skip', storage: 'skip'
+        };
+        const metadata = JSON.stringify({ a: 'pombo', v: '1', t: 'dm-inbox', pk: a.publicKey });
+        const ephMeta = JSON.stringify({ a: 'pombo', v: '1', ln: messageStreamId });
+        const pubOnly = [{ public: true, permissions: ['publish'] }];
+        let messageStream = null, ephemeralStream = null;
+
+        if (!d.messageStream.exists) {
+            try {
+                messageStream = await client.createStream({ id: messageStreamId, description: metadata, partitions: 13 });
+                steps.messageStream = 'ok';
+            } catch (e) { steps.messageStream = 'fail'; }
+        } else {
+            try { messageStream = await client.getStream(messageStreamId); } catch (e) {}
+        }
+        if (messageStream && d.messageStream.exists && !d.messageStream.partitionsCorrect) {
+            try {
+                const m = await messageStream.getMetadata();
+                await messageStream.setMetadata(Object.assign({}, m, { partitions: 13 }));
+                steps.partitions = 'ok';
+            } catch (e) { steps.partitions = 'fail'; }
+        }
+        if (!d.ephemeralStream.exists) {
+            try {
+                ephemeralStream = await client.createStream({ id: ephemeralStreamId, description: ephMeta, partitions: 3 });
+                steps.ephemeralStream = 'ok';
+            } catch (e) { steps.ephemeralStream = 'fail'; }
+        } else {
+            try { ephemeralStream = await client.getStream(ephemeralStreamId); } catch (e) {}
+        }
+        if (messageStream && a.publicKey && !d.messageStream.publicKeyPresent) {
+            try {
+                const desc = await messageStream.getDescription();
+                const meta = desc ? JSON.parse(desc) : { a: 'pombo', v: '1', t: 'dm-inbox' };
+                meta.pk = a.publicKey;
+                await messageStream.setDescription(JSON.stringify(meta));
+                steps.metadata = 'ok';
+            } catch (e) { steps.metadata = 'fail'; }
+        }
+        if (messageStream && !d.permissions.messagePublicPublish) {
+            try {
+                await client.setPermissions({ streamId: messageStreamId, assignments: pubOnly });
+                steps.messagePermissions = 'ok';
+            } catch (e) { steps.messagePermissions = 'fail'; }
+        }
+        if (ephemeralStream && !d.permissions.ephemeralPublicPublish) {
+            try {
+                await client.setPermissions({ streamId: ephemeralStreamId, assignments: pubOnly });
+                steps.ephemeralPermissions = 'ok';
+            } catch (e) { steps.ephemeralPermissions = 'fail'; }
+        }
+        if (messageStream && !d.storage.enabled) {
+            try {
+                const s = await client.getStream(messageStreamId);
+                await s.addToStorageNode('0xae340e799e8151f6a4999d245e466197aa217667');
+                try { await s.setStorageDayCount(180); } catch (e) { /* TTL best-effort */ }
+                steps.storage = 'ok';
+            } catch (e) { steps.storage = 'fail'; }
+        }
+        return { steps: steps };
+    },
+
+    // ===== storage node management (web getStreamStorageInfo & friends) =====
+
+    async getStorageInfo(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        const res = stream.getStorageNodes();
+        let nodes = [];
+        if (Array.isArray(res)) nodes = res;
+        else if (res && typeof res.then === 'function') nodes = await res;
+        else if (res && typeof res[Symbol.asyncIterator] === 'function') { for await (const n of res) nodes.push(n); }
+        else if (res && typeof res[Symbol.iterator] === 'function') nodes = [...res];
+        nodes = nodes.map(function (n) { return String(n); });
+        let storageDays = null;
+        if (nodes.length) {
+            try {
+                const dcount = await stream.getStorageDayCount();
+                if (dcount != null) storageDays = typeof dcount === 'bigint' ? Number(dcount) : dcount;
+            } catch (e) { /* TTL not set on this node */ }
+        }
+        return { enabled: nodes.length > 0, nodes: nodes, storageDays: storageDays };
+    },
+
+    async removeStorageNode(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        await stream.removeFromStorageNode(a.nodeAddress);
+        return { ok: true };
+    },
+
+    // On-chain resolution of a stream's storage-node HTTP endpoints, for the
+    // Persistent File Sharing transport. Mirror of web storageEndpoints.js
+    // resolveUncached (two SDK calls: getStorageNodes -> node addresses,
+    // getStorageNodeMetadata -> {urls}), EXCEPT the web-safe URL filtering is
+    // left to the native StorageEndpoints so the filter is unit-testable in
+    // Kotlin — here every raw URL is returned. The direct HTTP reads themselves
+    // run natively (OkHttp), not through this WebView.
+    //   -> { nodes: [{ nodeAddress, urls: [...] }] }   (may be empty)
+    async resolveStorageEndpoints(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        const res = stream.getStorageNodes();
+        let addresses = [];
+        if (Array.isArray(res)) addresses = res;
+        else if (res && typeof res.then === 'function') addresses = await res;
+        else if (res && typeof res[Symbol.asyncIterator] === 'function') { for await (const n of res) addresses.push(n); }
+        else if (res && typeof res[Symbol.iterator] === 'function') addresses = [...res];
+        const nodes = [];
+        for (const address of addresses) {
+            try {
+                const md = await client.getStorageNodeMetadata(address);
+                const urls = (Array.isArray(md && md.urls) ? md.urls : [])
+                    .filter(function (u) { return typeof u === 'string'; });
+                nodes.push({ nodeAddress: String(address).toLowerCase(), urls: urls });
+            } catch (e) {
+                console.warn('storage node metadata read failed: ' + address + ' — ' + (e && e.message || e));
+            }
+        }
+        return { nodes: nodes };
+    },
+
+    async setStorageDays(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        await stream.setStorageDayCount(a.storageDays);
+        return { ok: true };
+    },
+
+    // ===== stream management (channel creation) =====
+
+    // Get-or-create for FIXED stream ids (DM inbox): a re-run after a partial
+    // failure must not die on "stream already exists".
+    async getOrCreateStream(a) {
+        if (!client) throw new Error('client not connected');
+        try {
+            await client.getStream(a.id);
+            return { id: a.id, existed: true };
+        } catch (e) {
+            const s = await client.createStream({ id: a.id, description: a.description, partitions: a.partitions });
+            return { id: s.id, existed: false };
+        }
+    },
+
+    // Creates a stream on-chain: {id, description, partitions}
+    async createStream(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.createStream({
+            id: a.id,
+            description: a.description,
+            partitions: a.partitions
+        });
+        return { id: stream.id };
+    },
+
+    // assignments: [{public:true, permissions:[...]}] or [{userId, permissions:[...]}]
+    async setPermissions(a) {
+        if (!client) throw new Error('client not connected');
+        await client.setPermissions({ streamId: a.streamId, assignments: a.assignments });
+        return { ok: true };
+    },
+
+    async addToStorageNode(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        await stream.addToStorageNode(a.nodeAddress);
+        if (a.storageDays && typeof stream.setStorageDayCount === 'function') {
+            try { await stream.setStorageDayCount(a.storageDays); } catch (e) { /* TTL is best-effort */ }
+        }
+        return { ok: true };
+    },
+
+    // Mirror of streamr.js checkPermissions (same hasPermission calls)
+    async checkPermissions(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        const SP = window.StreamPermission;
+        const me = await client.getAddress();
+        const r = await Promise.all([
+            stream.hasPermission({ permission: SP.PUBLISH, userId: me, allowPublic: true }),
+            stream.hasPermission({ permission: SP.SUBSCRIBE, userId: me, allowPublic: true }),
+            stream.hasPermission({ permission: SP.GRANT, userId: me, allowPublic: false }),
+            stream.hasPermission({ permission: SP.EDIT, userId: me, allowPublic: false }),
+            stream.hasPermission({ permission: SP.DELETE, userId: me, allowPublic: false })
+        ]);
+        return {
+            canPublish: r[0], canSubscribe: r[1], canGrant: r[2], canEdit: r[3], canDelete: r[4],
+            isOwner: r[2] && r[3] && r[4]
+        };
+    },
+
+    // Stream metadata (the description holds the pombo JSON {a,v,n,t,e,...})
+    async getStreamInfo(a) {
+        if (!client) throw new Error('client not connected');
+        const stream = await client.getStream(a.streamId);
+        let md = null;
+        try {
+            md = (typeof stream.getMetadata === 'function') ? await stream.getMetadata() : stream.metadata;
+        } catch (e) { md = null; }
+        return { metadata: md || {} };
+    }
+};
+
+// Generic RPC: Kotlin -> bridgeCall(id, method, argsB64) -> Native.result(id, ok, payloadB64)
+window.bridgeCall = function (id, method, argsB64) {
+    Promise.resolve().then(async function () {
+        const args = argsB64 ? JSON.parse(b64ToUtf8(argsB64)) : {};
+        const fn = api[method];
+        if (!fn) throw new Error('unknown method: ' + method);
+        const value = await fn(args);
+        Native.result(id, true, utf8ToB64(JSON.stringify(value === undefined ? {} : value)));
+    }).catch(function (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        Native.result(id, false, utf8ToB64(JSON.stringify({ error: msg })));
+    });
+};
+
+// Binary publish (file pieces on -2/P2). Deliberately NOT routed through
+// bridgeCall: that path base64s the whole args JSON, so a payload that is
+// already base64 would be encoded twice and a 240 KB piece would cross the
+// bridge as ~427 KB. Here only the small {streamId,partition} envelope pays
+// the double encoding and the payload carries a single base64 layer.
+//
+// Resolves through the same Native.result(id, …) plumbing as bridgeCall, so
+// Kotlin can await a publish (needed for send-slot accounting) with no extra
+// machinery — unlike PomboTV, which is fire-and-forget plus a separate ack.
+//
+// Also deliberately NOT joined to `pubChains`: pieces are self-describing
+// (fileId + index live in the payload header), so ordering is irrelevant, and
+// chaining would serialise sends and cap throughput at one publish in flight.
+// The web publishes pieces concurrently under its own send-slot limiter.
+//
+// The payload is published as a bare Uint8Array with no contentType option —
+// exactly what web streamr.js publish() does with the same vendor bundle. The
+// PomboTV POC passes { contentType: 'binary' }, but matching the web is what
+// keeps pieces readable by web clients.
+window.bridgePublishBinary = function (id, argsB64, dataB64) {
+    Promise.resolve().then(async function () {
+        if (!client) throw new Error('client not connected');
+        const a = JSON.parse(b64ToUtf8(argsB64));
+        let bytes = b64ToU8(dataB64);
+        // Encrypted here for the same reason it is decrypted here: PBKDF2 in
+        // BoringSSL rather than Bouncy Castle. The password never leaves the
+        // WebView on this path — Kotlin hands over plaintext bytes.
+        if (a.password) bytes = await pwEncryptBinary(bytes, String(a.password));
+        // DM piece: sealed with the pair's ECDH key, web dmCrypto.encryptBinary
+        // format ([12B iv][ct+tag]). Mutually exclusive with password by
+        // construction — a DM has no channel password.
+        else if (a.dmPeerPublicKey) {
+            const key = await api._dmKey(String(a.dmPeerPublicKey));
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, bytes));
+            const sealed = new Uint8Array(12 + ct.length);
+            sealed.set(iv, 0); sealed.set(ct, 12);
+            bytes = sealed;
+        }
+        await client.publish({ streamId: a.streamId, partition: a.partition }, bytes);
+        Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
+    }).catch(function (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        Native.result(id, false, utf8ToB64(JSON.stringify({ error: msg })));
+    });
+};
+
+// Storage-file chunk publish (message stream -1 chunk partitions, Persistent
+// File Sharing). Distinct from bridgePublishBinary on two counts:
+//
+//  1. It publishes with { contentType: 'binary' } — exactly what web
+//     streamr.js publishStorageChunk does. The storage node then stores the row
+//     as contentType 1 (binary), which the HTTP range reader hex-decodes on
+//     download; a bare Uint8Array publish (the mesh path) would not round-trip
+//     through the node's HTTP API the same way.
+//  2. It RETURNS THE PUBLISH TIMESTAMP. Upload verify matches published chunks
+//     to stored rows by timestamp (never content — that works on sealed rows
+//     too), so the caller must learn each chunk's assigned timestamp.
+//
+// NO crypto here: storage chunks are sealed natively in Kotlin (one PBKDF2 per
+// FILE via PomboCrypto, then per-chunk AES-GCM), so the bytes that cross are
+// already ciphertext (or plaintext for public channels). The bridge just
+// publishes them. Also NOT joined to pubChains: chunks are self-describing
+// (transferId + index in the header) so ordering is irrelevant, and chaining
+// would cap in-flight publishes at one.
+window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
+    Promise.resolve().then(async function () {
+        if (!client) throw new Error('client not connected');
+        const a = JSON.parse(b64ToUtf8(argsB64));
+        let bytes = b64ToU8(dataB64);
+        // DM chunk: sealed with the pair's ECDH key ([12B iv][ct+tag]) — the same
+        // format as the mesh DM piece path. Native crypto handles password/public
+        // channels (one PBKDF2 per file), but ECDH lives only here, so DM chunks
+        // seal in the bridge. The receiver opens them via resendStorageChunksDm.
+        if (a.dmPeerPublicKey) {
+            const key = await api._dmKey(String(a.dmPeerPublicKey));
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, bytes));
+            const sealed = new Uint8Array(12 + ct.length);
+            sealed.set(iv, 0); sealed.set(ct, 12);
+            bytes = sealed;
+        }
+        const msg = await client.publish(
+            { streamId: a.streamId, partition: a.partition },
+            bytes,
+            { contentType: 'binary' }
+        );
+        // The SDK publish result carries the assigned timestamp; shapes vary
+        // across versions, so fall back defensively (Date.now() last).
+        var ts = null;
+        if (msg && typeof msg.timestamp === 'number') ts = msg.timestamp;
+        else if (msg && msg.streamMessage && typeof msg.streamMessage.getTimestamp === 'function') ts = msg.streamMessage.getTimestamp();
+        else if (msg && typeof msg.getTimestamp === 'function') ts = msg.getTimestamp();
+        if (typeof ts !== 'number') ts = Date.now();
+        Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length, timestamp: ts })));
+    }).catch(function (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        Native.result(id, false, utf8ToB64(JSON.stringify({ error: msg })));
+    });
+};
+
+async function boot() {
+    try {
+        if (!window.StreamrClient || !window.ethers) {
+            Native.error('vendor bundle failed to load');
+            return;
+        }
+        // No identity: ethers-only operations (create/import wallet).
+        if (!BRIDGE_PK || BRIDGE_PK.indexOf('__') === 0) {
+            Native.status('no-identity');
+            return;
+        }
+        wallet = new window.ethers.Wallet(BRIDGE_PK);
+        Native.status('connecting');
+        // Config identical to the web streamr.js init().
+        client = new window.StreamrClient({
+            auth: { privateKey: BRIDGE_PK },
+            network: {
+                controlLayer: {
+                    maxMessageSize: 1048576,
+                    webrtcDatachannelBufferThresholdLow: 65536,
+                    webrtcDatachannelBufferThresholdHigh: 262144
+                }
+            },
+            contracts: {
+                ethereumNetwork: { chainId: 137, highGasPriceStrategy: false },
+                rpcs: RPCS,
+                rpcQuorum: 1
+            },
+            // Deliberate divergence from the web (SDK default 30s): a member
+            // who is OFFLINE makes every history message sealed with their key
+            // wait out this timeout serially during a resend drain — two such
+            // messages ate an entire page budget and the room rendered empty.
+            // Real exchanges measured 2-8s; 10s keeps those while capping the
+            // dead-key cost per message.
+            encryption: { keyRequestTimeout: 10000 }
+        });
+        const addr = await client.getAddress();
+        Native.connected(addr);
+    } catch (e) {
+        Native.error('boot: ' + ((e && e.message) ? e.message : String(e)));
+    }
+}
+boot();
+</script>
+</body>
+</html>

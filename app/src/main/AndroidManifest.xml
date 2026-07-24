@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Android 11+ package visibility: without this, getLaunchIntentForPackage
+         returns null for MetaMask even when it IS installed, and "Fund with
+         MetaMask" wrongly falls through to the Play Store. -->
+    <queries>
+        <package android:name="io.metamask" />
+    </queries>
+
+    <application
+        android:label="Pombo"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.Pombo"
+        android:usesCleartextTraffic="false"
+        android:supportsRtl="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.Pombo.Splash"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                Invite links. The web puts the token in the fragment
+                (app.pombo.cc/#/invite/<token>), which Android never matches on
+                — the fragment is not part of intent filtering. So we accept the
+                host and read the fragment ourselves in onNewIntent.
+            -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="app.pombo.cc" />
+            </intent-filter>
+            <!-- Custom scheme, for links shared outside a browser context. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="pombo" android:host="invite" />
+            </intent-filter>
+        </activity>
+
+        <!-- YouTube player. MUST live in its own process: sharing one with the
+             bridge's headless WebView renders video as sound over a black
+             picture (proven by isolation — see YtProbeActivity's kdoc). -->
+        <activity
+            android:name=".YtProbeActivity"
+            android:process=":player"
+            android:theme="@android:style/Theme.Black.NoTitleBar"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+            android:exported="false" />
+
+        <!-- Relay wake signals. Data-only, so onMessageReceived runs and can
+             discard the false positives the 1-byte tag inevitably produces. -->
+        <service
+            android:name=".push.PomboMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- Holds the process (bridge WebView + transfer engine) while file
+             transfers run with the UI in the background. -->
+        <service
+            android:name=".MediaTransferService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@mipmap/ic_launcher" />
+    </application>
+</manifest>

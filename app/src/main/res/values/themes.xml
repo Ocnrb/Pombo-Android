@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base dark theme (the real UI is all Compose); background matches the
+         web's dark-bg. -->
+    <style name="Theme.Pombo" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/pombo_background</item>
+        <item name="android:statusBarColor">@color/pombo_background</item>
+        <item name="android:navigationBarColor">@color/pombo_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <!-- Launch theme: Android 12+ draws the system splash from these; older
+         versions fall back to the window background, which is the same colour. -->
+    <style name="Theme.Pombo.Splash" parent="Theme.Pombo">
+        <!-- Pure black, like the app itself; @color/pombo_background is the
+             web's #09090B and read as a grey rectangle against the UI. -->
+        <item name="android:windowSplashScreenBackground" tools:targetApi="s">@color/splash_background</item>
+        <!-- Same padded asset as the launcher foreground: the splash icon is
+             masked into a circle too, and its safe zone (192 of 288dp) is even
+             more generous than the launcher's, so one asset covers both. -->
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="s">@drawable/ic_launcher_fg</item>
+    </style>
+</resources>
