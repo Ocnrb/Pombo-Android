@@ -56,6 +56,11 @@ const ENS_RPCS = [
     'https://eth.drpc.org',
     'https://cloudflare-eth.com'
 ];
+// K-anonymity decoys per reverse lookup (web CONFIG.identity.ensDecoyCount).
+// Kept at 2 because the free ENS tiers 429 easily: cover fires once per
+// resolution, but a null result still walks all providers, so the ceiling is
+// N+numProviders requests.
+const ENS_DECOY_COUNT = 2;
 let ensProviders = null;
 
 let client = null;   // StreamrClient (only with an identity)
@@ -66,21 +71,17 @@ const pubChains = new Map();  // 'streamId|partition' -> promise chain (publish 
 // api.subscribe). Held here rather than passed per message because a
 // subscription callback has no other way to learn which channel it belongs to.
 const subPasswords = new Map();
-// Pre-agreed Streamr-layer key for /Pombo-DM-* streams (web CONFIG.dm).
-const DM_KEY_ID = 'pombo-dm-v1';
-const DM_KEY_HEX = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2';
-const dmPublishKeySet = new Set();
-// peerPublicKeyHex -> Promise<CryptoKey> (derived AES key; see api._dmKey).
+// The Streamr-layer DM key (the fixed 'pombo-dm-v1' group key), the per-peer
+// key registry and the decrypt recovery are GONE — removed together with the
+// web's P6 cleanup. Everything Pombo publishes on DM streams now goes out
+// with EncryptionType.NONE under a throwaway identity, sealed at the app
+// layer (sealed sender v2); a DECRYPT_ERROR on a subscription is foreign
+// traffic or pre-migration history and there is no key left to add for it.
+//
+// peerPublicKeyHex -> Promise<CryptoKey> (v1 pair AES key; see api._dmKey).
+// Still used by DM STORAGE CHUNKS only: the web kept chunk rows on the v1
+// pair-static key (no epk per row), so the seal/open here must match.
 const dmSharedKeyCache = {};
-// peerAddress (lowercase) -> compressed public key hex. Registered from Kotlin
-// so the binary receive path can unwrap DM pieces WITHOUT a per-piece bridge
-// round-trip: the piece arrives on MY inbox -2/P2 and the only hint of which
-// key opens it is the publisher's address (web dm.js routeInboxMedia does the
-// same lookup).
-const dmPeerKeys = {};
-// "streamId|publisherId" pairs already put through DM decrypt recovery, so a
-// publisher that stays undecryptable does not loop the resend forever.
-const dmKeyRecovered = new Set();
 // Push wake-signal constants (web CONFIG.push). tagBytes=1 keeps 256 possible
 // tags, which is what gives K-anonymity while the user base is small.
 const PUSH_TAG_BYTES = 1;
@@ -306,6 +307,208 @@ const api = {
         return { ok: true, timestamp: ts };
     },
 
+    // ===== publishAs — publish under an identity that is not the client's =====
+    //
+    // Mirror of web streamr.js publishAs(). client.publish() bakes in two
+    // things the privacy migration must override: it derives publisherId from
+    // the client identity (the social-graph leak), and its MessageFactory
+    // forces EncryptionType.AES on any stream that is not public-subscribe,
+    // dragging the group-key exchange back in. Building the StreamMessage by
+    // hand sidesteps both; encryption stays at the app layer.
+    //
+    // ⚠️ getNode() is @deprecated/@hidden in the SDK — exported and typed, but
+    // with no stability guarantee. The SDK version is pinned by the vendor
+    // bundle; re-run the smoke test after any bundle refresh.
+    //
+    // identity: an EthereumKeyPairIdentity. data: Uint8Array (published as-is)
+    // or a JSON-able object. opts: { publisherId, signatureType, msgChainId,
+    // timestamp }.
+    async _publishAs(identity, streamId, partition, data, opts) {
+        if (!client) throw new Error('client not connected');
+        opts = opts || {};
+        const MessageID = window.MessageID, MessageSigner = window.MessageSigner;
+        if (!MessageID || !MessageSigner) {
+            throw new Error('SDK message primitives not exposed — refresh pombo-vendor.bundle.js');
+        }
+
+        const isBinary = data instanceof Uint8Array;
+        const content = isBinary ? data : new TextEncoder().encode(JSON.stringify(data));
+
+        const messageId = new MessageID(
+            streamId,
+            partition,
+            opts.timestamp != null ? opts.timestamp : Date.now(),
+            0,
+            opts.publisherId != null ? opts.publisherId : await identity.getUserId(),
+            opts.msgChainId != null ? opts.msgChainId : api._randomHex(10)
+        );
+
+        const message = await new MessageSigner(identity).createSignedMessage({
+            messageId: messageId,
+            content: content,
+            contentType: isBinary ? window.ContentType.BINARY : window.ContentType.JSON,
+            // Never AES: the app already encrypts what needs encrypting, and
+            // the SDK's own layer would need a group key per publisher.
+            encryptionType: window.EncryptionType.NONE,
+            messageType: window.StreamMessageType.MESSAGE
+        }, opts.signatureType != null ? opts.signatureType : identity.getSignatureType());
+
+        const node = client.getNode();
+        const streamPartId = messageId.getStreamPartID();
+
+        // join() only registers interest — it does not guarantee anyone is
+        // connected, and broadcasting into an empty room reaches storage but
+        // no live subscriber. Wait for one neighbour; on timeout publish
+        // anyway (best-effort — a cold-node message can still reach storage).
+        // This matters most for DMs: a peer's inbox we never subscribe to has
+        // no standing topology.
+        try {
+            await node.join(streamPartId, { minCount: 1, timeout: 5000 });
+        } catch (e) {
+            console.warn('publishAs: no neighbours on ' + streamPartId + ' yet (' +
+                (e && e.message || e) + ') — publishing anyway');
+        }
+
+        await node.broadcast(message);
+
+        // Expose .timestamp the way client.publish() does, ONCE, at the
+        // source. A StreamMessage only has getTimestamp()/messageId.timestamp;
+        // callers that read .timestamp would get undefined and silently
+        // conclude nothing was published (web hit this three times).
+        try { message.timestamp = messageId.timestamp; } catch (e) { /* frozen: callers fall back */ }
+        return message;
+    },
+
+    _randomHex(nBytes) {
+        const u8 = crypto.getRandomValues(new Uint8Array(nBytes));
+        let s = '';
+        for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, '0');
+        return s;
+    },
+
+    // Streams whose publish rights are on-chain and owner/member-bound must
+    // never see an ephemeral publisher: the admin stream (-3: ADMIN_STATE,
+    // CHANNEL_IMAGE, PASSWORD_CHALLENGE) is refused HERE, loudly — a clever
+    // fallback would produce a message the network validates and receivers
+    // reject as a non-owner. Native channels are refused by the Kotlin
+    // routing, which is the layer that knows the channel kind.
+    _refuseAdminStream(streamId) {
+        if (/-3$/.test(String(streamId))) {
+            throw new Error('publishAs refuses the admin stream (' + streamId +
+                '): an ephemeral key holds no on-chain permission');
+        }
+    },
+
+    // ===== per-channel ephemeral publishing identity (web channelIdentity.js) =====
+    //
+    // ONE KEY PER CHANNEL, not per message: inside a channel the pseudonym
+    // hides nothing from members, who read the proof anyway. Its job is to
+    // stop a network observer — who sees publisherId on every message without
+    // joining anything — from stitching a social graph. ONE KEY PER CHANNEL,
+    // not per account: two channels must not be tied together by publisher.
+    //
+    // NEVER PERSISTED: lives here, dies with the page (the WebView reloads on
+    // identity switch). Rotation happens when the channel is genuinely LEFT
+    // (Kotlin calls dropChannelIdentity from the leave path), never on a view
+    // switch — peers mid-transfer know the current publisher.
+    _channelIdentities: {},
+
+    // All three streams of a channel (-1/-2/-3) share one identity.
+    _baseChannelId(streamId) {
+        return String(streamId).replace(/-[123]$/, '');
+    },
+
+    _channelIdentity(streamId) {
+        const key = api._baseChannelId(streamId);
+        const existing = api._channelIdentities[key];
+        if (existing) return existing;
+        if (!wallet) throw new Error('no identity');
+        const pk = api._genEphemeralPk();
+        const publisherId = new window.ethers.Wallet(pk).address;
+        // One proof per key, reused by every message: the digest covers only
+        // the publisher (POMBO_PUB_V1), so it does not change until rotation.
+        const digest = window.ethers.keccak256(window.ethers.toUtf8Bytes(
+            'POMBO_PUB_V1|' + publisherId.toLowerCase()));
+        const entry = {
+            identityPk: pk,
+            publisherId: publisherId,
+            proof: new window.ethers.SigningKey(wallet.privateKey).sign(digest).serialized
+        };
+        api._channelIdentities[key] = entry;
+        return entry;
+    },
+
+    async dropChannelIdentity(a) {
+        delete api._channelIdentities[api._baseChannelId(a.streamId)];
+        return { ok: true };
+    },
+
+    // Fields that must never reach the wire (web publisherProof.js
+    // stripLocalFields): local UI state, and the identity fields D6/D7
+    // removed — `sender`/`account` beside an ephemeral publisher would undo
+    // the whole migration; `signature` is the app-layer signature that no
+    // longer travels; `channelId` is redundant with the Streamr MessageID.
+    _stripLocalFields(data) {
+        const out = {};
+        for (var k in data) {
+            if (k === 'verified' || k === 'pending' || k === '_dmSent' ||
+                k === 'sender' || k === 'account' || k === 'signature' || k === 'channelId') continue;
+            out[k] = data[k];
+        }
+        return out;
+    },
+
+    // Publish channel traffic under the channel's ephemeral identity, with
+    // the proof INSIDE the payload — sealed by the channel password when
+    // there is one, in the clear (deliberately) on a public channel.
+    //
+    // THE single place where "who we appear to be" on a channel is decided.
+    // Kotlin routes every public/password channel publish through here;
+    // native channels and the admin stream keep the account (on-chain
+    // permission that a throwaway key does not hold).
+    //   { streamId, partition, content, password? } -> { ok, timestamp }
+    async publishAsChannel(a) {
+        api._refuseAdminStream(a.streamId);
+        const entry = api._channelIdentity(a.streamId);
+        const payload = api._stripLocalFields(a.content);
+        payload.proof = entry.proof;
+        // A password-sealed payload goes out as a JSON STRING (base64), same
+        // as api.publish — NOT as binary content. Pre-encoding it here flagged
+        // ContentType.BINARY and receivers routed it to the piece path.
+        const wire = a.password
+            ? await pwEncryptString(JSON.stringify(payload), String(a.password))
+            : payload;
+        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(entry.identityPk);
+        // NO publisherId override — the MessageID takes identity.getUserId(),
+        // exactly like the web and the smoke test. Passing the wallet-derived
+        // CHECKSUMMED address here made every receiver's signature validation
+        // reject the message: recovered (lowercase) != publisherId (mixed
+        // case), and the whole channel went silent without one error.
+        const msg = await api._publishAs(identity, a.streamId, a.partition, wire);
+        return { ok: true, timestamp: msg.timestamp };
+    },
+
+    // Kotlin-facing wrapper: publish under a random (or given) ephemeral key.
+    //   { streamId, partition, content?|contentB64?, privateKey? }
+    //   -> { ok, timestamp, publisherId }
+    // JSON content via `content`; binary via base64 `contentB64` (same reason
+    // as bridgePublishBinary: a Uint8Array through JSON.stringify mangles).
+    // Smoke-test and diagnostics surface for now — the channel/DM sealing
+    // wrappers that production paths use live bridge-side and call _publishAs
+    // directly, so ephemeral private keys never cross the bridge.
+    async publishAs(a) {
+        api._refuseAdminStream(a.streamId);
+        const pk = a.privateKey || ('0x' + api._randomHex(32));
+        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(pk);
+        const data = a.contentB64 != null ? b64ToU8(a.contentB64) : a.content;
+        const msg = await api._publishAs(identity, a.streamId, a.partition, data);
+        return {
+            ok: true,
+            timestamp: msg.timestamp,
+            publisherId: String(msg.messageId.publisherId)
+        };
+    },
+
     // `a.password` is used ONLY for binary payloads (-2/P2 pieces), which are
     // unwrapped in the callback below. JSON messages keep being decrypted in
     // Kotlin (PomboCrypto) as before — they are low-rate and already work, and
@@ -369,26 +572,24 @@ const api = {
                         });
                     } else if (wallet && String(a.streamId).toLowerCase() ===
                             wallet.address.toLowerCase() + '/pombo-dm-2') {
-                        // A binary on MY OWN DM inbox is a piece sealed with the
-                        // pair's ECDH key ([12B iv][ct+tag], dmCrypto format).
-                        // The only hint of which key opens it is the publisher —
-                        // Kotlin registers each conversation's public key via
-                        // registerDmPeerKey; an unregistered sender is dropped
-                        // (same silence as an unopenable password piece).
-                        const pub = metaOut.publisherId ? String(metaOut.publisherId).toLowerCase() : '';
-                        const peerPk = dmPeerKeys[pub];
-                        if (!peerPk) {
-                            console.warn('DM piece from unregistered peer ' + pub + ' — dropped');
-                            return;
-                        }
-                        api._dmKey(peerPk).then(function (key) {
-                            return crypto.subtle.decrypt(
-                                { name: 'AES-GCM', iv: bin.slice(0, 12) }, key, bin.slice(12));
-                        }).then(function (pt) {
-                            deliver(new Uint8Array(pt));
+                        // A binary on MY OWN DM inbox is a sealed-sender 0x02
+                        // envelope: the epk in the header is everything needed
+                        // to open it with our static key — no peer registry,
+                        // no publisher hint (the publisher is a throwaway).
+                        // The recovered sender rides to Kotlin as `account`;
+                        // what does not open is not ours and is dropped, which
+                        // also covers the 1-in-256 legacy v1 payload whose
+                        // random IV byte happens to be 0x02.
+                        api._openBinary(bin).then(function (opened) {
+                            if (!opened) {
+                                console.warn('DM binary did not open on ' + a.streamId +
+                                    '#' + a.partition + ' — dropped');
+                                return;
+                            }
+                            metaOut.account = opened.sender;
+                            deliver(opened.bytes);
                         }, function (e) {
-                            console.warn('DM binary decrypt failed from ' + pub + ': ' +
-                                (e && e.message || e));
+                            console.warn('DM binary open failed: ' + (e && e.message || e));
                         });
                     } else {
                         deliver(bin);
@@ -433,59 +634,15 @@ const api = {
         return { ok: true };
     },
 
-    // Web streamr.js handleDMDecryptError: a DECRYPT_ERROR on a /Pombo-DM-*
-    // stream means a publisher we never registered the fixed Pombo key for
-    // (subscribeMyInbox only registers self + existing DM peers). Register it
-    // and replay the window FROM STORAGE — the key is local, so this works
-    // even when the publisher is offline or unicast-unreachable, which is
-    // exactly when the SDK's own key request dies.
+    // A DECRYPT_ERROR used to trigger key recovery (register the fixed Pombo
+    // key for the publisher and replay from storage). Nothing to recover any
+    // more: every Pombo publish is EncryptionType.NONE, so an SDK-layer
+    // decrypt error is foreign traffic, or DM history from before the fixed
+    // key was removed — both are ignored on purpose (web P6 does the same).
     async _onSubError(err, streamId, partition) {
         try {
             var msg = err && err.message ? String(err.message) : String(err);
-            if (String(streamId).toLowerCase().indexOf('/pombo-dm-') === -1) {
-                console.warn('subscription error on ' + streamId + '#' + partition + ': ' + msg);
-                return;
-            }
-            var mid = err ? err.messageId : null;
-            if (typeof mid === 'string') { try { mid = JSON.parse(mid); } catch (e) { mid = null; } }
-            var pub = mid && mid.publisherId ? String(mid.publisherId) : null;
-            if (!pub) {
-                var m = msg.match(/(0x[0-9a-fA-F]{40})/);
-                pub = m ? m[1] : null;
-            }
-            if (!pub) { console.warn('DM subscription error (no publisher): ' + msg); return; }
-            pub = pub.toLowerCase();
-            var recKey = streamId + '#' + partition + '|' + pub;
-            if (dmKeyRecovered.has(recKey)) return;
-            dmKeyRecovered.add(recKey);
-            console.warn('DM decrypt recovery: registering key for ' + pub + ' on ' + streamId + '#' + partition);
-            await api.addDMDecryptKey({ publisherId: pub });
-            var ts = (mid && mid.timestamp) || Date.now();
-            // Small delay so the key store settles before the replay (web: 500ms).
-            setTimeout(async function () {
-                try {
-                    var stream = await client.resend(
-                        { streamId: streamId, partition: partition },
-                        { from: { timestamp: ts - 60000 }, to: { timestamp: ts + 60000 } });
-                    var n = 0;
-                    await api._drainResend(stream, function (m2) {
-                        if (String(m2.publisherId).toLowerCase() !== pub) return;
-                        try {
-                            Native.message(streamId, partition,
-                                utf8ToB64(JSON.stringify(m2.content)),
-                                utf8ToB64(JSON.stringify({
-                                    publisherId: String(m2.publisherId),
-                                    timestamp: m2.timestamp,
-                                    sequenceNumber: null
-                                })));
-                            n++;
-                        } catch (e) { /* keep draining */ }
-                    }, Date.now() + 15000);
-                    console.warn('DM decrypt recovery: replayed ' + n + ' message(s) from ' + pub);
-                } catch (e) {
-                    console.warn('DM decrypt recovery failed: ' + (e && e.message ? e.message : e));
-                }
-            }, 500);
+            console.warn('subscription error on ' + streamId + '#' + partition + ': ' + msg);
         } catch (e) { /* an error handler must never throw */ }
     },
 
@@ -528,9 +685,8 @@ const api = {
             } catch (iterError) {
                 if (iterError && (iterError.code === 'DECRYPT_ERROR' ||
                     (iterError.message && iterError.message.indexOf('encryption key') !== -1))) {
-                    if (ctx && String(ctx.streamId).toLowerCase().indexOf('/pombo-dm-') !== -1) {
-                        api._onSubError(iterError, ctx.streamId, ctx.partition);
-                    }
+                    // Skip and carry on — pre-migration rows and foreign
+                    // traffic; there is no key recovery any more (P6).
                     continue;
                 }
                 console.warn('resend iteration error: ' +
@@ -795,6 +951,49 @@ const api = {
 
     // ===== ENS (mainnet reverse lookup, like identity.js resolveENS) =====
 
+    // Reverse-lookup buried among throwaway addresses (identity.js
+    // _lookupWithDecoys): the RPC operator sees N+1 addresses and cannot tell
+    // which one we care about. All N+1 go out CONCURRENTLY and in shuffled
+    // order — issuing the real one first and the decoys after leaves the
+    // ordering as a giveaway. Decoys are inert: results discarded, failures
+    // swallowed; only the real lookup's outcome propagates.
+    async _lookupWithDecoys(provider, address, withCover) {
+        var count = withCover ? ENS_DECOY_COUNT : 0;
+        if (count <= 0) return provider.lookupAddress(address);
+
+        var slots = [{ real: true, addr: address }];
+        try {
+            for (var i = 0; i < count; i++) {
+                slots.push({ real: false, addr: window.ethers.hexlify(window.ethers.randomBytes(20)) });
+            }
+        } catch (e) {
+            // No RNG available — resolve without cover rather than not at all.
+            return provider.lookupAddress(address);
+        }
+
+        // Fisher-Yates with crypto randomness, so the real address's position
+        // is not derivable from a predictable PRNG sequence.
+        var rand = crypto.getRandomValues(new Uint32Array(slots.length));
+        for (var i = slots.length - 1; i > 0; i--) {
+            var j = rand[i] % (i + 1);
+            var tmp = slots[i]; slots[i] = slots[j]; slots[j] = tmp;
+        }
+
+        var realResult = null;
+        var realError = null;
+        await Promise.all(slots.map(async function (slot) {
+            try {
+                var result = await provider.lookupAddress(slot.addr);
+                if (slot.real) realResult = result;
+            } catch (error) {
+                if (slot.real) realError = error;
+            }
+        }));
+
+        if (realError) throw realError;
+        return realResult;
+    },
+
     async resolveEns(a) {
         var addr = String(a.address || '');
         if (!ensProviders) {
@@ -803,9 +1002,15 @@ const api = {
                 catch (e) { return null; }
             }).filter(Boolean);
         }
+        // Cover traffic goes out ONCE per resolution, not once per provider:
+        // a null result still walks every provider, so decoying each attempt
+        // multiplies the request count until the free tiers answer HTTP 429
+        // (identity.js _doResolveENS learned this the hard way).
+        var coverUsed = false;
         for (var i = 0; i < ensProviders.length; i++) {
             try {
-                var name = await ensProviders[i].lookupAddress(addr);
+                var name = await api._lookupWithDecoys(ensProviders[i], addr, !coverUsed);
+                coverUsed = true;
                 if (name) return { name: name };
             } catch (e) { /* try the next provider */ }
         }
@@ -864,6 +1069,208 @@ const api = {
             } catch (e) { /* try the next provider */ }
         }
         return { address: null };
+    },
+
+    // ===== DMs — sealed sender v2, byte-compatible with web dmCrypto.js =====
+    //
+    // v1 derived the conversation key from ECDH(sender.static, recipient.static),
+    // so the recipient had to know WHO sent a message before picking a key —
+    // the sender's identity had to ride the publisherId, handing the full
+    // (sender → recipient) edge to anyone watching the inbox stream.
+    //
+    // v2 replaces the sender's static key with a throwaway one:
+    //
+    //     AES = HKDF( ECDH(ephemeral.priv, recipient.staticPub) )
+    //
+    // The recipient does ECDH with its OWN static key and the cleartext `epk`
+    // — no idea who sent it, and no need to guess. O(1), not trial decryption.
+    // The real sender is inside the ciphertext, as `p`: a signature binding
+    // their wallet to this ephemeral key FOR THIS RECIPIENT, so a captured
+    // proof cannot be replayed into someone else's inbox. The same ephemeral
+    // key doubles as the Streamr publishing identity.
+
+    // Throwaway secp256k1 key from the CSPRNG directly — never from a wallet
+    // helper. A uniform 32-byte value can land outside the curve order
+    // (~2^-128); retrying is free, so we do.
+    _genEphemeralPk() {
+        for (var attempt = 0; attempt < 4; attempt++) {
+            var candidate = window.ethers.hexlify(crypto.getRandomValues(new Uint8Array(32)));
+            try { new window.ethers.SigningKey(candidate); return candidate; }
+            catch (e) { /* out of range — draw again */ }
+        }
+        throw new Error('Could not generate a valid ephemeral key');
+    },
+
+    // keccak256("POMBO_DM_BIND_V2|" + lowercase(recipient) + "|" + epk)
+    _bindDigestV2(recipientAddress, ephemeralPublicKey) {
+        return window.ethers.keccak256(window.ethers.toUtf8Bytes(
+            'POMBO_DM_BIND_V2|' + String(recipientAddress).toLowerCase() + '|' + ephemeralPublicKey));
+    },
+
+    // Symmetric: the sender passes (ephemeral.priv, recipient.staticPub), the
+    // recipient passes (own static priv, envelope epk). The salt differs from
+    // v1 ('pombo-dm-e2e-v1') ON PURPOSE — domain separation so the two schemes
+    // can never derive the same key from the same secret. No cache: every
+    // envelope has a fresh epk, so there is nothing to hit.
+    async _sealedKey(privateKeyHex, publicKeyHex) {
+        const sk = new window.ethers.SigningKey(privateKeyHex);
+        const sharedBytes = window.ethers.getBytes(sk.computeSharedSecret(publicKeyHex)).slice(1, 33);
+        const km = await crypto.subtle.importKey('raw', sharedBytes, { name: 'HKDF' }, false, ['deriveKey']);
+        return crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256',
+              salt: new TextEncoder().encode('pombo-dm-sealed-v2'),
+              info: new TextEncoder().encode('aes-256-gcm') },
+            km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    },
+
+    // Seal a JSON message and publish it under the ephemeral key, in one call
+    // — the ephemeral private key never crosses the bridge and dies here.
+    //   { streamId, partition, recipientAddress, recipientPublicKey, message }
+    //   -> { ok, timestamp, epk }
+    async dmSealPublish(a) {
+        if (!wallet) throw new Error('no identity');
+        api._refuseAdminStream(a.streamId);
+        const ephemeralPrivateKey = api._genEphemeralPk();
+        const epk = new window.ethers.SigningKey(ephemeralPrivateKey).compressedPublicKey;
+
+        const aesKey = await api._sealedKey(ephemeralPrivateKey, String(a.recipientPublicKey));
+        const digest = api._bindDigestV2(a.recipientAddress, epk);
+        const proof = new window.ethers.SigningKey(wallet.privateKey).sign(digest).serialized;
+
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const pt = new TextEncoder().encode(JSON.stringify(Object.assign({ p: proof }, a.message)));
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, aesKey, pt));
+
+        const envelope = { v: 2, epk: epk, ct: u8ToB64(ct), iv: u8ToB64(iv), e: 'aes-256-gcm' };
+        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(ephemeralPrivateKey);
+        const msg = await api._publishAs(identity, a.streamId, a.partition, envelope);
+        return { ok: true, timestamp: msg.timestamp, epk: epk };
+    },
+
+    // Open sealed envelopes addressed to us. Batched for history pages — the
+    // per-item cost is one ECDH+HKDF+AES (~1ms); the bridge hop is what the
+    // batch saves. Entries that are not v2 envelopes, do not decrypt (not
+    // ours / tampered), or carry no proof come back null — per-item, so one
+    // bad row never takes the page down.
+    //
+    // The digest is recomputed with OUR OWN address: a proof bound to someone
+    // else's inbox recovers a different, meaningless address rather than
+    // "failing". The sender is only knowable AFTER this — that inversion is
+    // the whole point of sealed sender (open first, identify after).
+    //   { items: [envelope|null] } -> { results: [{ sender, message } | null] }
+    async dmOpenBatch(a) {
+        if (!wallet) throw new Error('no identity');
+        const myAddress = wallet.address;
+        const out = await Promise.all((a.items || []).map(async function (env) {
+            try {
+                if (!env || env.v !== 2 || typeof env.epk !== 'string' ||
+                    typeof env.ct !== 'string' || typeof env.iv !== 'string') return null;
+                const aesKey = await api._sealedKey(wallet.privateKey, env.epk);
+                const pt = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: b64ToU8(env.iv) }, aesKey, b64ToU8(env.ct));
+                const inner = JSON.parse(new TextDecoder().decode(new Uint8Array(pt)));
+                if (!inner || typeof inner.p !== 'string') return null;
+                const digest = api._bindDigestV2(myAddress, env.epk);
+                const sender = window.ethers.recoverAddress(digest, inner.p).toLowerCase();
+                delete inner.p;
+                return { sender: sender, message: inner };
+            } catch (e) { return null; }
+        }));
+        return { results: out };
+    },
+
+    // ===== sealed sender — binary (media pieces / storage chunks) =====
+    //
+    //   wire:      [v:1=0x02][epk:33][iv:12][ct:...]
+    //   plaintext: [proof:65][payload:...]
+    //
+    // ONE EPHEMERAL KEY PER TRANSFER, not per piece: epk and proof are fixed
+    // for the transfer, so the sealer computes them once and every piece
+    // reuses them. Kotlin owns the sealer's lifetime via an opaque key (one
+    // per file+peer); the ephemeral private key never leaves this map.
+    _binarySealers: {},
+
+    //   { key, recipientAddress, recipientPublicKey } -> { epk }
+    async dmBinarySealerCreate(a) {
+        if (!wallet) throw new Error('no identity');
+        const existing = api._binarySealers[a.key];
+        if (existing) return { epk: existing.epk };
+        const ephemeralPrivateKey = api._genEphemeralPk();
+        const epk = new window.ethers.SigningKey(ephemeralPrivateKey).compressedPublicKey;
+        const aesKey = await api._sealedKey(ephemeralPrivateKey, String(a.recipientPublicKey));
+        const digest = api._bindDigestV2(a.recipientAddress, epk);
+        const proofBytes = window.ethers.getBytes(
+            new window.ethers.SigningKey(wallet.privateKey).sign(digest).serialized);
+        api._binarySealers[a.key] = {
+            epk: epk,
+            epkBytes: window.ethers.getBytes(epk),
+            aesKey: aesKey,
+            proofBytes: proofBytes,
+            identityPk: ephemeralPrivateKey
+        };
+        return { epk: epk };
+    },
+
+    async dmBinarySealerDrop(a) {
+        delete api._binarySealers[a.key];
+        return { ok: true };
+    },
+
+    // Per-transfer throwaway PUBLISHING identity for DM storage chunks. The
+    // chunk bytes stay on the v1 pair key (no epk in the row — see
+    // bridgePublishStorageChunk); only the publisher is disposable. Kotlin
+    // needs the address back: upload verification matches stored rows by
+    // timestamp AND this publisher, exactly as the web passes chunkPublisher.
+    _chunkIdentities: {},
+
+    //   { key } -> { address }
+    async dmChunkIdentityCreate(a) {
+        var pk = api._chunkIdentities[a.key];
+        if (!pk) {
+            pk = api._genEphemeralPk();
+            api._chunkIdentities[a.key] = pk;
+        }
+        return { address: new window.ethers.Wallet(pk).address.toLowerCase() };
+    },
+
+    async dmChunkIdentityDrop(a) {
+        delete api._chunkIdentities[a.key];
+        return { ok: true };
+    },
+
+    async _sealBinaryWith(sealer, bytes) {
+        const plain = new Uint8Array(sealer.proofBytes.length + bytes.length);
+        plain.set(sealer.proofBytes, 0);
+        plain.set(bytes, sealer.proofBytes.length);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = new Uint8Array(await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: iv }, sealer.aesKey, plain));
+        const out = new Uint8Array(1 + sealer.epkBytes.length + 12 + ct.length);
+        out[0] = 0x02;
+        out.set(sealer.epkBytes, 1);
+        out.set(iv, 1 + sealer.epkBytes.length);
+        out.set(ct, 1 + sealer.epkBytes.length + 12);
+        return out;
+    },
+
+    // Open a sealed binary envelope with our own static key. Returns null on
+    // anything that is not ours — including the 1-in-256 legacy v1 payload
+    // whose random IV byte happens to be 0x02, which is why detection is
+    // try-and-fall-back, never a bare byte test.
+    async _openBinary(bytes) {
+        try {
+            // 1 + 33 + 12 + 16 (tag) + 65 (proof) = 127 = shortest legal envelope
+            if (!bytes || bytes.length < 127 || bytes[0] !== 0x02) return null;
+            const epk = window.ethers.hexlify(bytes.slice(1, 34));
+            const aesKey = await api._sealedKey(wallet.privateKey, epk);
+            const plain = new Uint8Array(await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: bytes.slice(34, 46) }, aesKey, bytes.slice(46)));
+            if (plain.length < 65) return null;
+            const digest = api._bindDigestV2(wallet.address, epk);
+            const sender = window.ethers.recoverAddress(
+                digest, window.ethers.hexlify(plain.slice(0, 65))).toLowerCase();
+            return { sender: sender, bytes: plain.slice(65) };
+        } catch (e) { return null; }
     },
 
     // ===== DMs (E2E) — byte-compatible with dmCrypto.js =====
@@ -925,73 +1332,6 @@ const api = {
         throw new Error('PoW timeout - could not find valid nonce');
     },
 
-    // ===== Streamr-layer DM key =====
-    //
-    // Pombo pre-agrees one symmetric key for every /Pombo-DM-* stream instead
-    // of running Streamr key exchange. It ships in the public web bundle, so
-    // it is not a secret — the real end-to-end protection is the per-pair ECDH
-    // envelope on top. Without it we cannot read anything the web published
-    // ("Could not get encryption key pombo-dm-v1") and the web cannot read us.
-    _pomboKey() {
-        if (!window.EncryptionKey || !window.ethers) return null;
-        var bytes = window.ethers.getBytes('0x' + DM_KEY_HEX);
-        var data;
-        if (typeof Buffer !== 'undefined' && Buffer.from) {
-            data = Buffer.from(DM_KEY_HEX, 'hex');
-        } else {
-            // No Buffer global in the WebView (the web app gets one from its
-            // bundler). The SDK only gates on `Buffer.isBuffer`, which is
-            // `e._isBuffer === true`, so a tagged Uint8Array satisfies it and
-            // carries the same 32 bytes.
-            data = bytes;
-            Object.defineProperty(data, '_isBuffer', { value: true, enumerable: false });
-        }
-        return new window.EncryptionKey(DM_KEY_ID, data);
-    },
-
-    async setDMPublishKey(a) {
-        if (!client) return { ok: false };
-        var streamId = String(a.streamId || '');
-        if (streamId.toLowerCase().indexOf('/pombo-dm-') === -1) return { ok: false };
-        if (dmPublishKeySet.has(streamId)) return { ok: true };
-        try {
-            var key = api._pomboKey();
-            if (!key) return { ok: false };
-            if (typeof client.updateEncryptionKey === 'function') {
-                // 'rekey', not 'rotate', matching the web (streamr.js
-                // setDMPublishKey). A rotation announces the new key WRAPPED IN
-                // THE CURRENT ONE, so a subscriber that never held a previous
-                // key cannot unwrap it and has to fall back to a live key
-                // request to the publisher. A rekey is distributed per entitled
-                // subscriber, which is the case that matters here: the first DM
-                // from a stranger, whose publisher id the receiver has not
-                // registered yet. Both sides pre-load this same fixed key
-                // locally (addDMDecryptKey), so in practice the distribution
-                // rarely runs — but when it does, this is the one that works.
-                await client.updateEncryptionKey({ streamId: streamId, distributionMethod: 'rekey', key: key });
-                dmPublishKeySet.add(streamId);
-            }
-            return { ok: true };
-        } catch (e) {
-            // Non-fatal: a rekey can fail if one is already in flight.
-            return { ok: false, error: String(e && e.message || e) };
-        }
-    },
-
-    async addDMDecryptKey(a) {
-        if (!client) return { ok: false };
-        try {
-            var key = api._pomboKey();
-            if (!key) return { ok: false };
-            if (typeof client.addEncryptionKey === 'function') {
-                await client.addEncryptionKey(key, String(a.publisherId).toLowerCase());
-            }
-            return { ok: true };
-        } catch (e) {
-            return { ok: false, error: String(e && e.message || e) };
-        }
-    },
-
     // Compressed public key of the active identity (33 bytes hex).
     async getMyPublicKey() {
         if (!wallet) throw new Error('no identity');
@@ -1037,6 +1377,32 @@ const api = {
         return promise;
     },
 
+    // Publisher-proof recovery (web publisherProof.js recoverPublisherAccount):
+    //
+    //   digest = keccak256(utf8('POMBO_PUB_V1|' + lowercase(publisherId)))
+    //   proof  = raw 65-byte ECDSA over that digest (SigningKey.sign — NOT
+    //            personal_sign, so ethers.recoverAddress, not verifyMessage)
+    //
+    // The digest is rebuilt from the publisherId that arrived ON THE WIRE —
+    // that binding is the whole security argument: a proof lifted onto another
+    // publisher recovers a different, meaningless address. Failures come back
+    // as null, not errors: a malformed proof is untrusted input on a public
+    // stream, not an exceptional condition. Kotlin caches by (publisherId,
+    // proof), so this runs once per ephemeral key, not once per message.
+    //   { items: [{ publisherId, proof }] } -> { accounts: [address|null] }
+    async recoverPublisherProofBatch(a) {
+        var out = [];
+        var items = a.items || [];
+        for (var i = 0; i < items.length; i++) {
+            try {
+                var digest = window.ethers.keccak256(window.ethers.toUtf8Bytes(
+                    'POMBO_PUB_V1|' + String(items[i].publisherId).toLowerCase()));
+                out.push(window.ethers.recoverAddress(digest, String(items[i].proof)).toLowerCase());
+            } catch (e) { out.push(null); }
+        }
+        return { accounts: out };
+    },
+
     // One evaluateJavascript round-trip for a page of signature checks (web
     // verifies in a worker pool; the WebView is single-threaded, so the win
     // here is the per-call bridge overhead on large resends).
@@ -1052,59 +1418,11 @@ const api = {
         return { addresses: out };
     },
 
-    // { address, publicKey } — see dmPeerKeys above.
-    async registerDmPeerKey(a) {
-        if (!a.address || !a.publicKey) throw new Error('address and publicKey required');
-        dmPeerKeys[String(a.address).toLowerCase()] = String(a.publicKey);
-        return { ok: true };
-    },
-
-    // message (JSON obj) -> {ct, iv, e}
-    async dmEncrypt(a) {
-        if (!wallet) throw new Error('no identity');
-        const key = await api._dmKey(a.peerPublicKey);
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const pt = new TextEncoder().encode(JSON.stringify(a.message));
-        const ctBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, pt);
-        function b64(buf) { const u = new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s); }
-        return { envelope: { ct: b64(ctBuf), iv: b64(iv), e: 'aes-256-gcm' } };
-    },
-
-    // {ct, iv, e} -> message (JSON obj)
-    async dmDecrypt(a) {
-        if (!wallet) throw new Error('no identity');
-        if (!a.envelope || a.envelope.e !== 'aes-256-gcm') throw new Error('unknown DM encryption');
-        const key = await api._dmKey(a.peerPublicKey);
-        function fromB64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
-        const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(a.envelope.iv) }, key, fromB64(a.envelope.ct));
-        return { message: JSON.parse(new TextDecoder().decode(pt)) };
-    },
-
-    // One evaluateJavascript round-trip for a whole page of DM envelopes, the
-    // same shape as pwDecryptBatch. The inbox replay used to call dmDecrypt once
-    // per message, so a 100-message history cost 100 sequential main-thread hops
-    // — and the hop IS the cost here: the ECDH->HKDF key is cached per peer in
-    // _dmKey, leaving only an AES-GCM open per item.
-    //
-    // Entries the caller could not prepare (unknown peer key, not an envelope)
-    // arrive as null and come back as null; failures are per-item, so one bad
-    // payload never takes the page down.
-    //   { items: [{ peerPublicKey, envelope } | null] } -> { messages: [json-string|null] }
-    async dmDecryptBatch(a) {
-        if (!wallet) throw new Error('no identity');
-        function fromB64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
-        const dec = new TextDecoder();
-        const out = await Promise.all((a.items || []).map(async function (it) {
-            try {
-                if (!it || !it.envelope || it.envelope.e !== 'aes-256-gcm') return null;
-                const key = await api._dmKey(String(it.peerPublicKey));
-                const pt = await crypto.subtle.decrypt(
-                    { name: 'AES-GCM', iv: fromB64(it.envelope.iv) }, key, fromB64(it.envelope.ct));
-                return dec.decode(pt);
-            } catch (e) { return null; }
-        }));
-        return { messages: out };
-    },
+    // v1 JSON envelopes (dmEncrypt/dmDecrypt/dmDecryptBatch) and the per-peer
+    // key registry (registerDmPeerKey) are gone: every JSON DM surface is
+    // sealed sender v2 now (dmSealPublish/dmOpenBatch), and the binary receive
+    // path opens by the epk in the envelope. _dmKey stays for the one v1
+    // survivor — DM storage chunks.
 
     // DM storage-chunk download: resend a time window from the RECEIVER's OWN
     // inbox (a DM inbox is private at the Streamr layer, so direct HTTP would
@@ -1553,20 +1871,44 @@ window.bridgePublishBinary = function (id, argsB64, dataB64) {
         if (!client) throw new Error('client not connected');
         const a = JSON.parse(b64ToUtf8(argsB64));
         let bytes = b64ToU8(dataB64);
+        // Channel piece under the channel's ephemeral identity (web media.js
+        // FILE_PIECE_SIGNED): the 0x01 frame from Kotlin is rewritten as
+        //   [0x03][proof:65][fileId:36][idx:4][data]
+        // with the channel identity's proof — computed once per channel
+        // session, reused by every piece — THEN password-sealed, and
+        // published under that same identity. A wallet-published piece would
+        // undo the pseudonym for the whole transfer.
+        if (a.channelEphemeral) {
+            if (bytes.length < 1 || bytes[0] !== 0x01) throw new Error('channelEphemeral expects a 0x01 piece frame');
+            const entry = api._channelIdentity(a.streamId);
+            const proofBytes = window.ethers.getBytes(entry.proof);
+            const signed = new Uint8Array(1 + proofBytes.length + (bytes.length - 1));
+            signed[0] = 0x03;
+            signed.set(proofBytes, 1);
+            signed.set(bytes.subarray(1), 1 + proofBytes.length);
+            bytes = signed;
+            if (a.password) bytes = await pwEncryptBinary(bytes, String(a.password));
+            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(entry.identityPk);
+            await api._publishAs(identity, a.streamId, a.partition, bytes);
+            Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
+            return;
+        }
         // Encrypted here for the same reason it is decrypted here: PBKDF2 in
         // BoringSSL rather than Bouncy Castle. The password never leaves the
         // WebView on this path — Kotlin hands over plaintext bytes.
         if (a.password) bytes = await pwEncryptBinary(bytes, String(a.password));
-        // DM piece: sealed with the pair's ECDH key, web dmCrypto.encryptBinary
-        // format ([12B iv][ct+tag]). Mutually exclusive with password by
-        // construction — a DM has no channel password.
-        else if (a.dmPeerPublicKey) {
-            const key = await api._dmKey(String(a.dmPeerPublicKey));
-            const iv = crypto.getRandomValues(new Uint8Array(12));
-            const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, bytes));
-            const sealed = new Uint8Array(12 + ct.length);
-            sealed.set(iv, 0); sealed.set(ct, 12);
-            bytes = sealed;
+        // DM piece: sealed-sender 0x02 envelope (web dmCrypto.createBinarySealer),
+        // one ephemeral key per transfer, published UNDER that same throwaway
+        // identity — the wallet address never appears on the wire. Mutually
+        // exclusive with password by construction — a DM has no channel password.
+        else if (a.dmSealerKey) {
+            const sealer = api._binarySealers[a.dmSealerKey];
+            if (!sealer) throw new Error('unknown dm sealer: ' + a.dmSealerKey);
+            bytes = await api._sealBinaryWith(sealer, bytes);
+            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(sealer.identityPk);
+            await api._publishAs(identity, a.streamId, a.partition, bytes);
+            Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
+            return;
         }
         await client.publish({ streamId: a.streamId, partition: a.partition }, bytes);
         Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
@@ -1599,10 +1941,12 @@ window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
         if (!client) throw new Error('client not connected');
         const a = JSON.parse(b64ToUtf8(argsB64));
         let bytes = b64ToU8(dataB64);
-        // DM chunk: sealed with the pair's ECDH key ([12B iv][ct+tag]) — the same
-        // format as the mesh DM piece path. Native crypto handles password/public
-        // channels (one PBKDF2 per file), but ECDH lives only here, so DM chunks
-        // seal in the bridge. The receiver opens them via resendStorageChunksDm.
+        // DM chunk: sealed with the pair's ECDH key ([12B iv][ct+tag]) — the
+        // web kept storage chunks on the v1 pair-static key ON PURPOSE (no epk
+        // in the chunk row; the download derives the key from the announce's
+        // proof-recovered sender). What DID change is the publisher: chunks go
+        // out under a per-transfer throwaway identity (chunkIdentityKey), so
+        // the wallet address no longer stamps every row of a file transfer.
         if (a.dmPeerPublicKey) {
             const key = await api._dmKey(String(a.dmPeerPublicKey));
             const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -1610,6 +1954,15 @@ window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
             const sealed = new Uint8Array(12 + ct.length);
             sealed.set(iv, 0); sealed.set(ct, 12);
             bytes = sealed;
+        }
+        if (a.chunkIdentityKey) {
+            const pk = api._chunkIdentities[a.chunkIdentityKey];
+            if (!pk) throw new Error('unknown chunk identity: ' + a.chunkIdentityKey);
+            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(pk);
+            const msg2 = await api._publishAs(identity, a.streamId, a.partition, bytes);
+            Native.result(id, true, utf8ToB64(JSON.stringify(
+                { ok: true, bytes: bytes.length, timestamp: msg2.timestamp })));
+            return;
         }
         const msg = await client.publish(
             { streamId: a.streamId, partition: a.partition },
@@ -1646,6 +1999,11 @@ async function boot() {
         // Config identical to the web streamr.js init().
         client = new window.StreamrClient({
             auth: { privateKey: BRIDGE_PK },
+            // Without this the SDK publishes node telemetry every minute to
+            // streamr.eth/metrics/nodes/firehose/*, signed with the REAL
+            // account (auth.privateKey does not count as auth.ethereum, so the
+            // SDK default keeps the metrics periods). Web P0.1 equivalent.
+            metrics: false,
             network: {
                 controlLayer: {
                     maxMessageSize: 1048576,

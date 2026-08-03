@@ -44,6 +44,13 @@ dependencies {
     // FCM: receives the relay wake signals as data-only messages.
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging-ktx")
+    // Full Bouncy Castle for the dead-app push path ONLY: opening a sealed-
+    // sender DM envelope needs secp256k1 ECDH + keccak256 + ecrecover, none of
+    // which Android's stripped BC has, and the WebView bridge is not running
+    // when FCM wakes a dead process. Used via direct class references (no JCA
+    // provider registration), byte-parity locked by SealedSenderCryptoTest
+    // vectors generated with the web's own ethers.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
     // Real org.json for JVM unit tests — the Android stub throws "not mocked".
     testImplementation("org.json:json:20240303")
     testImplementation("junit:junit:4.13.2")

@@ -17,7 +17,7 @@ import org.json.JSONObject
  *
  * Only [chunkMetaJson]'s `transferId` is load-bearing on the receive side (it is
  * matched against the announce); every other field is informational — the real
- * fileName/compression/sizes come from the signed announce, not the chunk meta.
+ * fileName/compression/sizes come from the announce, not the chunk meta.
  */
 object StorageWire {
 

@@ -250,8 +250,17 @@ class PomboBridge(
         partition: Int,
         data: ByteArray,
         password: String? = null,
-        /** DM piece: sealed in the bridge with the pair's ECDH key instead. */
-        dmPeerPublicKey: String? = null,
+        /**
+         * DM piece: key of a bridge-held sealed-sender binary sealer (one per
+         * transfer, created via dmBinarySealerCreate). The bridge seals the
+         * 0x02 envelope AND publishes under the sealer's throwaway identity.
+         */
+        dmSealerKey: String? = null,
+        /**
+         * Channel piece: the bridge rewrites the 0x01 frame as 0x03 with the
+         * channel identity's inline proof and publishes under that identity.
+         */
+        channelEphemeral: Boolean = false,
         timeoutMs: Long = 45_000
     ) {
         withTimeout(timeoutMs) { pageReadyFlow.first { it } }
@@ -261,7 +270,8 @@ class PomboBridge(
         pending[id] = deferred
         val args = JSONObject().put("streamId", streamId).put("partition", partition)
         if (password != null) args.put("password", password)
-        if (dmPeerPublicKey != null) args.put("dmPeerPublicKey", dmPeerPublicKey)
+        if (dmSealerKey != null) args.put("dmSealerKey", dmSealerKey)
+        if (channelEphemeral) args.put("channelEphemeral", true)
         val argsB64 = Base64.encodeToString(args.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val dataB64 = Base64.encodeToString(data, Base64.NO_WRAP)
         inFlightBytes.addAndGet(data.size.toLong())
@@ -296,6 +306,12 @@ class PomboBridge(
         data: ByteArray,
         /** DM chunk: sealed in the bridge with the pair's ECDH key ([iv][ct]). */
         dmPeerPublicKey: String? = null,
+        /**
+         * DM chunk: key of a bridge-held per-transfer throwaway identity
+         * (dmChunkIdentityCreate). The chunk bytes stay on the pair key; only
+         * the PUBLISHER is disposable, and upload verify matches its address.
+         */
+        chunkIdentityKey: String? = null,
         timeoutMs: Long = 45_000
     ): Long {
         withTimeout(timeoutMs) { pageReadyFlow.first { it } }
@@ -305,6 +321,7 @@ class PomboBridge(
         pending[id] = deferred
         val args = JSONObject().put("streamId", streamId).put("partition", partition)
         if (dmPeerPublicKey != null) args.put("dmPeerPublicKey", dmPeerPublicKey)
+        if (chunkIdentityKey != null) args.put("chunkIdentityKey", chunkIdentityKey)
         val argsB64 = Base64.encodeToString(args.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val dataB64 = Base64.encodeToString(data, Base64.NO_WRAP)
         inFlightBytes.addAndGet(data.size.toLong())

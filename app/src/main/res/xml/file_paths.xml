@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The only path the FileProvider exposes: the scratch directory the camera
+    app writes a capture into. cacheDir is deliberate here — the file is a
+    hand-off that lives for the seconds between ACTION_IMAGE_CAPTURE and the
+    encoder reading it, so the OS purging it costs nothing. (Persistent caches
+    still belong in filesDir; cacheDir loses them between launches.)
+-->
+<paths>
+    <cache-path name="camera" path="camera/" />
+</paths>

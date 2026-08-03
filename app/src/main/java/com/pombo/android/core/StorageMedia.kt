@@ -42,7 +42,7 @@ private typealias Win = StorageWindows.Window
  * coordinate and the web's standalone-controller shape is the right one.
  *
  * This file covers both halves: upload (warm-up, paced publish with the full
- * auto-tune v3 oscillator, timestamp-based verify & repair, signed announce)
+ * auto-tune v3 oscillator, timestamp-based verify & repair, announce)
  * and download (windowed HTTP/resend fetch into resumable staging, then
  * assemble/inflate).
  *
@@ -74,13 +74,11 @@ class StorageMedia(
 
     /** How the engine reaches the network for anything that is NOT a raw chunk publish. */
     interface Transport {
-        /** keccak256(utf8(data)) + personal_sign via the bridge; returns the signature hex. */
-        suspend fun signCanonical(data: String): String
-
         /**
-         * Publish the signed announce as a normal P0 message, sealed by the
-         * channel's rules (the single sealing point — password AES-GCM / DM
-         * envelope), and return the publish timestamp for the confirm loop.
+         * Publish the announce as a normal P0 message, sealed by the
+         * channel's rules (the single sealing point — ephemeral identity +
+         * proof / password AES-GCM / DM sealed sender), and return the
+         * publish timestamp for the confirm loop.
          */
         suspend fun publishAnnounce(messageStreamId: String, announce: JSONObject, password: String?, isDm: Boolean): Long
 
@@ -265,15 +263,24 @@ class StorageMedia(
 
     private suspend fun readStoredIndices(
         sid: String, windows: List<Win>, tsIndex: Map<String, Int>, bases: List<String>,
-        label: String, stats: ReadStats? = null, onProgress: ((Set<Int>) -> Unit)? = null
+        label: String, stats: ReadStats? = null,
+        /**
+         * Which publisher our own chunks carry. The wallet for channel
+         * uploads — but a DM transfer publishes under a per-transfer
+         * throwaway identity, and filtering by the wallet there would
+         * classify every one of OUR OWN rows as foreign and verify blind
+         * (trap 1 of the migration, storage flavour).
+         */
+        expectedPublisher: String? = null,
+        onProgress: ((Set<Int>) -> Unit)? = null
     ): Set<Int> {
         val found = Collections.synchronizedSet(HashSet<Int>())
-        val myAddress = (transport.myAddress() ?: "").lowercase()
+        val expected = (expectedPublisher ?: transport.myAddress() ?: "").lowercase()
         val next = AtomicInteger(0)
         val lock = Any()
         fun matchTs(partition: Int, timestamp: Long, publisherId: String?) {
             synchronized(lock) { stats?.let { it.rows++ } }
-            if (myAddress.isNotEmpty() && publisherId != null && publisherId.lowercase() != myAddress) {
+            if (expected.isNotEmpty() && publisherId != null && publisherId.lowercase() != expected) {
                 synchronized(lock) { stats?.let { it.foreignRows++ } }; return
             }
             tsIndex["$partition:$timestamp"]?.let { found.add(it) }
@@ -439,10 +446,15 @@ class StorageMedia(
                 return sealer.seal(StorageWire.packChunkPayload(metaBytes, curTc(), i, cd))
             }
 
-            // DMs: force the well-known Streamr-layer key before any publish to the
-            // peer inbox, or the SDK key exchange poisons the resends the receiver
-            // reads (same rule as every other DM publish).
-            if (isDm) bridge.call("setDMPublishKey", JSONObject().put("streamId", messageStreamId))
+            // DM chunks publish under a per-transfer throwaway identity (web
+            // storageMedia chunkIdentity): the wallet must not stamp every row
+            // of a file transfer in the peer's inbox. The chunk bytes stay on
+            // the v1 pair key — only the publisher is disposable — and upload
+            // verify has to match THIS address, not ours.
+            val chunkIdentityKey = if (isDm) "chunks|$messageStreamId|$tid" else null
+            val verifyPublisher = chunkIdentityKey?.let {
+                bridge.call("dmChunkIdentityCreate", JSONObject().put("key", it)).getString("address")
+            }
 
             warmUpPartitions(messageStreamId, firstPart) { up.phase = it; emit(up) }
 
@@ -509,7 +521,10 @@ class StorageMedia(
             suspend fun publishOne(i: Int): Int {
                 val pay = buildPayload(i)
                 awaitSendSlot()
-                val ts = publishChunkWithRetry(messageStreamId, chunkPartition(i), pay, if (isDm) dmPeerPublicKey else null)
+                val ts = publishChunkWithRetry(
+                    messageStreamId, chunkPartition(i), pay,
+                    if (isDm) dmPeerPublicKey else null, chunkIdentityKey
+                )
                 chunkTs[i] = ts
                 chunkTsHist.getOrPut(i) { ArrayList() }.add(ts)
                 return pay.size
@@ -606,14 +621,14 @@ class StorageMedia(
                 val step = max(1, cand.size / 5)
                 var k = 0; while (k < cand.size && sample.size < 5) { sample.add(cand[k]); k += step }
                 val st = ReadStats()
-                val found = readStoredIndices(messageStreamId, windowsForIndices(sample), tsIndexForVerify(), bases, "auto-tune probe", st)
+                val found = readStoredIndices(messageStreamId, windowsForIndices(sample), tsIndexForVerify(), bases, "auto-tune probe", st, expectedPublisher = verifyPublisher)
                 stored.addAll(found)
                 val missed = sample.filter { !found.contains(it) }
                 if (missed.isNotEmpty()) {
                     if (st.winsOk == 0) { Log.w(TAG, "auto-tune probe: every verify read failed — skipping judgement"); return }
                     if (atState != "drain") {
                         delay(2500)
-                        val found2 = readStoredIndices(messageStreamId, windowsForIndices(missed), tsIndexForVerify(), bases, "cut confirmation")
+                        val found2 = readStoredIndices(messageStreamId, windowsForIndices(missed), tsIndexForVerify(), bases, "cut confirmation", expectedPublisher = verifyPublisher)
                         stored.addAll(found2)
                         val confirmed = missed.filter { !found2.contains(it) }
                         if (confirmed.isEmpty()) return
@@ -707,7 +722,7 @@ class StorageMedia(
                 var missing = missingIdx()
                 if (missing.isNotEmpty()) {
                     up.phase = "Verifying on storage…"; emit(up)
-                    val found = readStoredIndices(messageStreamId, allPartitionWindows(firstChunkTs - 15000, wall() + 1000), tsIndexForVerify(), bases, "full sweep") { fs ->
+                    val found = readStoredIndices(messageStreamId, allPartitionWindows(firstChunkTs - 15000, wall() + 1000), tsIndexForVerify(), bases, "full sweep", expectedPublisher = verifyPublisher) { fs ->
                         stored.addAll(fs); updBar(); up.phase = "Verifying: ${stored.size}/$tc confirmed…"; emitThrottled(up)
                     }
                     stored.addAll(found); missing = missingIdx(); updBar()
@@ -719,7 +734,7 @@ class StorageMedia(
                     while (missing.isNotEmpty() && stalledReal < 2 && zeroProgress < 24 && perf() - scStart < 5 * 60000) {
                         delay(2500)
                         val before = missing.size
-                        stored.addAll(readStoredIndices(messageStreamId, windowsForIndices(missing), tsIndexForVerify(), bases, "drain"))
+                        stored.addAll(readStoredIndices(messageStreamId, windowsForIndices(missing), tsIndexForVerify(), bases, "drain", expectedPublisher = verifyPublisher))
                         missing = missingIdx(); updBar()
                         if (missing.size < before) { zeroProgress = 0; stalledReal = 0 } else {
                             zeroProgress++
@@ -744,7 +759,7 @@ class StorageMedia(
                     while (r < 30 && missing.isNotEmpty()) {
                         r++
                         delay(2000)
-                        stored.addAll(readStoredIndices(messageStreamId, windowsForIndices(missing), tsIndexForVerify(), bases, "post-repair pass $pass"))
+                        stored.addAll(readStoredIndices(messageStreamId, windowsForIndices(missing), tsIndexForVerify(), bases, "post-repair pass $pass", expectedPublisher = verifyPublisher))
                         val before = missing.size; missing = missingIdx(); updBar()
                         if (missing.size < before) { noProg = 0; continue }
                         noProg++; if (noProg >= 6) { Log.w(TAG, "$noProg reads with no progress — republishing the ${missing.size} missing again"); break }
@@ -769,19 +784,15 @@ class StorageMedia(
                 put("firstChunkPartition", firstPart); put("firstChunkTs", firstChunkTs); put("lastChunkTs", lastChunkTs)
                 put("storedChunks", storedCount ?: JSONObject.NULL); put("encSalt", sealer.encSalt ?: JSONObject.NULL)
             }
-            val canonical = Protocol.canonicalStorageFileManifestData(
-                id = msgId, sender = sender, timestamp = timestamp, channelId = messageStreamId,
-                transferId = tid, fileName = source.fileName, fileType = source.fileType,
-                originalSize = source.size, compressedSize = compSize, compression = compression,
-                totalChunks = tc, chunkDataSize = upc, chunkPartitions = CHUNK_PARTS,
-                firstChunkPartition = firstPart, firstChunkTs = firstChunkTs, lastChunkTs = lastChunkTs,
-                storedChunks = storedCount, encSalt = sealer.encSalt
-            )
-            val signature = transport.signCanonical(canonical)
+            // Unsigned announce (D6): identity comes from the proof (channels)
+            // or the sealed envelope (DMs). `sender` stays on the object for
+            // the local bubble; the bridge strips it at egress on ephemeral
+            // publishes. Canonical builders survive in Protocol.kt for
+            // verifying pre-migration history only.
             val announce = JSONObject().apply {
                 put("type", "storage_file_announce"); put("v", 1); put("id", msgId); put("sender", sender)
                 put("senderName", transport.username() ?: JSONObject.NULL); put("timestamp", timestamp)
-                put("channelId", messageStreamId); put("metadata", meta); put("signature", signature); put("replyTo", JSONObject.NULL)
+                put("metadata", meta); put("replyTo", JSONObject.NULL)
             }
             val annTs = transport.publishAnnounce(messageStreamId, announce, password, isDm)
             confirmAnnounce(messageStreamId, annTs, bases) { a, n -> up.phase = "Confirming announcement ($a/$n)…"; emit(up) }
@@ -798,6 +809,11 @@ class StorageMedia(
             producerJob?.cancel()   // stop a still-running compression on an abnormal exit
             try { slicer?.close() } catch (e: Exception) { /* closed */ }
             stagingFile?.let { runCatching { it.delete() } }
+            // The per-transfer throwaway publisher dies with the transfer —
+            // in memory only, and not even for the rest of the session.
+            if (isDm) runCatching {
+                bridge.call("dmChunkIdentityDrop", JSONObject().put("key", "chunks|$messageStreamId|$tid"))
+            }
         }
     }
 
@@ -1079,10 +1095,10 @@ class StorageMedia(
         }
     }
 
-    private suspend fun publishChunkWithRetry(sid: String, partition: Int, payload: ByteArray, dmPeerPublicKey: String? = null, attempts: Int = 3): Long {
+    private suspend fun publishChunkWithRetry(sid: String, partition: Int, payload: ByteArray, dmPeerPublicKey: String? = null, chunkIdentityKey: String? = null, attempts: Int = 3): Long {
         var last: Exception? = null
         for (a in 0 until attempts) {
-            try { return bridge.publishStorageChunk(sid, partition, payload, dmPeerPublicKey) }
+            try { return bridge.publishStorageChunk(sid, partition, payload, dmPeerPublicKey, chunkIdentityKey) }
             catch (e: Exception) { last = e; delay(500L * (a + 1)) }
         }
         throw last ?: IllegalStateException("publish failed")

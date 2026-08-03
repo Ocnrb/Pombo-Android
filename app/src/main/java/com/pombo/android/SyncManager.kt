@@ -118,15 +118,16 @@ class SyncManager(
                 .put("ts", ts)
                 .put("data", exportLocal())
 
+            // Sealed-to-self v2 under a throwaway publisher (web pushSync):
+            // only this account's static key opens it, and the proof inside
+            // recovers to this wallet — which the pull verifies.
             val pk = bridge.call("getMyPublicKey").getString("publicKey")
-            // Self-ECDH: peer key == my key, so only this account derives it.
-            val enc = bridge.call("dmEncrypt", JSONObject().put("peerPublicKey", pk).put("message", payload))
-            // Streamr-layer key, or the web cannot decrypt what we publish.
-            bridge.call("setDMPublishKey", JSONObject().put("streamId", inbox))
-            bridge.call("publish", JSONObject()
+            bridge.call("dmSealPublish", JSONObject()
                 .put("streamId", inbox)
                 .put("partition", StreamConstants.P_SYNC)
-                .put("content", enc.getJSONObject("envelope")), 60_000)
+                .put("recipientAddress", myAddress()!!.lowercase())
+                .put("recipientPublicKey", pk)
+                .put("message", payload), 60_000)
 
             // Our own snapshot is by definition already applied locally.
             store.recordApplied(listOf(ts))
@@ -150,11 +151,7 @@ class SyncManager(
 
         _syncing.value = true
         try {
-            val pk = bridge.call("getMyPublicKey").getString("publicKey")
-            // Register the shared key for my own publisher id, otherwise every
-            // payload the web wrote fails with "Could not get encryption key".
-            bridge.call("addDMDecryptKey", JSONObject().put("publisherId", me))
-            var payloads = fetchPayloads(inbox, me, pk)
+            var payloads = fetchPayloads(inbox, me)
             val applied = store.appliedTs()
             var fresh = payloads.filter { it.optLong("ts") !in applied }
 
@@ -164,7 +161,7 @@ class SyncManager(
                 // Provably stale read — storage replicas are round-robined, so
                 // one retry usually lands on the other replica.
                 if (newestFetched < newestApplied) {
-                    payloads = fetchPayloads(inbox, me, pk)
+                    payloads = fetchPayloads(inbox, me)
                     fresh = payloads.filter { it.optLong("ts") !in applied }
                 }
             }
@@ -282,14 +279,16 @@ class SyncManager(
         if (!inboxExists()) return
 
         val pk = bridge.call("getMyPublicKey").getString("publicKey")
-        bridge.call("setDMPublishKey", JSONObject().put("streamId", inbox))
+        val meAddr = myAddress()?.lowercase() ?: return
 
+        // Sealed-to-self v2 under a throwaway publisher, one seal per message.
         suspend fun publish(payload: JSONObject) {
-            val enc = bridge.call("dmEncrypt", JSONObject().put("peerPublicKey", pk).put("message", payload))
-            bridge.call("publish", JSONObject()
+            bridge.call("dmSealPublish", JSONObject()
                 .put("streamId", inbox)
                 .put("partition", StreamConstants.P_SYNC_BLOBS)
-                .put("content", enc.getJSONObject("envelope")), 60_000)
+                .put("recipientAddress", meAddr)
+                .put("recipientPublicKey", pk)
+                .put("message", payload), 60_000)
         }
 
         for (record in pending) {
@@ -353,9 +352,6 @@ class SyncManager(
         val me = myAddress()?.lowercase() ?: return 0
         if (!inboxExists()) return 0
 
-        val pk = bridge.call("getMyPublicKey").getString("publicKey")
-        bridge.call("addDMDecryptKey", JSONObject().put("publisherId", me))
-
         val res = bridge.call("resend", JSONObject()
             .put("streamId", inbox)
             .put("partition", StreamConstants.P_SYNC_BLOBS)
@@ -369,17 +365,13 @@ class SyncManager(
         val chunks = HashMap<String, MutableMap<Int, String>>()
         val chunkStream = HashMap<String, String>()
 
+        // Same rule as fetchPayloads: opening proves addressed-to-me, the
+        // proof-recovered sender == me proves it is OURS.
+        val opened = openAllSealed(arr)
         for (i in 0 until arr.length()) {
-            val entry = arr.optJSONObject(i) ?: continue
-            val meta = entry.optJSONObject("meta") ?: JSONObject()
-            if (!meta.optString("publisherId").equals(me, ignoreCase = true)) continue
-            val envelope = entry.opt("content") as? JSONObject ?: continue
-            val payload = try {
-                bridge.call("dmDecrypt", JSONObject().put("peerPublicKey", pk).put("envelope", envelope))
-                    .getJSONObject("message")
-            } catch (e: Exception) {
-                continue
-            }
+            val o = opened?.takeIf { !it.isNull(i) }?.optJSONObject(i) ?: continue
+            if (!o.optString("sender").equals(me, ignoreCase = true)) continue
+            val payload = o.optJSONObject("message") ?: continue
             if (payload.optInt("v") != 2) continue
             when (payload.optString("type")) {
                 "sync_blob" -> singles.add(payload)
@@ -424,29 +416,44 @@ class SyncManager(
         return importedIds.size
     }
 
-    private suspend fun fetchPayloads(inbox: String, me: String, myPubKey: String): List<JSONObject> {
+    private suspend fun fetchPayloads(inbox: String, me: String): List<JSONObject> {
         val res = bridge.call("resend", JSONObject()
             .put("streamId", inbox)
             .put("partition", StreamConstants.P_SYNC)
             .put("last", maxPayloads), 60_000)
         val arr = res.optJSONArray("messages") ?: JSONArray()
+        // The old "publisherId == me" gate is trap 1 of the migration: sealed
+        // pushes ride a throwaway publisher, so that filter rejected every one
+        // of our own payloads. Opening decides ownership instead — but opening
+        // alone only proves the payload was ADDRESSED to us (anyone can seal
+        // to a public key), so the proof-recovered sender must ALSO be this
+        // wallet, or a stranger could inject state into our merge. (The web
+        // currently skips that second check — flagged to be fixed there.)
+        val opened = openAllSealed(arr)
         val out = mutableListOf<JSONObject>()
         for (i in 0 until arr.length()) {
-            val entry = arr.optJSONObject(i) ?: continue
-            val meta = entry.optJSONObject("meta") ?: JSONObject()
-            // Anyone may publish to an inbox, so a payload that is not from me
-            // is spam and must never be merged.
-            if (!meta.optString("publisherId").equals(me, ignoreCase = true)) continue
-            val envelope = entry.opt("content") as? JSONObject ?: continue
-            val payload = try {
-                bridge.call("dmDecrypt", JSONObject().put("peerPublicKey", myPubKey).put("envelope", envelope))
-                    .getJSONObject("message")
-            } catch (e: Exception) {
-                continue
-            }
+            val o = opened?.takeIf { !it.isNull(i) }?.optJSONObject(i) ?: continue
+            if (!o.optString("sender").equals(me, ignoreCase = true)) continue
+            val payload = o.optJSONObject("message") ?: continue
             if (payload.optString("type") == "sync" && payload.optInt("v") == 1) out.add(payload)
         }
         return out
+    }
+
+    /** One dmOpenBatch over a resend page; null-per-entry for anything not v2-sealed or not ours. */
+    private suspend fun openAllSealed(arr: JSONArray): JSONArray? {
+        val items = JSONArray()
+        for (i in 0 until arr.length()) {
+            val content = arr.optJSONObject(i)?.opt("content")
+            items.put(
+                if (content is JSONObject && content.optInt("v") == 2 && content.has("epk")) content
+                else JSONObject.NULL
+            )
+        }
+        return try {
+            bridge.call("dmOpenBatch", JSONObject().put("items", items), 60_000)
+                .optJSONArray("results")
+        } catch (e: Exception) { null }
     }
 
     private suspend fun inboxExists(): Boolean = try {

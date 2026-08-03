@@ -8,6 +8,12 @@ import java.security.SecureRandom
  * canonical form must be IDENTICAL to JS JSON.stringify (key order and
  * escaping). So the string is built by hand, not with org.json (which
  * would escape '/' in '</' sequences).
+ *
+ * LEGACY-VERIFY ONLY since the privacy migration (D6): nothing signs these
+ * canonicals any more — identity travels as the publisher proof (channels) or
+ * inside the sealed envelope (DMs). The builders survive solely so
+ * pre-migration history, which discriminates on the presence of `signature`,
+ * stays verifiable indefinitely (D10b). Do not add new callers.
  */
 object Protocol {
 

@@ -2830,9 +2830,17 @@ private fun ChatComposer(
             if (first) first = false else onTyping()
         }
     }
-    val imagePicker = androidx.activity.compose.rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()
-    ) { uri -> if (uri != null) onPickImage(uri) }
+    // Image opens a tray of ours (ImagePickerSheet) instead of a launcher: the
+    // system photo picker is a closed Activity and cannot carry the camera
+    // tile, so that grid has to be drawn here. Video and File keep the system
+    // pickers — nothing about them wants a camera.
+    var imageTrayOpen by remember { mutableStateOf(false) }
+    if (imageTrayOpen) {
+        com.pombo.android.ui.ImagePickerSheet(
+            onPick = onPickImage,
+            onDismiss = { imageTrayOpen = false }
+        )
+    }
     val videoPicker = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()
     ) { uri -> if (uri != null) onPickVideo(uri) }
@@ -2890,12 +2898,7 @@ private fun ChatComposer(
                         )
                         DropdownMenuItem(
                             text = { Text("Image", color = Color.White) },
-                            onClick = {
-                                attachOpen = false
-                                imagePicker.launch(androidx.activity.result.PickVisualMediaRequest(
-                                    androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly
-                                ))
-                            }
+                            onClick = { attachOpen = false; imageTrayOpen = true }
                         )
                     }
                     "file" -> {

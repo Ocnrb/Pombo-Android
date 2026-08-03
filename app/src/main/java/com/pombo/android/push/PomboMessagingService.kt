@@ -50,7 +50,28 @@ class PomboMessagingService : FirebaseMessagingService() {
                 // same precedence the UI uses: contact nickname → ENS → the
                 // DM room's local name → short address. Plus the face: ENS
                 // avatar when cached, the generated one otherwise.
-                val sender = result.publisherId?.lowercase()
+                //
+                // Under sealed sender the row's publisherId is a throwaway
+                // key, so the sender is only knowable by OPENING the envelope
+                // — natively (SealedSenderCrypto): the bridge WebView does
+                // not exist in a dead process. Failure paths fall back to a
+                // generic notification rather than a wrong one: envelope that
+                // is not ours, or the key still locked before the first
+                // unlock (Direct Boot). Legacy plaintext rows keep the
+                // publisherId attribution — it was the wallet in that era.
+                val sender: String? = run {
+                    val content = result.content
+                    if (content != null && content.optInt("v") == 2 && content.has("epk")) {
+                        val pk = try {
+                            com.pombo.android.identity.WalletStore(applicationContext).privateKey
+                        } catch (e: Exception) { null }
+                        if (pk.isNullOrEmpty() || myAddress.isNullOrEmpty()) null
+                        else com.pombo.android.core.SealedSenderCrypto
+                            .open(content, pk, myAddress)?.first
+                    } else {
+                        result.publisherId?.lowercase()
+                    }
+                }
                 if (sender != null) {
                     val settings = com.pombo.android.data.SettingsStore(applicationContext)
                         .apply { scopeAddress = myAddress }

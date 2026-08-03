@@ -151,7 +151,12 @@ class PushRelayClient(
             .put("subscription", JSONObject().put("fcmToken", token()).toString())
             .put("timestamp", System.currentTimeMillis())
 
-        bridge.call("publish", JSONObject()
+        // Ephemeral publisher, fresh key per publish: the relay keys on
+        // (tag, token) and never reads publisherId, so publishing the
+        // registration under the account would only pin "this wallet uses
+        // Pombo" onto the public /push stream for nothing. `publishAs` with no
+        // privateKey generates a throwaway key in the bridge.
+        bridge.call("publishAs", JSONObject()
             .put("streamId", pushStreamId)
             .put("partition", 0)
             .put("content", payload), 30_000)

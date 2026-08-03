@@ -151,26 +151,27 @@ class ChannelManager(
                 isDm: Boolean
             ) {
                 if (isDm) {
-                    // DM signals travel as ECDH envelopes to the PEER's inbox
-                    // ephemeral (web media.js requestPiece: dmCrypto.encrypt).
-                    // The peer is the inbox owner — the stream id's prefix.
-                    // Sealing stays inside publishContent, the one place that
-                    // decides how a payload is encrypted.
-                    val pk = dmMediaPeerKey(ephemeralStreamId)
-                        ?: throw IllegalStateException("Peer public key unavailable for DM media")
-                    bridge.call("setDMPublishKey", JSONObject().put("streamId", ephemeralStreamId))
+                    // DM signals are sealed-sender v2 to the PEER's inbox
+                    // ephemeral (web media.js: dmManager.sealAndPublish), one
+                    // fresh throwaway publisher per signal. The peer is the
+                    // inbox owner — the stream id's prefix. Sealing stays
+                    // inside publishContent, the one place that decides how a
+                    // payload is encrypted.
+                    val peerAddr = ephemeralStreamId.substringBefore('/').lowercase()
                     publishContent(
                         ephemeralStreamId, StreamConstants.EPH_MEDIA_SIGNALS,
-                        payload, password = null, dmPeerPublicKey = pk
+                        payload, password = null, dmPeer = peerAddr
                     )
                     return
                 }
-                val args = JSONObject()
-                    .put("streamId", ephemeralStreamId)
-                    .put("partition", StreamConstants.EPH_MEDIA_SIGNALS)
-                    .put("content", payload)
-                if (password != null) args.put("password", password)
-                bridge.call("publish", args)
+                // Channel signals ride the channel's ephemeral identity too —
+                // "everything that channel sends" (channelIdentity.js): a
+                // wallet-published piece_request would undo the pseudonym for
+                // the whole transfer. Password sealing stays in the bridge.
+                publishChannel(
+                    channelByStream(ephemeralStreamId), ephemeralStreamId,
+                    StreamConstants.EPH_MEDIA_SIGNALS, payload, password
+                )
             }
 
             /**
@@ -186,23 +187,42 @@ class ChannelManager(
                 isDm: Boolean
             ) {
                 if (isDm) {
+                    // Sealed-sender 0x02 envelope, ONE ephemeral key per
+                    // transfer (web: sealer cached per (file, stream)). The
+                    // fileId is already inside the piece frame
+                    // [0x01][fileId:36][idx:4][data], so the sealer is keyed
+                    // by (fileId, destination stream) without widening the
+                    // Transport interface. The bridge holds the sealer and
+                    // publishes under its throwaway identity.
+                    val peerAddr = ephemeralStreamId.substringBefore('/').lowercase()
                     val pk = dmMediaPeerKey(ephemeralStreamId)
                         ?: throw IllegalStateException("Peer public key unavailable for DM media")
-                    bridge.call("setDMPublishKey", JSONObject().put("streamId", ephemeralStreamId))
+                    val fileId = if (bytes.size >= 37) String(bytes, 1, 36, Charsets.UTF_8) else ""
+                    val sealerKey = "$fileId|$ephemeralStreamId"
+                    bridge.call("dmBinarySealerCreate", JSONObject()
+                        .put("key", sealerKey)
+                        .put("recipientAddress", peerAddr)
+                        .put("recipientPublicKey", pk))
                     bridge.publishBinary(
                         ephemeralStreamId,
                         StreamConstants.EPH_MEDIA_DATA,
                         bytes,
                         password = null,
-                        dmPeerPublicKey = pk
+                        dmSealerKey = sealerKey
                     )
                     return
                 }
+                // Channel pieces carry the inline proof (0x03) and publish
+                // under the channel identity — native channels stay on the
+                // account (their grants are on-chain per member; the piece
+                // stays a legacy 0x01 frame there).
+                val ephemeral = channelByStream(ephemeralStreamId)?.type != "native"
                 bridge.publishBinary(
                     ephemeralStreamId,
                     StreamConstants.EPH_MEDIA_DATA,
                     bytes,
-                    password
+                    password,
+                    channelEphemeral = ephemeral
                 )
             }
         }
@@ -241,24 +261,19 @@ class ChannelManager(
         scope = scope,
         transferDir = { transferDir },
         transport = object : com.pombo.android.core.StorageMedia.Transport {
-            override suspend fun signCanonical(data: String): String =
-                bridge.call("signCanonical", JSONObject().put("data", data)).getString("signature")
-
             override suspend fun publishAnnounce(
                 messageStreamId: String, announce: JSONObject, password: String?, isDm: Boolean
             ): Long {
                 if (isDm) {
-                    // The announce rides the pair's ECDH envelope to the peer's
-                    // inbox P0, sealed through the single sealing point (setDM key
-                    // first, same as every DM publish). Returns the publish timestamp.
+                    // The announce rides a sealed-sender v2 envelope to the
+                    // peer's inbox P0, through the single sealing point, like
+                    // every DM message. Returns the publish timestamp.
                     val peer = _current.value?.peerAddress ?: throw IllegalStateException("DM announce: no peer")
-                    val pk = peerPubKey(peer) ?: throw IllegalStateException("DM announce: peer public key unavailable")
-                    bridge.call("setDMPublishKey", JSONObject().put("streamId", messageStreamId))
-                    return publishContent(messageStreamId, StreamConstants.P_MESSAGES, announce, password = null, dmPeerPublicKey = pk)
+                    return publishContent(messageStreamId, StreamConstants.P_MESSAGES, announce, password = null, dmPeer = peer)
                 }
-                // Regular/password channel: the single sealing point seals by
-                // password (or leaves it plain) and returns the publish timestamp.
-                return publishContent(messageStreamId, StreamConstants.P_MESSAGES, announce, password)
+                // Regular/password channel: ephemeral identity + proof via the
+                // channel rule (account only for native/readOnly).
+                return publishChannel(channelByStream(messageStreamId), messageStreamId, StreamConstants.P_MESSAGES, announce, password)
             }
 
             override fun myAddress(): String? = this@ChannelManager.myAddress()
@@ -1440,10 +1455,13 @@ class ChannelManager(
                 val entry = arr.optJSONObject(i) ?: continue
                 val content = decrypted.getOrNull(i) as? JSONObject ?: continue
                 val ts = entry.optJSONObject("meta")?.optLong("timestamp") ?: 0L
-                // Reactions carry no sender in the payload — the web falls back
-                // to the stream's publisherId for those.
-                val senderAddr = content.optString("sender")
-                    .ifEmpty { entry.optJSONObject("meta")?.optString("publisherId").orEmpty() }
+                // account = proof ? recovered wallet : publisherId — covers all
+                // three eras: new messages (proof), legacy (publisherId = the
+                // wallet) and reactions (no sender field at all). The legacy
+                // payload `sender` only matters when meta carried no publisher.
+                val senderAddr = attachAccount(
+                    content, entry.optJSONObject("meta")?.optString("publisherId")
+                ) ?: content.optString("sender")
                 val sender = previewSenderLabel(senderAddr, content.optStringOrNull("senderName"))
                 val body = when (content.optString("type")) {
                     "text" -> content.optString("text")
@@ -1512,8 +1530,10 @@ class ChannelManager(
                 // the same entries forever (web does the same).
                 if (ts > maxTs) maxTs = ts
 
-                val senderAddr = content.optString("sender")
-                    .ifEmpty { meta?.optString("publisherId").orEmpty() }
+                // Same rule as fetchLatestPreview: identity from the proof-
+                // resolved account, publisherId fallback for the legacy eras.
+                val senderAddr = attachAccount(content, meta?.optString("publisherId"))
+                    ?: content.optString("sender")
 
                 // --- preview candidate (reactions allowed) ---
                 val body = when (type) {
@@ -1758,10 +1778,17 @@ class ChannelManager(
             else -> return
         }
         if (data.optString("type") != "ADMIN_STATE") return
-        // Owner-authored only (authority = publisherId); latest-wins by
-        // (rev, ts) like the web — the timestamp breaks rev ties so a stale
+        // Owner-authored only. Authority is the ACCOUNT: on the -3 stream the
+        // owner always publishes as the wallet (on-chain permission — an
+        // ephemeral key can't), so publisherId still works there; but the
+        // admin_invalidate snapshot rides the -2 stream, which will publish
+        // under an ephemeral key once step 5 lands — there the proof-resolved
+        // `account` (stamped by attachAccount before this is called) is the
+        // only field that still names the owner. Web checks data.account too.
+        // Latest-wins by (rev, ts) — the timestamp breaks rev ties so a stale
         // replica snapshot sharing a rev cannot overwrite a newer one.
-        val senderId = meta.optString("publisherId").lowercase()
+        val senderId = data.optString("account")
+            .ifEmpty { meta.optString("publisherId") }.lowercase()
         val owner = channelOwner(channel)
         if (owner != null && senderId.isNotEmpty() && senderId != owner) return
         val rev = data.optInt("rev", 0)
@@ -1931,7 +1958,12 @@ class ChannelManager(
                     JSONObject().put("streamId", channel.messageStreamId).put("native", native),
                     30_000
                 )
-                bridge.call("publish", JSONObject()
+                // Ephemeral publisher, fresh key per wake (see PushRelayClient):
+                // the wake is validated by PoW, not publisher, so under the
+                // account every message X sends would stamp X onto the public
+                // /push stream — a timing side-channel back onto the sealed
+                // DM it just sent. A throwaway key closes it.
+                bridge.call("publishAs", JSONObject()
                     .put("streamId", PUSH_STREAM_ID)
                     .put("partition", 0)
                     .put("content", res.getJSONObject("payload")), 30_000)
@@ -2025,44 +2057,63 @@ class ChannelManager(
      */
     private suspend fun routeInboxMessage(
         envelope: Any?,
-        senderIdRaw: String?,
-        /**
-         * Plaintext already recovered by the page-wide batch decrypt in
-         * [loadInboxHistory]. Null on the live path, which still opens its one
-         * envelope inline.
-         */
-        pre: JSONObject? = null
+        /** Transport publisher — a THROWAWAY key on sealed traffic; only ever
+         *  an identity for legacy plaintext payloads (back then it was the
+         *  wallet). Never used to pick a decryption key: the sender is
+         *  unknown until the envelope is open. */
+        publisherIdRaw: String?,
+        /** Already opened by the page-wide batch in [loadInboxHistory]. */
+        preSender: String? = null,
+        preData: JSONObject? = null
     ) {
-        val sender = senderIdRaw?.lowercase()?.ifEmpty { null } ?: return
         val me = myAddress()?.lowercase() ?: return
+        if (envelope !is JSONObject) return
+
+        // SEALED SENDER INVERTS THE ORDER: open first, identify after. Any
+        // lookup keyed by the sender before decryption (peer key choice,
+        // block check, conversation state) would key off a throwaway address
+        // and silently drop every message — the web hit that five times.
+        val sender: String
+        val data: JSONObject
+        if (preSender != null && preData != null) {
+            sender = preSender
+            data = preData
+        } else if (envelope.optInt("v") == 2 && envelope.has("epk")) {
+            // v2 sealed envelope: ECDH with OUR static key + the cleartext
+            // epk; the true sender comes from ecrecover of the proof inside,
+            // rebuilt against OUR address. What does not open is not ours.
+            val opened = try {
+                bridge.call("dmOpenBatch", JSONObject()
+                    .put("items", JSONArray().put(envelope)))
+                    .optJSONArray("results")?.takeIf { !it.isNull(0) }?.optJSONObject(0)
+            } catch (e: Exception) { null } ?: return
+            sender = opened.optString("sender").lowercase().ifEmpty { return }
+            data = opened.optJSONObject("message") ?: return
+        } else if (envelope.optString("e") == "aes-256-gcm") {
+            // v1 pair-key envelope: pre-migration traffic. Its outer
+            // Streamr-native layer is gone (P6), and the web can no longer
+            // produce this format — dropped by design, not by accident.
+            return
+        } else {
+            // Legacy plaintext payloads (old unsealed file announces) pass
+            // through, attributed to the transport publisher — which was the
+            // wallet in that era.
+            if (envelope.optString("type").isEmpty()) return
+            sender = publisherIdRaw?.lowercase()?.ifEmpty { null } ?: return
+            data = envelope
+        }
+
         // My own messages are never in my inbox; if one shows up, it is not mine
         // to render from here (the local sent store owns that half).
         if (sender == me) return
-        // A blocked peer is ignored before anything is decrypted or stored, so
-        // a block cannot be undone by the sender simply sending again
-        // (web dm.js:443 — the same check at every inbox entry point).
+        // The block check now necessarily runs AFTER opening — the sender is
+        // simply not knowable before. The ~1ms ECDH spent on a blocked peer's
+        // message is the documented cost of sealed sender (brief §5.3).
         if (isBlockedPeer(sender)) return
-        if (envelope !is JSONObject) return
-
-        // Web parity (dm.js decryptDMEnvelope): only an actual ECDH envelope
-        // is decrypted — anything else passes through as plain data. The web
-        // publishes DM file announces UNSEALED (publishMessage has no ECDH
-        // path), so treating "not an envelope" as "not for us" silently ate
-        // every web→Android file bubble.
-        val data = if (envelope.optString("e") == "aes-256-gcm") {
-            pre ?: run {
-                val pk = peerPubKey(sender) ?: return
-                try {
-                    bridge.call("dmDecrypt", JSONObject()
-                        .put("peerPublicKey", pk).put("envelope", envelope)).getJSONObject("message")
-                } catch (e: Exception) {
-                    return
-                }
-            }
-        } else {
-            if (envelope.optString("type").isEmpty()) return
-            envelope
-        }
+        // Same stamp as the channel ingest (applyAccount): identity for every
+        // downstream reader comes from the proof, never from the wire.
+        data.put("account", sender)
+        data.put("sender", sender)
 
         // A conversation the user left stays gone until the peer writes again
         // after the tombstone (web: getDMLeftAt).
@@ -2155,39 +2206,38 @@ class ChannelManager(
             val arr = res.optJSONArray("messages") ?: return
             val n = arr.length()
 
-            // Open the WHOLE page in one bridge call. Routing message by message
-            // meant one dmDecrypt round-trip each — 100 sequential
-            // evaluateJavascript hops posted to the main thread, which was the
-            // bulk of the time an inbox replay took. Entries we cannot prepare
-            // (unknown peer key, not an ECDH envelope) go in as null and the
-            // router falls back to its inline path for them.
-            val senders = arrayOfNulls<String>(n)
+            // Open the WHOLE page in one bridge call — no pre-filtering by
+            // publisher, which is a throwaway key on sealed traffic. Every v2
+            // envelope goes in; the ones that open are ours, the ones that
+            // don't come back null and are dropped (opening IS the ownership
+            // test). One batch instead of 100 sequential evaluateJavascript
+            // hops is what keeps the replay fast.
+            val publishers = arrayOfNulls<String>(n)
             val items = JSONArray()
             for (i in 0 until n) {
                 val entry = arr.optJSONObject(i)
-                val sender = entry?.optJSONObject("meta")?.optString("publisherId")
+                publishers[i] = entry?.optJSONObject("meta")?.optString("publisherId")
                     ?.lowercase()?.ifEmpty { null }
-                senders[i] = sender
                 val content = entry?.opt("content")
-                val pk = if (sender != null && content is JSONObject &&
-                    content.optString("e") == "aes-256-gcm"
-                ) peerPubKey(sender) else null
                 items.put(
-                    if (pk == null) JSONObject.NULL
-                    else JSONObject().put("peerPublicKey", pk).put("envelope", content)
+                    if (content is JSONObject && content.optInt("v") == 2 && content.has("epk")) content
+                    else JSONObject.NULL
                 )
             }
-            val plain = try {
-                bridge.call("dmDecryptBatch", JSONObject().put("items", items), 60_000)
-                    .optJSONArray("messages")
+            val opened = try {
+                bridge.call("dmOpenBatch", JSONObject().put("items", items), 60_000)
+                    .optJSONArray("results")
             } catch (e: Exception) { null }
             val tDecrypt = System.currentTimeMillis()
 
             for (i in 0 until n) {
                 val entry = arr.optJSONObject(i) ?: continue
-                val pre = plain?.takeIf { !it.isNull(i) }
-                    ?.let { try { JSONObject(it.getString(i)) } catch (e: Exception) { null } }
-                routeInboxMessage(entry.opt("content"), senders[i], pre)
+                val res = opened?.takeIf { !it.isNull(i) }?.optJSONObject(i)
+                routeInboxMessage(
+                    entry.opt("content"), publishers[i],
+                    preSender = res?.optString("sender")?.lowercase()?.ifEmpty { null },
+                    preData = res?.optJSONObject("message")
+                )
             }
             android.util.Log.d("PomboPerf",
                 "inbox replay: resend=${tResend - t0}ms decrypt=${tDecrypt - tResend}ms " +
@@ -2289,19 +2339,12 @@ class ChannelManager(
         inboxSubscribeJob?.cancel()
         subscribedInboxId = inbox
         inboxSubscribeJob = scope.launch {
-            // Register the shared Streamr-layer key for myself first: my own
-            // sync payloads and any DM I sent from another device are published
-            // under my address, and without the key they arrive undecryptable.
-            runCatching { bridge.call("addDMDecryptKey", JSONObject().put("publisherId", me)) }
-            // Same for every peer we already have a conversation with: the key
-            // is per-publisher, and a DM from an unregistered publisher never
-            // reaches the subscription callback at all.
-            _channels.value.filter { it.type == "dm" }.mapNotNull { it.peerAddress }.distinct()
-                .forEach { peer ->
-                    runCatching {
-                        bridge.call("addDMDecryptKey", JSONObject().put("publisherId", peer.lowercase()))
-                    }
-                }
+            // No Streamr-layer key registration any more: everything Pombo
+            // publishes on DM streams is EncryptionType.NONE, sealed at the
+            // app layer, so the SDK has nothing to decrypt (P6). Traffic from
+            // pre-migration clients stays SDK-wrapped and never reaches the
+            // callback — accepted, there is no key left to add for it.
+            //
             // History BEFORE live, mirroring subscribeWithHistory: every past
             // message goes through the same router, which is what populates
             // conversations the user has not opened yet — and creates ones they
@@ -2379,9 +2422,6 @@ class ChannelManager(
         val pk = bridge.call("getPeerPublicKey", JSONObject().put("address", peer)).optString("publicKey")
         if (pk.isEmpty() || pk == "null") throw IllegalStateException("This user hasn't set up DMs yet")
         peerPubKeys[peer.lowercase()] = pk
-        runCatching {
-            bridge.call("addDMDecryptKey", JSONObject().put("publisherId", peer.lowercase()))
-        }
 
         val channel = Channel(
             messageStreamId = peerInbox,
@@ -2461,12 +2501,15 @@ class ChannelManager(
                     .put("password", channel.password ?: JSONObject.NULL)
             )
 
-        val enc = bridge.call("dmEncrypt", JSONObject().put("peerPublicKey", pk).put("message", invite))
-        bridge.call("setDMPublishKey", JSONObject().put("streamId", "${recipient.lowercase()}/Pombo-DM-1"))
-        bridge.call("publish", JSONObject()
+        // Sealed sender v2 under a throwaway publisher (web notifications.js):
+        // the inner `from` field survives for display, but the receiver treats
+        // the proof-recovered sender as the authoritative identity.
+        bridge.call("dmSealPublish", JSONObject()
             .put("streamId", "${recipient.lowercase()}/Pombo-DM-1")
             .put("partition", StreamConstants.P_NOTIFICATIONS)
-            .put("content", enc.getJSONObject("envelope")), 60_000)
+            .put("recipientAddress", recipient.lowercase())
+            .put("recipientPublicKey", pk)
+            .put("message", invite), 60_000)
     }
 
     /** Invites that arrived on my inbox P3 and are still unanswered. */
@@ -2505,32 +2548,36 @@ class ChannelManager(
         })
     }
 
-    /** Decrypts and files an incoming P3 notification. */
-    private suspend fun handleNotification(envelope: Any?, senderId: String?) {
-        if (envelope !is JSONObject || senderId == null) return
-        // A blocked peer must not spam channel invites into pendingInvites
-        // (web dm.js routeNotification: isBlocked early-return). Checked
-        // before any decrypt so the block also skips the crypto work.
-        if (isBlockedPeer(senderId)) return
-        val pk = peerPubKey(senderId)
-        if (pk == null) {
-            // A sender with no DM inbox has no published pubkey anywhere, so
-            // their invites are undecryptable by design (web has the same
-            // constraint) — worth a log line because the drop looks like a bug.
-            android.util.Log.d("PomboInvites", "drop invite from $senderId: no pubkey (sender has no DM inbox)")
+    /** Opens and files an incoming P3 notification (open first — sealed sender). */
+    private suspend fun handleNotification(envelope: Any?, publisherId: String?) {
+        if (envelope !is JSONObject) return
+        // Sealed sender: the sender is unknown until the envelope is open, so
+        // the block check necessarily moved to AFTER the decrypt (web
+        // routeNotification does the same). ~1ms of ECDH per blocked invite
+        // is the documented cost.
+        if (envelope.optInt("v") != 2 || !envelope.has("epk")) {
+            // v1 invites are pre-migration traffic whose outer SDK layer is
+            // gone (P6) — nothing to open any more.
             return
         }
-        val decrypted = try {
-            bridge.call("dmDecrypt", JSONObject().put("peerPublicKey", pk).put("envelope", envelope))
-                .getJSONObject("message")
-        } catch (e: Exception) {
-            android.util.Log.d("PomboInvites", "drop invite from $senderId: decrypt failed")
-            return  // not for us, or a key mismatch
+        val opened = try {
+            bridge.call("dmOpenBatch", JSONObject().put("items", JSONArray().put(envelope)))
+                .optJSONArray("results")?.takeIf { !it.isNull(0) }?.optJSONObject(0)
+        } catch (e: Exception) { null }
+        if (opened == null) {
+            android.util.Log.d("PomboInvites", "drop invite: envelope did not open (not for us)")
+            return
         }
+        // Authoritative sender = the proof inside the ciphertext, recovered
+        // against OUR address — never the inner `from` (self-claimed) and
+        // never the publisher (a throwaway key).
+        val senderId = opened.optString("sender").lowercase().ifEmpty { return }
+        if (senderId == myAddress()?.lowercase()) return
+        if (isBlockedPeer(senderId)) return
+        val decrypted = opened.optJSONObject("message") ?: return
         if (decrypted.optString("type") != "CHANNEL_INVITE") return
         val ch = decrypted.optJSONObject("channel") ?: return
         val streamId = ch.optString("streamId").ifEmpty { return }
-        // Trust the envelope's publisher, not the `from` field inside it.
         val inviteId = decrypted.optString("inviteId").ifEmpty { streamId }
         if (_pendingInvites.value.any { it.inviteId == inviteId }) return
         if (inviteStore.isDismissed(inviteId)) {
@@ -2657,7 +2704,6 @@ class ChannelManager(
         val generationAtStart = switchGeneration
         _loadingHistory.value = true
         try {
-            val pk = peerPubKey(peer) ?: return DmPage(0, false, false)
             val res = bridge.call("resendWindow", JSONObject()
                 .put("streamId", "$me/Pombo-DM-1")
                 .put("partition", StreamConstants.P_MESSAGES)
@@ -2672,32 +2718,56 @@ class ChannelManager(
             val existing = _messages.value.map { it.id }.toSet()
             val fresh = mutableListOf<UiMessage>()
 
-            for (i in 0 until arr.length()) {
-                // The loop itself suspends, once per message, on dmDecrypt — so
-                // the single check above the loop was not enough to cover it.
-                if (!stillCurrent(generationAtStart)) return DmPage(0, false, false)
+            // Filtering by publisher no longer works AT ALL — on sealed
+            // traffic it is a throwaway key per message. Open EVERYTHING in
+            // the window (one batch, ~1ms per envelope) and keep what turns
+            // out to be from this peer; the alternative is not knowing who
+            // wrote what (brief §5.3).
+            val n = arr.length()
+            val items = JSONArray()
+            for (i in 0 until n) {
+                val content = arr.optJSONObject(i)?.opt("content")
+                items.put(
+                    if (content is JSONObject && content.optInt("v") == 2 && content.has("epk")) content
+                    else JSONObject.NULL
+                )
+            }
+            val openedAll = try {
+                bridge.call("dmOpenBatch", JSONObject().put("items", items), 60_000)
+                    .optJSONArray("results")
+            } catch (e: Exception) { null }
+
+            if (!stillCurrent(generationAtStart)) return DmPage(0, false, false)
+
+            for (i in 0 until n) {
                 val entry = arr.optJSONObject(i) ?: continue
                 val meta = entry.optJSONObject("meta") ?: JSONObject()
-                val publisher = meta.optString("publisherId").lowercase()
-                // My own messages live in local storage, never in my inbox.
-                if (publisher == me || publisher != peer) continue
+                val opened = openedAll?.takeIf { !it.isNull(i) }?.optJSONObject(i)
+                val plain: JSONObject
+                val sender: String
+                if (opened != null) {
+                    val s = opened.optString("sender").lowercase()
+                    if (s.isEmpty()) continue
+                    sender = s
+                    plain = opened.optJSONObject("message") ?: continue
+                } else {
+                    // Legacy plaintext payloads (old unsealed file announces):
+                    // identity is the transport publisher, which was the wallet
+                    // in that era. v1 envelopes no longer open (P6) and fall
+                    // out here too.
+                    val envelope = entry.opt("content") as? JSONObject ?: continue
+                    if (envelope.optString("type").isEmpty()) continue
+                    sender = meta.optString("publisherId").lowercase()
+                    plain = envelope
+                }
+                // My own messages live in local storage, never in my inbox;
+                // and this timeline shows one peer only.
+                if (sender == me || sender != peer) continue
                 meta.optLong("timestamp", 0L).takeIf { it > 0 }?.let { ts ->
                     if (oldestTimestamp == 0L || ts < oldestTimestamp) oldestTimestamp = ts
                 }
-                val envelope = entry.opt("content") as? JSONObject ?: continue
-                // Same rule as routeInboxMessage: the web publishes DM file
-                // announces unsealed, so a non-envelope is plain data, not junk.
-                val plain = if (envelope.optString("e") == "aes-256-gcm") {
-                    try {
-                        bridge.call("dmDecrypt", JSONObject()
-                            .put("peerPublicKey", pk).put("envelope", envelope)).getJSONObject("message")
-                    } catch (e: Exception) {
-                        continue
-                    }
-                } else {
-                    if (envelope.optString("type").isEmpty()) continue
-                    envelope
-                }
+                plain.put("account", sender)
+                plain.put("sender", sender)
                 when (plain.optString("type")) {
                     "text", "image", "file_announce", "storage_file_announce" -> {
                         val id = plain.optString("id")
@@ -2877,15 +2947,8 @@ class ChannelManager(
 
         val id = Protocol.generateMessageId()
         val timestamp = System.currentTimeMillis()
-        val signed = bridge.call("signCanonical", JSONObject().put(
-            "data",
-            Protocol.canonicalFileManifestData(
-                id = id, sender = sender, timestamp = timestamp,
-                channelId = channel.messageStreamId,
-                fileId = fileId, fileName = fileName, fileSize = fileSize,
-                fileType = mimeType, pieceCount = pieceHashes.size, pieceHashes = pieceHashes
-            )
-        ))
+        // Unsigned (D6) — identity comes from the proof/envelope; the
+        // canonical builders in Protocol.kt survive only to verify history.
         val metadataJson = JSONObject()
             .put("fileId", fileId).put("fileName", fileName)
             .put("fileSize", fileSize).put("fileType", mimeType)
@@ -2894,9 +2957,8 @@ class ChannelManager(
         val announce = JSONObject()
             .put("type", "file_announce").put("v", 2).put("id", id)
             .put("sender", sender).put("senderName", myUsername() ?: JSONObject.NULL)
-            .put("timestamp", timestamp).put("channelId", channel.messageStreamId)
+            .put("timestamp", timestamp)
             .put("metadata", metadataJson)
-            .put("signature", signed.getString("signature"))
             .put("replyTo", JSONObject.NULL)
 
         val metadata = com.pombo.android.core.MediaController.FileMetadata(
@@ -2913,13 +2975,14 @@ class ChannelManager(
         )))
         try {
             if (isDm) {
-                // Same wire as web DM announces: the manifest rides inside the
-                // ECDH envelope to the peer's inbox, Streamr key set first.
-                bridge.call("setDMPublishKey", JSONObject().put("streamId", channel.messageStreamId))
+                // Same wire as web DM announces: sealed-sender v2 to the
+                // peer's inbox, one throwaway publisher per message.
+                val peer = channel.peerAddress
+                    ?: throw IllegalStateException("DM conversation has no peer")
                 publishTextWithRetry {
                     publishContent(
                         channel.messageStreamId, StreamConstants.P_MESSAGES,
-                        announce, password = null, dmPeerPublicKey = dmPeerPk
+                        announce, password = null, dmPeer = peer
                     )
                 }
             } else {
@@ -2974,30 +3037,28 @@ class ChannelManager(
             ensAvatar = ensStore.cachedAvatar(sender)
         )))
 
-        val pk = peerPubKey(peer) ?: throw IllegalStateException("Peer public key unavailable")
-        val signed = bridge.call("signCanonical", JSONObject()
-            .put("data", Protocol.canonicalMessageData(id, text, sender, timestamp, channel.messageStreamId)))
-        val plain = JSONObject()
+        // Wire message, post-D6: no app-layer signature, no `sender`, no
+        // `channelId`. Identity travels as the proof inside the sealed
+        // envelope (`p`, added by the bridge); a signature here would be a
+        // third authority covering the same claim, and `sender` in the
+        // plaintext could name someone the proof doesn't vouch for.
+        val wire = JSONObject()
             .put("type", "text").put("id", id).put("text", text)
-            .put("sender", sender).put("senderName", myUsername() ?: JSONObject.NULL)
-            .put("timestamp", timestamp).put("channelId", channel.messageStreamId)
-            .put("signature", signed.getString("signature")).put("replyTo", JSONObject.NULL)
+            .put("senderName", myUsername() ?: JSONObject.NULL)
+            .put("timestamp", timestamp).put("replyTo", JSONObject.NULL)
 
-        val enc = bridge.call("dmEncrypt", JSONObject().put("peerPublicKey", pk).put("message", plain))
-        val envelope = enc.getJSONObject("envelope")
-        // Streamr-layer key: without it the peer sees an undecryptable message.
-        bridge.call("setDMPublishKey", JSONObject().put("streamId", channel.messageStreamId))
         publishTextWithRetry {
-            bridge.call("publish", JSONObject()
-                .put("streamId", channel.messageStreamId)
-                .put("partition", StreamConstants.P_MESSAGES)
-                .put("content", envelope))
+            publishContent(
+                channel.messageStreamId, StreamConstants.P_MESSAGES,
+                wire, password = null, dmPeer = peer
+            )
         }
         confirmMessage(id)
         // Persist only after the publish succeeded, so a failed send does not
         // leave a message in the history that the peer never received. This is
-        // the only copy we will ever have of it.
-        sentDmStore.add(channel.messageStreamId, plain)
+        // the only copy we will ever have of it — and it keeps `sender`,
+        // which the timeline's toUiMessage needs; the field never travels.
+        sentDmStore.add(channel.messageStreamId, JSONObject(wire.toString()).put("sender", sender))
         onLocalStateChanged()
         // The DM branch returns out of sendMessage BEFORE its wake-signal
         // call, so no Android DM ever woke the peer's push relay. Web dm.js
@@ -3007,26 +3068,28 @@ class ChannelManager(
     }
 
     /**
-     * A peer's DM typing/presence control (ECDH envelope on my `-2`). Decrypts
-     * it and feeds it into the same presence/typing state channels use, so the
+     * A peer's DM typing/presence control (sealed-sender v2 envelope on my
+     * `-2`). Opens it with our static key, identifies the peer from the proof,
+     * and feeds it into the same presence/typing state channels use, so the
      * DM header's "Online/Offline" and the typing indicator behave identically.
      */
     private fun handleDmControl(contentRaw: String, meta: JSONObject) {
-        val sender = meta.optString("publisherId").lowercase().ifEmpty { return }
-        if (sender == myAddress()?.lowercase()) return   // my own echo
-        // A blocked peer must not light up "Online"/typing, and neither must
-        // one whose conversation the user left — the message path enforces
-        // both, and the web does the same for control traffic
-        // (dm.js routeInboxControl: isBlocked + getDMLeftAt early-returns).
-        if (isBlockedPeer(sender)) return
-        if (dmLeftAt(sender) > 0) return
         val envelope = try { JSONObject(contentRaw) } catch (e: Exception) { return }
+        if (envelope.optInt("v") != 2 || !envelope.has("epk")) return  // v1: gone with P6
         scope.launch {
-            val pk = peerPubKey(sender) ?: return@launch
-            val plain = try {
-                bridge.call("dmDecrypt", JSONObject()
-                    .put("peerPublicKey", pk).put("envelope", envelope)).getJSONObject("message")
-            } catch (e: Exception) { return@launch }
+            // Open FIRST — the publisher is a throwaway key, so every check
+            // (own echo, blocked, left) can only run on the sender the proof
+            // recovers to (web routeInboxControl does the same).
+            val opened = try {
+                bridge.call("dmOpenBatch", JSONObject()
+                    .put("items", JSONArray().put(envelope)))
+                    .optJSONArray("results")?.takeIf { !it.isNull(0) }?.optJSONObject(0)
+            } catch (e: Exception) { null } ?: return@launch
+            val sender = opened.optString("sender").lowercase().ifEmpty { return@launch }
+            if (sender == myAddress()?.lowercase()) return@launch   // my own echo
+            if (isBlockedPeer(sender)) return@launch
+            if (dmLeftAt(sender) > 0) return@launch
+            val plain = opened.optJSONObject("message") ?: return@launch
             // Only react while THIS peer's DM is the open channel — a stray
             // heartbeat must not light up another conversation.
             if (_current.value?.peerAddress?.lowercase() != sender) return@launch
@@ -3042,15 +3105,15 @@ class ChannelManager(
         }
     }
 
-    /** Handles an incoming DM envelope from my inbox (decrypt with sender pubkey). */
+    /** Feeds a live inbox arrival through the same router as history. */
     private fun handleIncomingDm(contentRaw: String, meta: JSONObject) {
-        val senderId = meta.optString("publisherId").lowercase().ifEmpty { return }
+        val publisherId = meta.optString("publisherId").lowercase().ifEmpty { return }
         val envelope = try { JSONObject(contentRaw) } catch (e: Exception) { return }
-        if (envelope.optString("e") != "aes-256-gcm") return
-        // Live traffic goes through the same router as history, so a message
-        // from a peer whose chat is closed still lands in its conversation
-        // instead of being discarded.
-        scope.launch { routeInboxMessage(envelope, senderId) }
+        // Sealed envelopes and legacy plaintext payloads (old unsealed file
+        // announces) both route; everything else is noise. The router owns
+        // the open-first inversion.
+        if (envelope.optString("e") != "aes-256-gcm" && envelope.optString("type").isEmpty()) return
+        scope.launch { routeInboxMessage(envelope, publisherId) }
     }
 
     private suspend fun verifyPasswordChallenge(adminStreamId: String, password: String) {
@@ -3424,6 +3487,19 @@ class ChannelManager(
             if (_current.value?.messageStreamId == messageStreamId) closeCurrentInternal()
             _channels.value = _channels.value.filterNot { it.messageStreamId == messageStreamId }
             store.save(_channels.value)
+            // Rotate the channel pseudonym on a GENUINE leave (never on a mere
+            // view switch — closeCurrent keeps it: peers mid-transfer know the
+            // current publisher). Rejoining gets a fresh key, so yesterday's
+            // pseudonym cannot be tied to today's. Guard: a leave with a
+            // transfer still running keeps the identity (web
+            // hasActiveMediaTransfers) — peers are mid-transfer against the
+            // publisher they already know; it dies with the session anyway.
+            val transfersActive = leaving?.ephemeralStreamId?.let { eph ->
+                media.activeEphemeralStreams().containsKey(eph)
+            } ?: false
+            if (!transfersActive) {
+                runCatching { bridge.call("dropChannelIdentity", JSONObject().put("streamId", messageStreamId)) }
+            }
             // A DM leave is SOFT (web dmLeftAt): messages older than this stay
             // gone, a new one resurfaces the conversation. Without the
             // tombstone the next inbox history replay recreated the room from
@@ -3836,9 +3912,11 @@ class ChannelManager(
             ensAvatar = ensStore.cachedAvatar(sender)
         )))
 
-        val signed = bridge.call("signCanonical", JSONObject()
-            .put("data", Protocol.canonicalMessageData(id, trimmed, sender, timestamp, channel.messageStreamId)))
-
+        // No app-layer signature (D6): the Streamr envelope authenticates the
+        // publisher and the proof (added by the bridge on ephemeral publishes)
+        // authenticates the account behind it. `sender`/`channelId` stay on
+        // the OBJECT for local use — the bridge strips them at egress; on the
+        // account paths (native/readOnly) they are simply redundant.
         val content = JSONObject()
             .put("type", "text")
             .put("id", id)
@@ -3846,9 +3924,6 @@ class ChannelManager(
             .put("sender", sender)
             .put("senderName", myUsername() ?: JSONObject.NULL)
             .put("timestamp", timestamp)
-            .put("channelId", channel.messageStreamId)
-            .put("signature", signed.getString("signature"))
-            // Metadata only — the web deliberately leaves replyTo out of the hash.
             .put("replyTo", replyTo?.let {
                 JSONObject()
                     .put("id", it.id)
@@ -3887,15 +3962,15 @@ class ChannelManager(
         // A DM uses the same chunked transport, but every payload is sealed in
         // the ECDH envelope: the peer's inbox accepts public publishes, so an
         // unsealed chunk there would be readable by anyone.
-        val dmPeerKey = if (channel.type == "dm") {
+        // A DM image publishes through publishForChannel → sealed sender v2;
+        // fail early here if the peer's key is unreachable, before the
+        // expensive encode below.
+        if (channel.type == "dm") {
             val peer = channel.peerAddress
                 ?: throw IllegalStateException("DM conversation has no peer")
             peerPubKey(peer) ?: throw IllegalStateException(
                 "Cannot send image: peer public key not available"
             )
-        } else null
-        if (dmPeerKey != null) {
-            bridge.call("setDMPublishKey", JSONObject().put("streamId", channel.messageStreamId))
         }
 
         // The heaviest single operation in the app: bitmap decode, then a
@@ -3932,20 +4007,12 @@ class ChannelManager(
         )
         onLocalStateChanged()
 
-        // Signed manifest (canonical v2 hash).
-        val canonical = Protocol.canonicalImageManifestData(
-            id, imageId, sender, timestamp, channel.messageStreamId,
-            enc.originalMime, enc.mime, enc.bytes.size, enc.chunks.size,
-            enc.chunkHashes, enc.assembledSha256, enc.quality,
-            preservedOriginal = enc.preservedOriginal, convertedTo = enc.convertedTo
-        )
-        val signed = bridge.call("signCanonical", JSONObject().put("data", canonical))
-
+        // Unsigned manifest (D6) — identity comes from the proof/envelope.
         val manifest = JSONObject()
             .put("type", "image").put("transport", "chunked").put("v", 2)
             .put("id", id).put("imageId", imageId).put("sender", sender)
             .put("senderName", myUsername() ?: JSONObject.NULL)
-            .put("timestamp", timestamp).put("channelId", channel.messageStreamId)
+            .put("timestamp", timestamp)
             .put("originalMime", enc.originalMime).put("finalMime", enc.mime)
             .put("finalSizeBytes", enc.bytes.size).put("chunkCount", enc.chunks.size)
             .put("chunkHashes", JSONArray(enc.chunkHashes))
@@ -3953,7 +4020,6 @@ class ChannelManager(
             .put("preservedOriginal", enc.preservedOriginal)
             .put("convertedTo", enc.convertedTo ?: JSONObject.NULL)
             .put("qualityUsed", enc.quality ?: JSONObject.NULL)
-            .put("signature", signed.getString("signature"))
 
         // Chunks first, manifest last (web media.js order): the manifest is what
         // tells the receiver how many pieces to expect, so publishing it before
@@ -4111,17 +4177,24 @@ class ChannelManager(
         payload: JSONObject,
         password: String?,
         /**
-         * Peer public key for a DM. Images use the same chunked transport as
-         * channels, but every payload is sealed in the ECDH envelope instead of
-         * the channel password — the peer's inbox is a public-publish stream,
-         * so anything unsealed there would be readable by anyone.
+         * Recipient address for a DM. The payload is sealed-sender v2 in the
+         * bridge (dmSealPublish): ECDH against a per-message ephemeral key,
+         * the identity proof INSIDE the ciphertext, and the publish goes out
+         * under that same throwaway key — the wallet address never touches
+         * the wire. The ephemeral private key never crosses the bridge.
          */
-        dmPeerPublicKey: String? = null
+        dmPeer: String? = null
     ): Long {
+        if (dmPeer != null) {
+            val pk = peerPubKey(dmPeer)
+                ?: throw IllegalStateException("DM publish: peer public key unavailable for $dmPeer")
+            val res = bridge.call("dmSealPublish", JSONObject()
+                .put("streamId", streamId).put("partition", partition)
+                .put("recipientAddress", dmPeer).put("recipientPublicKey", pk)
+                .put("message", payload))
+            return res.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
+        }
         val content: Any = when {
-            dmPeerPublicKey != null -> bridge.call("dmEncrypt", JSONObject()
-                .put("peerPublicKey", dmPeerPublicKey).put("message", payload))
-                .getJSONObject("envelope")
             password != null -> PomboCrypto.encryptString(payload.toString(), password)
             else -> payload
         }
@@ -4153,12 +4226,46 @@ class ChannelManager(
     ) {
         if (channel.type == "dm") {
             val peer = channel.peerAddress ?: return
-            val pk = peerPubKey(peer) ?: return
-            bridge.call("setDMPublishKey", JSONObject().put("streamId", streamId))
-            publishContent(streamId, partition, payload, password = null, dmPeerPublicKey = pk)
+            publishContent(streamId, partition, payload, password = null, dmPeer = peer)
             return
         }
-        publishContent(streamId, partition, payload, channel.password)
+        publishChannel(channel, streamId, partition, payload, channel.password)
+    }
+
+    /**
+     * Ephemeral-or-account decision for a non-DM channel publish (returns the
+     * publish timestamp):
+     *
+     *   public/password -> the channel's ephemeral identity, proof in the
+     *                      payload, local fields stripped — all in the bridge
+     *                      (publishAsChannel), which also refuses -3.
+     *   native          -> the ACCOUNT. Its grants are per member address
+     *                      on-chain; every receiver validates the publisher
+     *                      per message, so an ephemeral key would be rejected
+     *                      network-wide (plan §8: granting one on-chain would
+     *                      link wallet→epk publicly — worse than today).
+     *   readOnly -1     -> the ACCOUNT (publish is the owner's by ownership).
+     *
+     * `channel` may be null (media transport paths look the channel up by
+     * stream id; a previewed channel is not in the list) — null means not
+     * native, so the ephemeral path applies.
+     */
+    private suspend fun publishChannel(
+        channel: Channel?, streamId: String, partition: Int, payload: JSONObject, password: String?
+    ): Long {
+        val keepAccount = channel != null &&
+            (channel.type == "native" || (channel.readOnly && streamId == channel.messageStreamId))
+        if (keepAccount) return publishContent(streamId, partition, payload, password)
+        val args = JSONObject()
+            .put("streamId", streamId).put("partition", partition).put("content", payload)
+        password?.let { args.put("password", it) }
+        val res = bridge.call("publishAsChannel", args)
+        return res.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
+    }
+
+    /** Channel lookup by ANY of its streams, for transports that only know a stream id. */
+    private fun channelByStream(streamId: String): Channel? = _channels.value.find {
+        it.messageStreamId == streamId || it.ephemeralStreamId == streamId || it.adminStreamId == streamId
     }
 
     private fun startPresence(channel: Channel) {
@@ -4219,19 +4326,35 @@ class ChannelManager(
         ) {
             val content = try { JSONTokener(contentRaw).nextValue() } catch (e: Exception) { return }
             val publisher = meta.optString("publisherId").lowercase().ifEmpty { null }
-            // A signal on OUR OWN DM inbox is an ECDH envelope (web dm.js
-            // routeInboxMedia): unwrap it with the publisher's key before the
-            // media controller sees it — it expects plaintext signals.
-            if (content is JSONObject && content.optString("e") == "aes-256-gcm") {
-                val sender = publisher ?: return
-                if (isBlockedPeer(sender)) return
+            // A signal on OUR OWN DM inbox is a sealed-sender v2 envelope
+            // (web dm.js routeInboxMedia): open it with OUR static key — the
+            // publisher is a throwaway and picks nothing — identify the peer
+            // from the proof, THEN check blocks and hand the plaintext to the
+            // media controller, which expects the true account as sender.
+            if (content is JSONObject && content.optInt("v") == 2 && content.has("epk")) {
                 scope.launch {
-                    val pk = peerPubKey(sender) ?: return@launch
-                    val plain = try {
-                        bridge.call("dmDecrypt", JSONObject()
-                            .put("peerPublicKey", pk).put("envelope", content)).getJSONObject("message")
-                    } catch (e: Exception) { return@launch }
+                    val opened = try {
+                        bridge.call("dmOpenBatch", JSONObject()
+                            .put("items", JSONArray().put(content)))
+                            .optJSONArray("results")?.takeIf { !it.isNull(0) }?.optJSONObject(0)
+                    } catch (e: Exception) { null } ?: return@launch
+                    val sender = opened.optString("sender").lowercase().ifEmpty { return@launch }
+                    if (isBlockedPeer(sender)) return@launch
+                    val plain = opened.optJSONObject("message") ?: return@launch
                     media.onSignal(streamId, plain, sender)
+                }
+                return
+            }
+            // v1 envelopes (pre-migration) no longer open — P6.
+            if (content is JSONObject && content.optString("e") == "aes-256-gcm") return
+            // Channel signals now arrive under an ephemeral publisher: the
+            // seeder/leecher identity the media controller needs is the
+            // account the proof recovers to (legacy signals fall back to the
+            // publisher, which was the wallet).
+            if (content is JSONObject) {
+                scope.launch {
+                    val acct = attachAccount(content, publisher) ?: publisher
+                    media.onSignal(streamId, content, acct)
                 }
                 return
             }
@@ -4267,10 +4390,111 @@ class ChannelManager(
         if (partition != StreamConstants.EPH_MEDIA_DATA) return
         if (!StreamConstants.isEphemeralStream(streamId)) return
         val meta = try { JSONObject(metaRaw) } catch (e: Exception) { JSONObject() }
-        media.onBinary(streamId, data, meta.optString("publisherId").lowercase().ifEmpty { null })
+        // `account` is the proof-recovered sender the bridge stamps when it
+        // opens a sealed DM piece (0x02).
+        val identity = meta.optString("account").lowercase().ifEmpty { null }
+            ?: meta.optString("publisherId").lowercase().ifEmpty { null }
+        // Channel piece with inline proof (0x03, web FILE_PIECE_SIGNED):
+        //   [0x03][proof:65][fileId:36][idx:4][data]
+        // The publisher is an ephemeral key; the seeder's identity is the
+        // account the proof recovers to. After resolving it, the frame is
+        // rewritten as legacy 0x01 so the store/assembly path stays byte-
+        // identical. Safe to discriminate on the byte here: both are OUR
+        // plaintext frame formats (the 1-in-256 random-byte hazard is the DM
+        // v1 ciphertext, which never reaches this path).
+        if (data.size >= 1 + 65 + 36 + 4 && data[0].toInt() == 0x03) {
+            scope.launch {
+                val proofHex = "0x" + data.copyOfRange(1, 66)
+                    .joinToString("") { "%02x".format(it) }
+                val pub = meta.optString("publisherId").lowercase().ifEmpty { null }
+                val account = pub?.let { recoverProofAccount(it, proofHex) } ?: pub
+                val legacy = ByteArray(data.size - 65)
+                legacy[0] = 0x01
+                System.arraycopy(data, 66, legacy, 1, data.size - 66)
+                media.onBinary(streamId, legacy, account)
+            }
+            return
+        }
+        media.onBinary(streamId, data, identity)
     }
 
-    private fun handleContent(
+    // ---- Ingest identity (web streamr.js attachAccount + publisherProof.js) ----
+
+    /**
+     * (publisherId|proof) -> recovered account, or null when the proof does
+     * not recover. Nulls are cached too — a malformed proof must not cost a
+     * bridge hop per message. Crude bound, not an LRU: a channel session sees
+     * far fewer distinct publishers than this, and an entry costs one bridge
+     * round-trip to rebuild. Never invalidated on account switch on purpose:
+     * an entry is a pure function of public wire data (ecrecover of a public
+     * proof), identical for every viewer, so it cannot go stale.
+     */
+    private val proofAccounts = HashMap<String, String?>()
+
+    /**
+     * THE single place where "who sent this" is decided (web attachAccount):
+     *
+     *     account = proof ? ecrecover(proof, digest(publisherId)) : publisherId
+     *
+     * The fallback keeps pre-migration history working — old messages carry no
+     * proof, and back then publisherId WAS the wallet, so both formats land in
+     * the same identifier space. It is also the failure mode: a proof that
+     * does not recover falls back to the ephemeral address, an identity that
+     * owns nothing and matches nobody (D10b).
+     *
+     * `sender` is overwritten as a DERIVED alias of the account — the new wire
+     * format does not send it, dozens of call sites still read it, and it must
+     * never again come from the wire: a payload beside a proof could otherwise
+     * name someone it cannot prove. For legacy messages the overwrite is a
+     * no-op (publisherId was the wallet, which is what `sender` already says).
+     *
+     * DM paths do NOT come through here: there the proof lives inside the
+     * sealed envelope and identity is decided after opening it (port step 4).
+     */
+    private suspend fun attachAccount(data: JSONObject, publisherId: String?): String? {
+        var account = publisherId?.lowercase()?.ifEmpty { null }
+        val proof = data.optString("proof").ifEmpty { null }
+        if (proof != null && account != null) {
+            recoverProofAccount(account, proof)?.let { account = it }
+        }
+        if (account != null) {
+            data.put("account", account)
+            data.put("sender", account)
+        }
+        return account
+    }
+
+    /**
+     * ecrecover of a publisher proof, through the shared (publisherId|proof)
+     * cache. Null when the proof does not recover — the caller falls back to
+     * the publisherId, D10b's failure mode. A bridge failure is NOT cached
+     * (unavailable ≠ invalid), so the next message retries instead of pinning
+     * the ephemeral id.
+     */
+    private suspend fun recoverProofAccount(publisherId: String, proof: String): String? {
+        val key = "$publisherId|$proof"
+        val cached = synchronized(proofAccounts) {
+            if (proofAccounts.containsKey(key)) proofAccounts[key] to true else null to false
+        }
+        if (cached.second) return cached.first
+        val rec = try {
+            val res = bridge.call(
+                "recoverPublisherProofBatch",
+                JSONObject().put("items", JSONArray().put(
+                    JSONObject().put("publisherId", publisherId).put("proof", proof)
+                ))
+            )
+            val arr = res.optJSONArray("accounts")
+            if (arr == null || arr.isNull(0)) null else arr.optString(0).ifEmpty { null }
+        } catch (e: Exception) { return null }
+        synchronized(proofAccounts) {
+            if (proofAccounts.size >= 500) proofAccounts.clear()
+            proofAccounts[key] = rec
+        }
+        return rec
+    }
+
+    private suspend fun handleContent(
         channel: Channel,
         contentAny: Any?,
         meta: JSONObject,
@@ -4318,7 +4542,12 @@ class ChannelManager(
             }
             return
         }
-        val senderId = meta.optString("publisherId").lowercase().ifEmpty { null }
+        // account, not publisherId: with ephemeral publishers the transport
+        // identity is a throwaway key, and everything below that names a user
+        // — reaction authorship, override authority, presence, typing — must
+        // read the account the proof recovers to. For legacy traffic the two
+        // are the same address, so nothing changes for old history (D10b).
+        val account = attachAccount(data, meta.optString("publisherId"))
 
         when (data.optString("type")) {
             "text" -> handleText(channel, data, historical)
@@ -4327,12 +4556,12 @@ class ChannelManager(
             "image" -> handleImageManifest(channel, data)
             "image_chunk" -> handleImageChunk(data)
             "reaction" -> {
-                val user = senderId ?: return
+                val user = account ?: return
                 applyReaction(data.optString("messageId"), data.optString("emoji"), user, data.optString("action") == "add")
             }
-            "edit", "delete" -> applyOverride(data, senderId)
+            "edit", "delete" -> applyOverride(data, account)
             "presence" -> {
-                val user = senderId ?: return
+                val user = account ?: return
                 synchronized(online) {
                     online[user] = data.optLong("lastActive", System.currentTimeMillis())
                     _onlineCount.value = online.size
@@ -4346,8 +4575,8 @@ class ChannelManager(
             }
             "typing" -> {
                 val me = myAddress()?.lowercase()
-                if (senderId != null && senderId != me) {
-                    markTyping(senderId, data.optStringOrNull("nickname"))
+                if (account != null && account != me) {
+                    markTyping(account, data.optStringOrNull("nickname"))
                 }
             }
             // Owner's low-latency moderation signal (web channels.js
@@ -4359,6 +4588,12 @@ class ChannelManager(
             // inject state a direct -3 publish couldn't.
             "admin_invalidate" -> {
                 val snapshot = data.optJSONObject("snapshot") ?: return
+                // The authority check inside applyAdminMessage reads the
+                // snapshot object, but the proof (and thus the resolved
+                // account) lives on the OUTER admin_invalidate payload —
+                // carry it over, or an owner publishing under an ephemeral
+                // key (step 5) fails the owner check in silence.
+                account?.let { snapshot.put("account", it) }
                 applyAdminMessage(channel, snapshot, meta, generation)
             }
         }
@@ -4530,7 +4765,7 @@ class ChannelManager(
                 messageId = id,
                 transferId = tid
             )
-            // Replace the draft with the confirmed metadata from the signed announce.
+            // Replace the draft with the confirmed metadata from the announce.
             val finalMeta = com.pombo.android.core.StorageMedia.StorageFileMetadata
                 .from(result.announce.optJSONObject("metadata"))
             _messages.value = _messages.value.map {
@@ -4640,23 +4875,10 @@ class ChannelManager(
             return
         }
         if (channel.type == "dm") {
-            // The pieces arrive ECDH-sealed on OUR inbox; the bridge can only
-            // unwrap them if it knows which peer's key to use, so register it
-            // before the first request goes out.
-            val peer = channel.peerAddress ?: return
+            // Sealed-sender pieces open with OUR OWN static key and the epk in
+            // each envelope — no peer-key registration, no publisher hint. The
+            // bridge does it inline on the -2/P2 callback.
             scope.launch {
-                val pk = peerPubKey(peer)
-                if (pk == null) {
-                    Log.w(TAG, "DM download refused: no public key for $peer")
-                    return@launch
-                }
-                try {
-                    bridge.call("registerDmPeerKey", JSONObject()
-                        .put("address", peer).put("publicKey", pk))
-                } catch (e: Exception) {
-                    Log.w(TAG, "registerDmPeerKey failed: ${e.message}")
-                    return@launch
-                }
                 media.startDownload(
                     messageStreamId = channel.messageStreamId,
                     metadata = metadata,
@@ -4938,8 +5160,9 @@ class ChannelManager(
     private fun verifyImageManifestAsync(data: JSONObject) {
         val id = data.optString("id")
         val signature = data.optString("signature")
-        // Same rule as text: no signature means no badge, not a red flag.
-        if (signature.isEmpty()) { markVerified(id, null); return }
+        // Same discriminant as text (see verifyAsync): absent = current
+        // format, identity already established at ingest.
+        if (signature.isEmpty()) { markVerifiedFromAccount(id, data); return }
         scope.launch {
             try {
                 val hashes = data.optJSONArray("chunkHashes") ?: return@launch
@@ -4984,8 +5207,9 @@ class ChannelManager(
     private fun verifyFileAnnounceAsync(data: JSONObject) {
         val id = data.optString("id")
         val signature = data.optString("signature")
-        // Same rule as text: no signature means no badge, not a red flag.
-        if (signature.isEmpty()) { markVerified(id, null); return }
+        // Same discriminant as text (see verifyAsync): absent = current
+        // format, identity already established at ingest.
+        if (signature.isEmpty()) { markVerifiedFromAccount(id, data); return }
         val meta = data.optJSONObject("metadata")
         val hashes = meta?.optJSONArray("pieceHashes")
         if (meta == null || hashes == null) { markVerified(id, null); return }
@@ -5016,7 +5240,9 @@ class ChannelManager(
     private fun verifyStorageAnnounceAsync(data: JSONObject) {
         val id = data.optString("id")
         val signature = data.optString("signature")
-        if (signature.isEmpty()) { markVerified(id, null); return }
+        // Same discriminant as text (see verifyAsync): absent = current
+        // format, identity already established at ingest.
+        if (signature.isEmpty()) { markVerifiedFromAccount(id, data); return }
         val meta = data.optJSONObject("metadata") ?: run { markVerified(id, null); return }
         fun str(k: String): String? = if (meta.isNull(k)) null else meta.optString(k)
         fun int(k: String): Int? = if (meta.isNull(k)) null else meta.optInt(k)
@@ -5059,13 +5285,24 @@ class ChannelManager(
         }
     }
 
-    /** Signature verification via the bridge (ethers.verifyMessage), like the web. */
+    /**
+     * Verification discriminates on the PRESENCE of `signature`, no version
+     * field (web identity.js verifyMessage):
+     *
+     *  - present → pre-migration message; verify the old way (the canonical
+     *    hash functions are kept exactly for this).
+     *  - absent  → current format (D6). Identity was already established at
+     *    ingest — account = ecrecover(proof) — so trusting it here is not a
+     *    weakening: the Streamr envelope authenticates the ephemeral publisher
+     *    and the proof authenticates the account behind it. A third signature
+     *    added no authority and re-exposed the address.
+     *
+     * The replay guard runs on BOTH paths — the window must not widen just
+     * because the app-layer signature went away.
+     */
     private fun verifyAsync(channel: Channel, data: JSONObject, historical: Boolean) {
         val id = data.optString("id")
         val signature = data.optString("signature")
-        // Unsigned messages get NO badge in the web, not a failure badge —
-        // marking them invalid was flagging legitimate messages.
-        if (signature.isEmpty()) { markVerified(id, null); return }
         val timestamp = data.optLong("timestamp", 0L)
         // The replay guard only applies to genuinely fresh messages. The web
         // keys this off the message age (isRecentMessage = < 30s), not off the
@@ -5077,10 +5314,24 @@ class ChannelManager(
             markVerified(id, false)
             return
         }
+        if (signature.isEmpty()) { markVerifiedFromAccount(id, data); return }
         val canonical = Protocol.canonicalMessageData(
             id, data.optString("text"), data.optString("sender"), timestamp, data.optString("channelId")
         )
         enqueueVerify(PendingVerify(id, canonical, signature, data.optString("sender")))
+    }
+
+    /**
+     * The unsigned-path verdict: valid via the ingest-resolved account, badge
+     * from the same trust ladder as a recovered signature. No account at all
+     * (a payload that never went through attachAccount, or arrived with no
+     * publisher) keeps the web's old "no badge, not a red flag" behaviour.
+     */
+    private fun markVerifiedFromAccount(id: String, data: JSONObject) {
+        val account = data.optString("account").ifEmpty { null }
+        if (account == null) { markVerified(id, null); return }
+        markVerified(id, true)
+        applyTrustLevel(id, account)
     }
 
     private data class PendingVerify(
@@ -5223,7 +5474,9 @@ class ChannelManager(
      * an N-message resend cost N sorts and N recompositions on the main thread,
      * which is most of what made opening a busy channel feel heavy.
      */
-    private fun batchingMerges(block: () -> Unit) {
+    // Inline so history loaders can call the now-suspending handleContent
+    // inside the block (a non-inline lambda cannot suspend its caller).
+    private inline fun batchingMerges(block: () -> Unit) {
         val alreadyBatching = synchronized(this) {
             if (mergeBuffer != null) true else { mergeBuffer = mutableListOf(); false }
         }

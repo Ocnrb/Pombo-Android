@@ -7,6 +7,31 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
+    <!--
+        Read access to the photo library, for the attach → Image grid. The
+        system photo picker needs none of this, but it is a closed Activity
+        with no way to host a camera tile, so the grid is ours and has to
+        query MediaStore itself. Refusal is handled: the sheet falls back to
+        the camera plus a Browse… entry into the system picker.
+
+        Three permissions because the model changed twice: READ_EXTERNAL_STORAGE
+        up to Android 12, READ_MEDIA_IMAGES on 13, and on 14+ the user may grant
+        _VISUAL_USER_SELECTED instead — access to a hand-picked subset, which
+        MediaStore then transparently limits the query to.
+    -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+
+    <!--
+        NOTE: no CAMERA permission, on purpose. The camera tile hands off to the
+        device's camera app through ACTION_IMAGE_CAPTURE, which needs no grant —
+        and declaring CAMERA would actively make things worse, because Android
+        then starts requiring a runtime grant before that intent works.
+    -->
+
     <!-- Android 11+ package visibility: without this, getLaunchIntentForPackage
          returns null for MetaMask even when it IS installed, and "Fund with
          MetaMask" wrongly falls through to the Play Store. -->
@@ -80,6 +105,18 @@
             android:name=".MediaTransferService"
             android:foregroundServiceType="dataSync"
             android:exported="false" />
+
+        <!-- Gives the camera app a writable target for the capture. Exposes
+             nothing but cacheDir/camera/ — see res/xml/file_paths.xml. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_icon"
