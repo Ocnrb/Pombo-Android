@@ -5284,9 +5284,10 @@ class ChannelManager(
             ensStore.cachedName(address) != null -> 1
             else -> 0
         }
-        _messages.value = _messages.value.map {
-            if (it.id == messageId) it.copy(trustLevel = level) else it
-        }
+        // Via patchMessage so a batched (historical) message — still in the
+        // merge buffer at verify time — gets its trust level too, not just
+        // live messages (the trusted-contact star was missing on history).
+        patchMessage(messageId) { it.copy(trustLevel = level) }
     }
 
     /**
@@ -5521,10 +5522,29 @@ class ChannelManager(
         _messages.value = _messages.value.map { if (it.id == id) it.copy(pending = false) else it }
     }
 
+    /**
+     * Apply [transform] to the message with [id] wherever it currently lives —
+     * the batch buffer while a history load is in flight, AND/OR the live list.
+     *
+     * A synchronous verdict (markVerified / applyTrustLevel on the unsigned
+     * path) runs right after [mergeMessages] parked the message in the buffer,
+     * so touching only [_messages] would miss every batched (historical)
+     * message: it would flush with `verified = null` and render no badge — the
+     * "badge shows on live messages but not on history" bug. Patch both, so
+     * the update survives the flush no matter which list holds it.
+     */
     @Synchronized
-    private fun markVerified(id: String, valid: Boolean?) {
-        _messages.value = _messages.value.map { if (it.id == id) it.copy(verified = valid) else it }
+    private fun patchMessage(id: String, transform: (UiMessage) -> UiMessage) {
+        mergeBuffer?.let { buf ->
+            for (i in buf.indices) if (buf[i].id == id) buf[i] = transform(buf[i])
+        }
+        if (_messages.value.any { it.id == id }) {
+            _messages.value = _messages.value.map { if (it.id == id) transform(it) else it }
+        }
     }
+
+    private fun markVerified(id: String, valid: Boolean?) =
+        patchMessage(id) { it.copy(verified = valid) }
 
     @Synchronized
     private fun applyEdit(id: String, newText: String) {
