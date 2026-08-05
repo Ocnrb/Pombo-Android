@@ -4253,8 +4253,16 @@ class ChannelManager(
     private suspend fun publishChannel(
         channel: Channel?, streamId: String, partition: Int, payload: JSONObject, password: String?
     ): Long {
-        val keepAccount = channel != null &&
-            (channel.type == "native" || (channel.readOnly && streamId == channel.messageStreamId))
+        // The admin stream (-3) ALWAYS publishes under the account, on every
+        // channel kind: ADMIN_STATE / CHANNEL_IMAGE / password challenge are
+        // gated by the owner's on-chain permission, which a throwaway key does
+        // not hold — the bridge's publishAsChannel refuses -3 outright. Missing
+        // this was the "publishAs refuses the admin stream" crash on every
+        // admin moderation (delete/hide/ban/pin) in a public/password channel.
+        val isAdminStream = streamId == channel?.adminStreamId ||
+            streamId.endsWith(StreamConstants.SUFFIX_ADMIN)
+        val keepAccount = isAdminStream || (channel != null &&
+            (channel.type == "native" || (channel.readOnly && streamId == channel.messageStreamId)))
         if (keepAccount) return publishContent(streamId, partition, payload, password)
         val args = JSONObject()
             .put("streamId", streamId).put("partition", partition).put("content", payload)
