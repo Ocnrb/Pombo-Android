@@ -312,6 +312,12 @@ class PomboBridge(
          * the PUBLISHER is disposable, and upload verify matches its address.
          */
         chunkIdentityKey: String? = null,
+        /**
+         * Channel chunk (public/password): publish under the channel's own
+         * ephemeral identity, the same pseudonym as the announce. Native/
+         * readOnly channels leave this false and publish under the account.
+         */
+        channelEphemeral: Boolean = false,
         timeoutMs: Long = 45_000
     ): Long {
         withTimeout(timeoutMs) { pageReadyFlow.first { it } }
@@ -322,6 +328,7 @@ class PomboBridge(
         val args = JSONObject().put("streamId", streamId).put("partition", partition)
         if (dmPeerPublicKey != null) args.put("dmPeerPublicKey", dmPeerPublicKey)
         if (chunkIdentityKey != null) args.put("chunkIdentityKey", chunkIdentityKey)
+        if (channelEphemeral) args.put("channelEphemeral", true)
         val argsB64 = Base64.encodeToString(args.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val dataB64 = Base64.encodeToString(data, Base64.NO_WRAP)
         inFlightBytes.addAndGet(data.size.toLong())

@@ -239,7 +239,9 @@ class StorageMedia(
     }
 
     // ---- warm-up ----
-    private suspend fun warmUpPartitions(sid: String, firstPartition: Int, onStatus: (String) -> Unit) {
+    private suspend fun warmUpPartitions(
+        sid: String, firstPartition: Int, channelEphemeral: Boolean, onStatus: (String) -> Unit
+    ) {
         if (warmedUp.contains(sid)) return
         warmUpJobs[sid]?.let { it.join(); return }
         val job = scope.launch(Dispatchers.IO) {
@@ -247,7 +249,9 @@ class StorageMedia(
             val ping = byteArrayOf(0)
             coroutineScope {
                 for (k in 0 until CHUNK_PARTS) launch {
-                    try { bridge.publishStorageChunk(sid, firstPartition + k, ping) }
+                    // Pings ride the same publisher as the chunks, or the wallet
+                    // would appear on the channel's -1 stream just from warm-up.
+                    try { bridge.publishStorageChunk(sid, firstPartition + k, ping, channelEphemeral = channelEphemeral) }
                     catch (e: Exception) { Log.w(TAG, "storage warm-up P${firstPartition + k} failed: ${e.message}") }
                 }
             }
@@ -347,6 +351,9 @@ class StorageMedia(
     suspend fun sendFile(
         messageStreamId: String, source: Source, password: String?,
         isDm: Boolean = false, dmPeerPublicKey: String? = null,
+        /** public/password channel: publish chunks + warm-up under the
+         *  channel's ephemeral identity (native/readOnly stay on the account). */
+        channelEphemeral: Boolean = false,
         messageId: String? = null, transferId: String? = null
     ): SendResult {
         if (source.size <= 0L) throw IllegalStateException("File is empty")
@@ -446,17 +453,26 @@ class StorageMedia(
                 return sealer.seal(StorageWire.packChunkPayload(metaBytes, curTc(), i, cd))
             }
 
-            // DM chunks publish under a per-transfer throwaway identity (web
-            // storageMedia chunkIdentity): the wallet must not stamp every row
-            // of a file transfer in the peer's inbox. The chunk bytes stay on
-            // the v1 pair key — only the publisher is disposable — and upload
-            // verify has to match THIS address, not ours.
+            // Who publishes the chunks and warm-up pings (and thus who verify
+            // must match): the announce goes out under an ephemeral identity,
+            // so the chunks must not fall back to the wallet.
+            //   DM        → a per-transfer throwaway identity (the chunk bytes
+            //               stay on the v1 pair key; only the publisher is
+            //               disposable), address from dmChunkIdentityCreate.
+            //   public/pw → the channel's own ephemeral identity, the same
+            //               pseudonym as the announce.
+            //   native/ro → the account; verifyPublisher stays null and verify
+            //               falls back to our wallet (D3).
             val chunkIdentityKey = if (isDm) "chunks|$messageStreamId|$tid" else null
-            val verifyPublisher = chunkIdentityKey?.let {
-                bridge.call("dmChunkIdentityCreate", JSONObject().put("key", it)).getString("address")
+            val verifyPublisher = when {
+                chunkIdentityKey != null ->
+                    bridge.call("dmChunkIdentityCreate", JSONObject().put("key", chunkIdentityKey)).getString("address")
+                channelEphemeral ->
+                    bridge.call("channelIdentityAddress", JSONObject().put("streamId", messageStreamId)).getString("address")
+                else -> null
             }
 
-            warmUpPartitions(messageStreamId, firstPart) { up.phase = it; emit(up) }
+            warmUpPartitions(messageStreamId, firstPart, channelEphemeral) { up.phase = it; emit(up) }
 
             val firstChunkTs = wall()
             val uploadStart = perf()
@@ -523,7 +539,7 @@ class StorageMedia(
                 awaitSendSlot()
                 val ts = publishChunkWithRetry(
                     messageStreamId, chunkPartition(i), pay,
-                    if (isDm) dmPeerPublicKey else null, chunkIdentityKey
+                    if (isDm) dmPeerPublicKey else null, chunkIdentityKey, channelEphemeral
                 )
                 chunkTs[i] = ts
                 chunkTsHist.getOrPut(i) { ArrayList() }.add(ts)
@@ -1095,10 +1111,10 @@ class StorageMedia(
         }
     }
 
-    private suspend fun publishChunkWithRetry(sid: String, partition: Int, payload: ByteArray, dmPeerPublicKey: String? = null, chunkIdentityKey: String? = null, attempts: Int = 3): Long {
+    private suspend fun publishChunkWithRetry(sid: String, partition: Int, payload: ByteArray, dmPeerPublicKey: String? = null, chunkIdentityKey: String? = null, channelEphemeral: Boolean = false, attempts: Int = 3): Long {
         var last: Exception? = null
         for (a in 0 until attempts) {
-            try { return bridge.publishStorageChunk(sid, partition, payload, dmPeerPublicKey, chunkIdentityKey) }
+            try { return bridge.publishStorageChunk(sid, partition, payload, dmPeerPublicKey, chunkIdentityKey, channelEphemeral) }
             catch (e: Exception) { last = e; delay(500L * (a + 1)) }
         }
         throw last ?: IllegalStateException("publish failed")

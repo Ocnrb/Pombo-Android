@@ -1238,6 +1238,16 @@ const api = {
         return { ok: true };
     },
 
+    // The channel identity's on-wire address, for storage-chunk upload verify:
+    // channel chunks publish under this identity (channelEphemeral), and verify
+    // matches stored rows by (timestamp, publisherId == this). Uses the same
+    // getUserId() the publish path stamps, lowercased for the comparison.
+    async channelIdentityAddress(a) {
+        const entry = api._channelIdentity(a.streamId);
+        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(entry.identityPk);
+        return { address: String(await identity.getUserId()).toLowerCase() };
+    },
+
     async _sealBinaryWith(sealer, bytes) {
         const plain = new Uint8Array(sealer.proofBytes.length + bytes.length);
         plain.set(sealer.proofBytes, 0);
@@ -1962,6 +1972,20 @@ window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
             const msg2 = await api._publishAs(identity, a.streamId, a.partition, bytes);
             Native.result(id, true, utf8ToB64(JSON.stringify(
                 { ok: true, bytes: bytes.length, timestamp: msg2.timestamp })));
+            return;
+        }
+        // Channel chunk (public/password): publish under the channel's own
+        // ephemeral identity — the SAME pseudonym as the announce — so the
+        // wallet does not stamp the channel's -1 stream. The bytes stay sealed
+        // by the native per-file password key (or plaintext on a public
+        // channel); only the publisher changes. Native/readOnly channels do
+        // NOT set this and fall through to the account path below (D3).
+        if (a.channelEphemeral) {
+            const entry = api._channelIdentity(a.streamId);
+            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(entry.identityPk);
+            const msg3 = await api._publishAs(identity, a.streamId, a.partition, bytes);
+            Native.result(id, true, utf8ToB64(JSON.stringify(
+                { ok: true, bytes: bytes.length, timestamp: msg3.timestamp })));
             return;
         }
         const msg = await client.publish(

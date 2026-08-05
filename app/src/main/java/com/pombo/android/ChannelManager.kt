@@ -4762,6 +4762,10 @@ class ChannelManager(
                 password = channel.password,
                 isDm = isDm,
                 dmPeerPublicKey = dmPeerPk,
+                // public/password channels publish chunks under the channel's
+                // ephemeral identity (same as the announce); native/readOnly
+                // keep the account (D3), same rule as publishChannel.
+                channelEphemeral = !isDm && channel.type != "native" && !channel.readOnly,
                 messageId = id,
                 transferId = tid
             )
