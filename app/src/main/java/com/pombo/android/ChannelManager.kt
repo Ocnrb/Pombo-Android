@@ -1075,6 +1075,13 @@ class ChannelManager(
             bridge.call("setStorageDays",
                 JSONObject().put("streamId", channel.adminStreamId).put("storageDays", days), 180_000)
         }
+        // Keep the local copy in sync — the TTL republish check on owner open
+        // (docs/TTL_REPUBLISH_PLAN.md) compares artifact age against this.
+        // Web channels.js setChannelStorageDays does the same.
+        val updated = channel.copy(storageDays = days)
+        _channels.value = _channels.value.map { if (it.messageStreamId == updated.messageStreamId) updated else it }
+        store.save(_channels.value)
+        if (_current.value?.messageStreamId == updated.messageStreamId) _current.value = updated
     }
 
     private fun markStorage(channel: Channel, enabled: Boolean) {
@@ -1754,6 +1761,138 @@ class ChannelManager(
                 if (!stillCurrent(generation)) return@launch
                 loadAdminState(channel, generation)
             }
+        }
+    }
+
+    /**
+     * TTL-aware republish of the -3 artifacts on owner open (web channels.js
+     * _ttlRepublishOnOpen; docs/TTL_REPUBLISH_PLAN.md).
+     *
+     * The storage node's TTL purge deletes by message timestamp and the -3
+     * artifacts are published once, then only read — an unmoderated channel
+     * eventually loses its ADMIN_STATE (bans/pins vanish silently), its
+     * CHANNEL_IMAGE and its PASSWORD_CHALLENGE (joiners fail closed: channel
+     * unjoinable). When the OWNER opens a channel, compare each retained
+     * artifact's payload `ts` against the retention and republish anything
+     * past TTL_REPUBLISH_AGE_FRACTION of its life. Republishing resets the
+     * clock, so this stays quiet for the next ~80% of the TTL.
+     *
+     * The challenge branch is also the reopen redundancy check the web had
+     * inline (create-time publish racing the storage attachment: missing or
+     * invalid → republish) — ported here for parity.
+     *
+     * Must run AFTER loadAdminState (reads adminRevs/adminTs and the
+     * moderation flows that publishAdminState snapshots).
+     */
+    private suspend fun ttlRepublishOnOpen(channel: Channel, generation: Int) {
+        if (channel.type == "dm") return
+        // Only the owner can publish on -3 (on-chain permissions).
+        if (!amOwner(channel)) return
+        // NOTE: deliberately NOT gated on channel.storageEnabled — the local
+        // flag can be stale (joined channels, pre-flag records) while the
+        // stream has storage on-chain. Each branch self-gates: nothing
+        // retained → nothing republished (and a missing challenge must
+        // republish regardless, the legacy redundancy semantics).
+        if (channel.adminStreamId.isEmpty()) return
+        val storageDays = channel.storageDays?.takeIf { it > 0 } ?: DEFAULT_RETENTION_DAYS
+        fun ageDays(ts: Long) = (System.currentTimeMillis() - ts) / 86_400_000L
+
+        // ADMIN_STATE (-3/P0): republish the current snapshot with rev+1 via
+        // the normal publish path (rev bookkeeping + admin_invalidate fan-out
+        // included). Only when a snapshot is actually retained — an empty
+        // state has nothing to preserve.
+        val adminTsValue = adminTs[channel.adminStreamId] ?: 0L
+        if (channel.adminStreamId in adminLoaded
+            && (adminRevs[channel.adminStreamId] ?: 0) > 0
+            && shouldRepublish(adminTsValue, storageDays)
+        ) {
+            try {
+                if (!stillCurrent(generation)) return
+                Log.i(TAG, "ADMIN_STATE nearing storage TTL (${ageDays(adminTsValue)}d/${storageDays}d) — owner republishing")
+                publishAdminState(channel)
+            } catch (e: Exception) {
+                Log.w(TAG, "ADMIN_STATE TTL republish failed (will retry next open): ${e.message}")
+            }
+        }
+
+        // PASSWORD_CHALLENGE (-3/P2): missing OR invalid (legacy redundancy
+        // semantics) OR too old → republish a fresh payload. Content is
+        // immutable, so a fresh publish is always safe.
+        val pwd = channel.password
+        if (channel.type == "password" && !pwd.isNullOrEmpty()) {
+            try {
+                val probe = probePasswordChallenge(channel.adminStreamId, pwd)
+                val tooOld = probe.found && probe.valid && shouldRepublish(probe.ts, storageDays)
+                when {
+                    !probe.found -> Log.i(TAG, "PASSWORD_CHALLENGE not retained on -3/P2 — owner republishing for redundancy")
+                    !probe.valid -> Log.w(TAG, "PASSWORD_CHALLENGE did not verify with owner password — republishing")
+                    tooOld -> Log.i(TAG, "PASSWORD_CHALLENGE nearing storage TTL (${ageDays(probe.ts)}d/${storageDays}d) — owner republishing")
+                }
+                if (!probe.found || !probe.valid || tooOld) {
+                    if (!stillCurrent(generation)) return
+                    // A single publish into a cold partition overlay can be
+                    // silently lost (observed in the field: publish returns ok,
+                    // storage never sees it). Verify-until-retained, but by
+                    // FRESHNESS, not existence — ensurePasswordChallengeRetained
+                    // would see the old still-valid challenge and declare
+                    // victory, which is exactly the entry we are replacing.
+                    val publishedAt = System.currentTimeMillis()
+                    publishPasswordChallenge(channel.adminStreamId, pwd)
+                    scope.launch {
+                        repeat(12) { attempt ->
+                            delay(5_000)
+                            val check = probePasswordChallenge(channel.adminStreamId, pwd)
+                            if (check.found && check.valid && check.ts >= publishedAt) {
+                                Log.i(TAG, "PASSWORD_CHALLENGE refresh retained after ${attempt + 1} cycle(s)")
+                                return@launch
+                            }
+                            try { publishPasswordChallenge(channel.adminStreamId, pwd) } catch (e: Exception) {
+                                Log.w(TAG, "PASSWORD_CHALLENGE refresh republish #${attempt + 1} failed: ${e.message}")
+                            }
+                        }
+                        Log.w(TAG, "PASSWORD_CHALLENGE refresh not retained after 12 attempts")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "PASSWORD_CHALLENGE TTL check failed (will retry next open): ${e.message}")
+            }
+        }
+
+        // CHANNEL_IMAGE (-3/P1): republish the RETAINED payload verbatim with
+        // rev+1 and a fresh ts. Deliberately re-resent here instead of
+        // trusting the image store — the disk cache survives a storage purge,
+        // and resurrecting a purged image from local cache is a recovery
+        // decision this path does not make (plan §6).
+        try {
+            val payload = resendImagePayload(channel.adminStreamId, pwd)
+            val ts = payload?.optLong("ts", 0L) ?: 0L
+            if (payload != null
+                && payload.optString("data").isNotEmpty()
+                && payload.optString("hash").isNotEmpty()
+                && shouldRepublish(ts, storageDays)
+            ) {
+                val encrypted = payload.optBoolean("encrypted", false)
+                if (encrypted && pwd.isNullOrEmpty()) {
+                    Log.d(TAG, "CHANNEL_IMAGE TTL republish skipped: encrypted payload without password")
+                    return
+                }
+                val newRev = payload.optInt("rev", 0) + 1
+                val fresh = JSONObject(payload.toString())
+                    .put("rev", newRev)
+                    .put("ts", System.currentTimeMillis())
+                if (fresh.optString("createdBy").isEmpty()) fresh.put("createdBy", myAddress())
+                if (!stillCurrent(generation)) return
+                Log.i(TAG, "CHANNEL_IMAGE nearing storage TTL (${ageDays(ts)}d/${storageDays}d) — owner republishing rev=$newRev")
+                publishContent(
+                    channel.adminStreamId, StreamConstants.ADMIN_CHANNEL_IMAGE, fresh,
+                    if (encrypted) pwd else null
+                )
+                // Keep the open channel's rev counter ahead of the retained
+                // entry so a later image change never publishes a lower rev.
+                if (stillCurrent(generation)) channelImageRev = maxOf(channelImageRev, newRev)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "CHANNEL_IMAGE TTL republish failed (will retry next open): ${e.message}")
         }
     }
 
@@ -3153,6 +3292,48 @@ class ChannelManager(
     private class WrongPassword : Exception()
     private class ChallengeNotFound : Exception()
 
+    /** Non-throwing challenge probe result (web verifyPasswordChallenge's
+     *  `{found, valid, ts}` — streamr.js). `ts` is the payload timestamp of
+     *  the retained challenge, 0 when absent/undecryptable. */
+    private data class ChallengeProbe(val found: Boolean, val valid: Boolean, val ts: Long)
+
+    /**
+     * Single-shot, non-throwing variant of [verifyPasswordChallenge] for the
+     * TTL republish check on owner open (docs/TTL_REPUBLISH_PLAN.md). The
+     * join flow keeps the strict throwing wrapper (fail-closed, retries);
+     * this one only answers "is a valid challenge retained, and how old?".
+     */
+    private suspend fun probePasswordChallenge(adminStreamId: String, password: String): ChallengeProbe {
+        return try {
+            val res = bridge.call("resend", JSONObject()
+                .put("streamId", adminStreamId)
+                .put("partition", StreamConstants.ADMIN_PASSWORD_CHALLENGE)
+                .put("last", 1), 30_000)
+            val arr = res.optJSONArray("messages") ?: JSONArray()
+            if (arr.length() == 0) return ChallengeProbe(found = false, valid = false, ts = 0L)
+            val content = arr.getJSONObject(arr.length() - 1).opt("content")
+            // Challenge is always published encrypted — a plaintext entry
+            // cannot prove password knowledge and counts as invalid.
+            if (content !is String) return ChallengeProbe(found = true, valid = false, ts = 0L)
+            val decoded = try {
+                JSONObject(PomboCrypto.decryptString(content, password))
+            } catch (e: Exception) {
+                return ChallengeProbe(found = true, valid = false, ts = 0L)
+            }
+            val ok = decoded.optString("type") == "PASSWORD_CHALLENGE" &&
+                decoded.optString("magic") == StreamConstants.PASSWORD_CHALLENGE_MAGIC
+            ChallengeProbe(found = true, valid = ok, ts = if (ok) decoded.optLong("ts", 0L) else 0L)
+        } catch (e: Exception) {
+            // Infra failure counts as "not retained", like the web (its
+            // verifyPasswordChallenge swallows resend errors into found:false
+            // and the caller republishes). The challenge publish is idempotent
+            // and joiners fail closed on a missing one — erring towards a
+            // redundant publish is the safe side.
+            Log.d(TAG, "probePasswordChallenge resend failed (treating as not retained): ${e.message}")
+            ChallengeProbe(found = false, valid = false, ts = 0L)
+        }
+    }
+
     fun openChannel(messageStreamId: String) {
         val channel = _channels.value.find { it.messageStreamId == messageStreamId } ?: return
         unreadStore.clear(messageStreamId)
@@ -3319,6 +3500,15 @@ class ChannelManager(
                 // no live subscription, so after the on-open load this poller
                 // is what catches anything the admin_invalidate signal missed.
                 startAdminPoller(channel, generation)
+                // TTL-aware owner republish of the -3 artifacts (web
+                // _ttlRepublishOnOpen; docs/TTL_REPUBLISH_PLAN.md). Runs after
+                // loadAdminState so adminRevs/adminTs and the moderation flows
+                // are populated. Fire-and-forget: must never hold the open.
+                launch {
+                    try { ttlRepublishOnOpen(channel, generation) } catch (e: Exception) {
+                        Log.d(TAG, "TTL republish check failed (will retry next open): ${e.message}")
+                    }
+                }
             }
             // Presence is live (or, for a write-only channel, will never be):
             // either way the header can stop saying "Connecting…" and show the
@@ -5613,5 +5803,25 @@ class ChannelManager(
         const val VERIFY_BATCH_WINDOW_MS = 100L
         // config.channels.latestMessageFetchLast
         const val LATEST_PREVIEW_FETCH = 10
+
+        // TTL-aware republish on owner open (docs/TTL_REPUBLISH_PLAN.md; web
+        // config.js storage.ttlRepublishAgeFraction + ttlRepublish.js).
+        const val DEFAULT_RETENTION_DAYS = 180
+        const val TTL_REPUBLISH_AGE_FRACTION = 0.8
+
+        /**
+         * Should a -3 artifact with payload timestamp [artifactTs] be
+         * republished, given the channel's retention of [storageDays]? The
+         * storage node's TTL purge deletes by message timestamp; republishing
+         * inside the last stretch of the artifact's life resets that clock.
+         * Pure — mirrors web ttlRepublish.js shouldRepublish. Unknown age or
+         * TTL must never trigger a publish.
+         */
+        fun shouldRepublish(artifactTs: Long, storageDays: Int?, now: Long = System.currentTimeMillis()): Boolean {
+            if (artifactTs <= 0L) return false
+            if (storageDays == null || storageDays <= 0) return false
+            val ttlMs = storageDays * 86_400_000L
+            return now - artifactTs > (TTL_REPUBLISH_AGE_FRACTION * ttlMs).toLong()
+        }
     }
 }
