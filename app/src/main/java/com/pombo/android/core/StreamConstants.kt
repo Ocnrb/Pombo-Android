@@ -1,17 +1,19 @@
 package com.pombo.android.core
 
 /**
- * Triple-stream architecture PROTOCOL constants (exact mirror of
+ * Stream architecture PROTOCOL constants (exact mirror of
  * Pombo web src/js/streamConstants.js) — changing them breaks
  * interoperability with already-published messages.
  *
- * Each channel derives up to 3 streams from the base ID by suffix:
- *   -1 -> messages (with storage)  -2 -> ephemeral (no storage)  -3 -> admin
+ * Each channel derives up to 4 streams from the base ID by suffix:
+ *   -1 -> messages (with storage)  -2 -> ephemeral (no storage)
+ *   -3 -> admin (with storage)     -4 -> epoch keys (native only, with storage)
  */
 object StreamConstants {
     const val SUFFIX_MESSAGE = "-1"
     const val SUFFIX_EPHEMERAL = "-2"
     const val SUFFIX_ADMIN = "-3"
+    const val SUFFIX_KEYS = "-4"
 
     // Message stream (-1)
     //
@@ -68,6 +70,21 @@ object StreamConstants {
 
     const val PASSWORD_CHALLENGE_MAGIC = "POMBO_PWD_CHALLENGE_V1"
 
+    // Keys stream (-4) — native channels only. Single partition carrying the
+    // epoch-key protocol; content on -1/-2 is encrypted with a channel-wide
+    // epoch key versioned by `kid`. Members publish AND subscribe here (any
+    // member may answer a KEY_REQUEST with a KEY_WRAP — k-of-n distribution).
+    // KEY_ANNOUNCE authority is app-layer: only the admin set (v1: the
+    // stream's namespace address), never inferred from stream permissions —
+    // which is why -4 cannot fold into the owner-only -3.
+    const val KEYS_PARTITIONS = 1
+    const val P_KEY_EXCHANGE = 0
+
+    // Message types on -4 (mirror of web KEYS_MSG_TYPE)
+    const val KEY_ANNOUNCE = "key_announce"
+    const val KEY_REQUEST = "key_request"
+    const val KEY_WRAP = "key_wrap"
+
     // History windows (web config.js: stream.initialMessages / loadMoreCount)
     const val INITIAL_MESSAGES = 50
     const val LOAD_MORE_COUNT = 50
@@ -87,7 +104,12 @@ object StreamConstants {
     fun deriveMessageId(ephemeralStreamId: String): String =
         ephemeralStreamId.replace(Regex("-2$"), SUFFIX_MESSAGE)
 
+    fun deriveKeysId(messageStreamId: String): String =
+        messageStreamId.replace(Regex("-1$"), SUFFIX_KEYS)
+
     fun isEphemeralStream(streamId: String): Boolean = streamId.endsWith(SUFFIX_EPHEMERAL)
 
     fun isMessageStream(streamId: String): Boolean = streamId.endsWith(SUFFIX_MESSAGE)
+
+    fun isKeysStream(streamId: String): Boolean = streamId.endsWith(SUFFIX_KEYS)
 }

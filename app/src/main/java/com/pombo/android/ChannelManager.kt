@@ -108,6 +108,8 @@ class ChannelManager(
     private val sentReactionsStore: com.pombo.android.data.SentReactionsStore? = null,
     private val inviteStore: com.pombo.android.data.InviteStore,
     private val unreadStore: com.pombo.android.data.UnreadStore,
+    /** Persisted epoch keys for native channels (-4 protocol, N-A). */
+    private val epochKeyStore: com.pombo.android.data.EpochKeyStore,
     /**
      * Where partial file transfers live. filesDir, never cacheDir: the system
      * may evict a cache directory at any moment, and a half-evicted transfer
@@ -121,6 +123,71 @@ class ChannelManager(
     /** Persist a new block; the caller owns the settings store. */
     private val persistBlockedPeer: (String) -> Unit = {}
 ) {
+
+    /**
+     * Epoch keys for native channels (-4, N-A). Transport is injected:
+     * protocol messages publish AS THE ACCOUNT with encryptionType NONE via
+     * the bridge's publishAsAccount (client.publish would force the SDK's AES
+     * + group-key exchange on a members-only stream — the very dependency the
+     * epoch protocol replaces), and announce history is a plain -4 resend.
+     */
+    private val epochKeys = com.pombo.android.core.EpochKeyManager(
+        store = epochKeyStore,
+        myAddress = myAddress,
+        publishKeys = { keysStreamId, data ->
+            bridge.call("publishAsAccount", JSONObject()
+                .put("streamId", keysStreamId)
+                .put("partition", StreamConstants.P_KEY_EXCHANGE)
+                .put("content", data))
+        },
+        resendKeys = { keysStreamId ->
+            val entries = mutableListOf<com.pombo.android.core.EpochKeyManager.Entry>()
+            try {
+                val res = bridge.call("resend", JSONObject()
+                    .put("streamId", keysStreamId)
+                    .put("partition", StreamConstants.P_KEY_EXCHANGE)
+                    .put("last", 1000), 30_000)
+                val arr = res.optJSONArray("messages")
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val entry = arr.optJSONObject(i) ?: continue
+                    val content = entry.opt("content") as? JSONObject ?: continue
+                    val meta = entry.optJSONObject("meta") ?: JSONObject()
+                    entries.add(com.pombo.android.core.EpochKeyManager.Entry(
+                        content,
+                        meta.optString("publisherId").ifEmpty { null },
+                        meta.optLong("timestamp", 0L)))
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e   // channel switch — propagate, never swallow
+            } catch (e: Exception) {
+                // No storage attached yet / empty stream — an empty list is
+                // the correct cold start ("no announces")
+                Log.d(TAG, "keys resend empty (${e.message})")
+            }
+            entries
+        },
+        onKeyAdopted = { messageStreamId, _ -> refreshAfterEpochKey(messageStreamId) }
+    )
+
+    private var epochRefreshJob: Job? = null
+
+    /**
+     * A key was adopted: messages skipped as "waiting for key" are sitting in
+     * storage — re-pull the recent window through the normal handlers (which
+     * dedupe by id and re-apply pending overrides). Debounced: adopting N
+     * epochs in a burst (join) fires one refresh.
+     */
+    private fun refreshAfterEpochKey(messageStreamId: String) {
+        if (_current.value?.messageStreamId != messageStreamId) return
+        epochRefreshJob?.cancel()
+        epochRefreshJob = scope.launch {
+            delay(1_500)
+            val channel = _current.value?.takeIf { it.messageStreamId == messageStreamId }
+                ?: return@launch
+            Log.i(TAG, "epochKeys: refreshing history after key adoption")
+            loadHistory(channel, switchGeneration)
+        }
+    }
 
     /**
      * P2P file transfers. Owned here rather than beside the channel list
@@ -659,13 +726,19 @@ class ChannelManager(
         val entry = arr.getJSONObject(arr.length() - 1)
         val meta = entry.optJSONObject("meta") ?: JSONObject()
         val contentAny = entry.opt("content")
-        val data: JSONObject = when (contentAny) {
+        var data: JSONObject = when (contentAny) {
             is JSONObject -> contentAny
             is String -> {
                 val pwd = password ?: return null
                 try { JSONObject(PomboCrypto.decryptString(contentAny, pwd)) } catch (e: Exception) { return null }
             }
             else -> return null
+        }
+        // Native: CHANNEL_IMAGE arrives as an epoch envelope (N-A)
+        if (com.pombo.android.core.EpochKeyCrypto.isEpochEnvelope(data)) {
+            val messageStreamId = adminStreamId.replace(Regex("-3$"), StreamConstants.SUFFIX_MESSAGE)
+            val keysId = StreamConstants.deriveKeysId(messageStreamId)
+            data = epochKeys.tryDecrypt(messageStreamId, keysId, data) ?: return null
         }
         if (data.optString("type") != "CHANNEL_IMAGE") return null
         val senderId = meta.optString("publisherId").lowercase()
@@ -751,10 +824,21 @@ class ChannelManager(
             .put("mime", mime)
             .put("hash", hash)
             .put("data", "data:$mime;base64,$base64")
-        bridge.call("publish", JSONObject()
-            .put("streamId", channel.adminStreamId)
-            .put("partition", StreamConstants.ADMIN_CHANNEL_IMAGE)
-            .put("content", payload), 60_000)
+        if (channel.type == "native") {
+            // Epoch envelope, same reason as ADMIN_STATE: the SDK's group-key
+            // AES on -3 is unreadable cross-device on native channels.
+            val envelope = epochKeys.encryptCurrent(channel.messageStreamId, payload)
+                ?: throw IllegalStateException("No epoch key — cannot publish the channel image yet")
+            bridge.call("publishAsAccount", JSONObject()
+                .put("streamId", channel.adminStreamId)
+                .put("partition", StreamConstants.ADMIN_CHANNEL_IMAGE)
+                .put("content", envelope), 60_000)
+        } else {
+            bridge.call("publish", JSONObject()
+                .put("streamId", channel.adminStreamId)
+                .put("partition", StreamConstants.ADMIN_CHANNEL_IMAGE)
+                .put("content", payload), 60_000)
+        }
         channelImageRev += 1
         _channelImage.value = bytes
         // Publish into the shared cache so list/Explore update without a refetch.
@@ -880,7 +964,8 @@ class ChannelManager(
             throw IllegalStateException("Address is already a member")
         }
 
-        // `-1` and `-2`: subscribe + publish (send messages, presence).
+        // `-1`, `-2` and `-4`: subscribe + publish (messages, presence, and
+        // the keys stream needs publish so the member can answer KEY_REQUESTs).
         // `-3` (moderation): subscribe ONLY — a normal member reads the admin
         // state but never writes it; publishing ADMIN_STATE is the owner's alone
         // (web addMember does the same).
@@ -893,6 +978,8 @@ class ChannelManager(
         setPermissionsRetry(channel.messageStreamId, rw)
         setPermissionsRetry(channel.ephemeralStreamId, rw)
         if (channel.adminStreamId.isNotEmpty()) setPermissionsRetry(channel.adminStreamId, readOnly)
+        val keysId = channel.keysStreamId.ifEmpty { StreamConstants.deriveKeysId(channel.messageStreamId) }
+        setPermissionsRetry(keysId, rw)
 
         com.pombo.android.core.GraphApi.clearCache()
         val updated = channel.copy(members = channel.members + addr)
@@ -918,12 +1005,23 @@ class ChannelManager(
         setPermissionsRetry(channel.messageStreamId, revoke)
         setPermissionsRetry(channel.ephemeralStreamId, revoke)
         if (channel.adminStreamId.isNotEmpty()) setPermissionsRetry(channel.adminStreamId, revoke)
+        val keysId = channel.keysStreamId.ifEmpty { StreamConstants.deriveKeysId(channel.messageStreamId) }
+        setPermissionsRetry(keysId, revoke)
 
         com.pombo.android.core.GraphApi.clearCache()
         val updated = channel.copy(members = channel.members.filterNot { it.equals(addr, ignoreCase = true) })
         _channels.value = _channels.value.map { if (it.messageStreamId == updated.messageStreamId) updated else it }
         store.save(_channels.value)
         _current.value = updated
+
+        // Rotate the epoch so the removed member cannot read anything published
+        // from here on — they keep what they already read; the rotation protects
+        // the future, not the past. Failure is surfaced, not fatal.
+        try {
+            epochKeys.rotateEpoch(channel.messageStreamId, keysId)
+        } catch (e: Exception) {
+            Log.w(TAG, "Epoch rotation after member removal FAILED — removed member can still read new messages until the next rotation: ${e.message}")
+        }
     }
 
     /**
@@ -1131,6 +1229,7 @@ class ChannelManager(
         val messageStreamId = "$base${StreamConstants.SUFFIX_MESSAGE}"
         val ephemeralStreamId = "$base${StreamConstants.SUFFIX_EPHEMERAL}"
         val adminStreamId = "$base${StreamConstants.SUFFIX_ADMIN}"
+        val keysStreamId = "$base${StreamConstants.SUFFIX_KEYS}"
         // Closed channels are never discoverable: the web forces exposure to
         // 'hidden' for `native` (ChannelModalsUI.js:525) and hides the whole
         // section. Honouring a caller-supplied 'visible' here would publish the
@@ -1152,11 +1251,18 @@ class ChannelManager(
         msgMeta.put("ts", System.currentTimeMillis())
         val ephMeta = JSONObject().put("a", "pombo").put("v", "1").put("ln", messageStreamId)
         val admMeta = JSONObject().put("a", "pombo").put("v", "1").put("ln", messageStreamId).put("k", "admin")
+        val keysMeta = JSONObject().put("a", "pombo").put("v", "1").put("ln", messageStreamId).put("k", "keys")
 
         // Streams SERIALLY (parallel causes on-chain nonce conflicts) with retries
         createStreamRetry(messageStreamId, msgMeta.toString(), StreamConstants.MSG_PARTITIONS); onProgress()
         createStreamRetry(ephemeralStreamId, ephMeta.toString(), StreamConstants.EPH_PARTITIONS); onProgress()
         createStreamRetry(adminStreamId, admMeta.toString(), StreamConstants.ADMIN_PARTITIONS); onProgress()
+        // Keys stream (-4): native only. Lives outside -3 on purpose — any
+        // member must publish KEY_REQUEST/KEY_WRAP here, while -3 stays
+        // owner-only publish (web streamr.js createStream, N-A).
+        if (type == "native") {
+            createStreamRetry(keysStreamId, keysMeta.toString(), StreamConstants.KEYS_PARTITIONS); onProgress()
+        }
 
         val publicRW = JSONArray().put(JSONObject().put("public", true).put("permissions", JSONArray(listOf("subscribe", "publish"))))
         val publicRead = JSONArray().put(JSONObject().put("public", true).put("permissions", JSONArray(listOf("subscribe"))))
@@ -1189,8 +1295,11 @@ class ChannelManager(
                             )
                         }
                     })
+                    // Keys stream: full member permissions — any member may
+                    // answer a KEY_REQUEST with a KEY_WRAP (k-of-n)
+                    setPermissionsRetry(keysStreamId, perms)
                 }
-                onProgress(); onProgress(); onProgress()
+                onProgress(); onProgress(); onProgress(); onProgress()
             }
         }
 
@@ -1211,6 +1320,16 @@ class ChannelManager(
             Log.w(TAG, "Storage on -3 failed; continuing without admin history: ${e.message}")
         }
         onProgress()
+        // -4 MUST have storage: joiners pull KEY_ANNOUNCEs from it, and
+        // requests/wraps survive there until the counterpart comes online.
+        // (The web shipped without this once — the announce was never retained
+        // and joiners could not even ask for the key.)
+        if (type == "native") {
+            try { addStorageRetry(keysStreamId, storageNode, storageDays) } catch (e: Exception) {
+                Log.w(TAG, "Storage on -4 failed; key exchange limited to live members: ${e.message}")
+            }
+            onProgress()
+        }
 
         // Password challenge on -3/P2 (payload encrypted with the password)
         if (type == "password" && password != null) {
@@ -1229,6 +1348,7 @@ class ChannelManager(
             messageStreamId = messageStreamId,
             ephemeralStreamId = ephemeralStreamId,
             adminStreamId = adminStreamId,
+            keysStreamId = if (type == "native") keysStreamId else "",
             name = name,
             type = type,
             createdBy = addr,
@@ -1729,13 +1849,27 @@ class ChannelManager(
                 .put("partition", StreamConstants.ADMIN_MODERATION)
                 .put("last", 5)
             channel.password?.let { args.put("password", it) }
+            val t0 = System.currentTimeMillis()
             val res = bridge.call("resend", args, 30_000)
+            android.util.Log.d("PomboPerf",
+                "adminState ${channel.name}: call=${System.currentTimeMillis() - t0}ms " +
+                    "n=${res.optJSONArray("messages")?.length() ?: -1}")
             if (!stillCurrent(generation)) return
             val arr = res.optJSONArray("messages") ?: return
             for (i in 0 until arr.length()) {
                 val entry = arr.optJSONObject(i) ?: continue
-                val content = entry.opt("content")
+                var content = entry.opt("content")
                 val meta = entry.optJSONObject("meta") ?: JSONObject()
+                // Native: ADMIN_STATE arrives as an epoch envelope (N-A)
+                if (content is JSONObject &&
+                    com.pombo.android.core.EpochKeyCrypto.isEpochEnvelope(content) &&
+                    channel.type == "native"
+                ) {
+                    val keysId = channel.keysStreamId.ifEmpty {
+                        StreamConstants.deriveKeysId(channel.messageStreamId)
+                    }
+                    content = epochKeys.tryDecrypt(channel.messageStreamId, keysId, content) ?: continue
+                }
                 applyAdminMessage(channel, content, meta, generation)
             }
             // Even an empty history is an answer: the stream holds no
@@ -3405,6 +3539,9 @@ class ChannelManager(
                     .replace(Regex("-1$"), StreamConstants.SUFFIX_EPHEMERAL)
             )
         }
+        if (healed.keysStreamId.isEmpty() && healed.type == "native") {
+            healed = healed.copy(keysStreamId = StreamConstants.deriveKeysId(healed.messageStreamId))
+        }
         if (healed !== channel) {
             _channels.value = _channels.value.map {
                 if (it.messageStreamId == healed.messageStreamId) healed else it
@@ -3466,6 +3603,54 @@ class ChannelManager(
                 // as long as that resend takes. The web accepts that window; we
                 // do not, and the cost of closing it is now zero because the
                 // fetch overlaps the history anyway.
+                // Epoch keys BEFORE the -1 history pull, so the envelopes the
+                // resend returns can already be opened (bootstrap as admin, or
+                // request as member). FAST PATH: with persisted keys+announces
+                // the channel decrypts immediately — the -4 resend leaves the
+                // open's critical path and becomes a background reconcile
+                // (measured: it added ~0.5-2s to every warm open for nothing).
+                if (channel.type == "native" && channel.keysStreamId.isNotEmpty()) {
+                    epochKeys.loadPersistedState(channel.messageStreamId)
+                    if (epochKeys.hasCurrentKey(channel.messageStreamId)) {
+                        android.util.Log.d("PomboPerf", "epochKeys ${channel.name}: warm (persisted), reconcile in background")
+                        launch {
+                            // After the open's own resends: the WebView JS
+                            // thread is single — a concurrent -4 drain here
+                            // pushed the P0 history call into the seconds.
+                            delay(8_000)
+                            if (!stillCurrent(generation)) return@launch
+                            try {
+                                epochKeys.ensureChannelKeys(channel.messageStreamId, channel.keysStreamId)
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Background epoch reconcile failed: ${e.message}")
+                            }
+                        }
+                    } else {
+                        val tEnsure = System.currentTimeMillis()
+                        try {
+                            epochKeys.ensureChannelKeys(channel.messageStreamId, channel.keysStreamId)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Epoch key setup failed (messages will wait for key): ${e.message}")
+                        }
+                        android.util.Log.d("PomboPerf",
+                            "epochKeys ${channel.name}: cold ensure=${System.currentTimeMillis() - tEnsure}ms")
+                        // A first KEY_REQUEST from a cold node can miss every
+                        // live subscriber (§7.2 R2) — waiting the full backoff
+                        // turned that into a 60s blank channel. Retry fast
+                        // while the topology warms; stop as soon as keys land.
+                        launch {
+                            repeat(com.pombo.android.core.EpochKeyManager.RETRY_LOOP_ATTEMPTS) {
+                                delay(10_000)
+                                if (!stillCurrent(generation)) return@launch
+                                if (epochKeys.hasCurrentKey(channel.messageStreamId)) return@launch
+                                try {
+                                    epochKeys.retryRequestIfWaiting(channel.messageStreamId, channel.keysStreamId)
+                                } catch (e: Exception) { /* next lap retries */ }
+                            }
+                        }
+                    }
+                    if (!stillCurrent(generation)) return@launch
+                }
                 val loads = launch {
                     listOf(
                         launch { loadHistory(channel, generation) },
@@ -3572,9 +3757,16 @@ class ChannelManager(
                 // two cheaper paths that share what is already open: the
                 // admin_invalidate snapshot on -2/P0 (instant) and the 30s
                 // poller, which resends straight from the storage node.
+                val tSub = System.currentTimeMillis()
                 subscribeQuiet(channel.messageStreamId, StreamConstants.P_MESSAGES)
                 subscribeQuiet(channel.messageStreamId, StreamConstants.P_CONTROL)
                 subscribeQuiet(channel.ephemeralStreamId, StreamConstants.EPH_CONTROL)
+                // Keys stream (-4): live epoch-key protocol for native channels
+                if (channel.type == "native" && channel.keysStreamId.isNotEmpty()) {
+                    subscribeQuiet(channel.keysStreamId, StreamConstants.P_KEY_EXCHANGE)
+                }
+                android.util.Log.d("PomboPerf",
+                    "subscribes ${channel.name}: ${System.currentTimeMillis() - tSub}ms")
                 // Cancelled mid-transition: undo our own subscribes, since the
                 // next open's teardown has already run and will not cover them.
                 if (!stillCurrent(generation)) unsubscribeAll(channel)
@@ -3638,6 +3830,9 @@ class ChannelManager(
         unsubscribeQuiet(channel.messageStreamId, StreamConstants.P_MESSAGES)
         unsubscribeQuiet(channel.messageStreamId, StreamConstants.P_CONTROL)
         unsubscribeQuiet(channel.ephemeralStreamId, StreamConstants.EPH_CONTROL)
+        if (channel.type == "native" && channel.keysStreamId.isNotEmpty()) {
+            unsubscribeQuiet(channel.keysStreamId, StreamConstants.P_KEY_EXCHANGE)
+        }
         if (media.hasActiveTransfers(channel.messageStreamId)) {
             Log.i(TAG, "keeping media partitions alive for ${channel.messageStreamId}")
         } else {
@@ -3660,6 +3855,9 @@ class ChannelManager(
                 subscribeQuiet(channel.messageStreamId, StreamConstants.P_MESSAGES)
                 subscribeQuiet(channel.messageStreamId, StreamConstants.P_CONTROL)
                 subscribeQuiet(channel.ephemeralStreamId, StreamConstants.EPH_CONTROL)
+                if (channel.type == "native" && channel.keysStreamId.isNotEmpty()) {
+                    subscribeQuiet(channel.keysStreamId, StreamConstants.P_KEY_EXCHANGE)
+                }
             }
             // Every stream with a live transfer, not just this channel's: the
             // seeding exception exists precisely so transfers outlive the
@@ -3689,6 +3887,10 @@ class ChannelManager(
             } ?: false
             if (!transfersActive) {
                 runCatching { bridge.call("dropChannelIdentity", JSONObject().put("streamId", messageStreamId)) }
+            }
+            // Native: drop the channel's epoch keys (runtime + persisted)
+            if (leaving?.type == "native") {
+                runCatching { epochKeys.forgetChannel(messageStreamId) }
             }
             // A DM leave is SOFT (web dmLeftAt): messages older than this stay
             // gone, a new one resurfaces the conversation. Without the
@@ -4451,9 +4653,41 @@ class ChannelManager(
         // admin moderation (delete/hide/ban/pin) in a public/password channel.
         val isAdminStream = streamId == channel?.adminStreamId ||
             streamId.endsWith(StreamConstants.SUFFIX_ADMIN)
-        val keepAccount = isAdminStream || (channel != null &&
-            (channel.type == "native" || (channel.readOnly && streamId == channel.messageStreamId)))
-        if (keepAccount) return publishContent(streamId, partition, payload, password)
+        // Admin stream keeps the legacy account path EXCEPT on native, where
+        // -3 rides the epoch layer too: the SDK's group-key AES made a
+        // web-published ADMIN_STATE unreadable here (20s key-exchange timeouts
+        // per row, moderation never landed). The owner still signs as the
+        // account, so the on-chain owner-only publish permission holds.
+        if (isAdminStream && channel?.type != "native") {
+            return publishContent(streamId, partition, payload, password)
+        }
+        if (channel != null && channel.readOnly && streamId == channel.messageStreamId) {
+            return publishContent(streamId, partition, payload, password)
+        }
+        // NATIVE channels (N-A): encrypt with the channel's epoch key and go
+        // out AS THE ACCOUNT with encryptionType NONE — the SDK's group-key
+        // layer is exactly the per-publisher, publisher-must-be-online
+        // dependency the epoch protocol replaces. Fail-closed: no epoch key
+        // means NO publish, never a plaintext or SDK-keyed fallback.
+        if (channel?.type == "native") {
+            val keysId = channel.keysStreamId.ifEmpty {
+                StreamConstants.deriveKeysId(channel.messageStreamId)
+            }
+            val clean = stripLocalFields(payload)
+            var envelope = epochKeys.encryptCurrent(channel.messageStreamId, clean)
+            if (envelope == null) {
+                // Cold open may not have run the bootstrap/request yet — one recovery attempt
+                epochKeys.ensureChannelKeys(channel.messageStreamId, keysId)
+                envelope = epochKeys.encryptCurrent(channel.messageStreamId, clean)
+            }
+            if (envelope == null) {
+                throw IllegalStateException(
+                    "No epoch key for ${channel.messageStreamId} — cannot publish on a native channel without one (waiting for KEY_WRAP)")
+            }
+            val res = bridge.call("publishAsAccount", JSONObject()
+                .put("streamId", streamId).put("partition", partition).put("content", envelope))
+            return res.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
+        }
         val args = JSONObject()
             .put("streamId", streamId).put("partition", partition).put("content", payload)
         password?.let { args.put("password", it) }
@@ -4461,9 +4695,26 @@ class ChannelManager(
         return res.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
     }
 
+    /**
+     * Fields that must never reach the wire inside an epoch envelope (web
+     * publisherProof.js stripLocalFields): local UI state, and the identity
+     * fields D6/D7 removed. `sender` is re-derived by every receiver from the
+     * transport publisher at ingest (attachAccount) — the account, on native.
+     */
+    private fun stripLocalFields(data: JSONObject): JSONObject {
+        val out = JSONObject()
+        for (k in data.keys()) {
+            if (k == "verified" || k == "pending" || k == "_dmSent" ||
+                k == "sender" || k == "account" || k == "signature" || k == "channelId") continue
+            out.put(k, data.opt(k))
+        }
+        return out
+    }
+
     /** Channel lookup by ANY of its streams, for transports that only know a stream id. */
     private fun channelByStream(streamId: String): Channel? = _channels.value.find {
-        it.messageStreamId == streamId || it.ephemeralStreamId == streamId || it.adminStreamId == streamId
+        it.messageStreamId == streamId || it.ephemeralStreamId == streamId ||
+            it.adminStreamId == streamId || (it.keysStreamId.isNotEmpty() && it.keysStreamId == streamId)
     }
 
     private fun startPresence(channel: Channel) {
@@ -4514,6 +4765,22 @@ class ChannelManager(
             handleDmControl(contentRaw, meta)
             return
         }
+        // Epoch-key protocol (-4, native channels). The -4 subscription follows
+        // the open channel, so route to it. Publisher/timestamp travel raw:
+        // KEY_ANNOUNCE authority is validated by transport publisher (the -4
+        // publishes as the ACCOUNT by design) and conflicts order by transport
+        // timestamp (D13) — this must NOT go through attachAccount.
+        if (StreamConstants.isKeysStream(streamId)) {
+            val channel = _current.value?.takeIf { it.keysStreamId == streamId } ?: return
+            val content = (try { JSONTokener(contentRaw).nextValue() } catch (e: Exception) { null })
+                as? JSONObject ?: return
+            val publisher = meta.optString("publisherId").ifEmpty { null }
+            val ts = meta.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
+            scope.launch {
+                epochKeys.handleKeysMessage(channel.messageStreamId, streamId, content, publisher, ts)
+            }
+            return
+        }
         // Media coordination (-2/P1). Handled BEFORE the open-channel gate
         // below on purpose: a seeder has to answer a piece request for a file
         // shared in a channel the user navigated away from, and a download has
@@ -4545,6 +4812,24 @@ class ChannelManager(
             }
             // v1 envelopes (pre-migration) no longer open — P6.
             if (content is JSONObject && content.optString("e") == "aes-256-gcm") return
+            // Native channel signals arrive as epoch envelopes (N-A): open
+            // with the channel's epoch key first — unknown kid skips, not
+            // errors; the signal re-fires on the sender's next retry.
+            if (content is JSONObject && com.pombo.android.core.EpochKeyCrypto.isEpochEnvelope(content)) {
+                val ch = channelByStream(streamId)
+                if (ch?.type == "native") {
+                    scope.launch {
+                        val keysId = ch.keysStreamId.ifEmpty {
+                            StreamConstants.deriveKeysId(ch.messageStreamId)
+                        }
+                        val plain = epochKeys.tryDecrypt(ch.messageStreamId, keysId, content)
+                            ?: return@launch
+                        val acct = attachAccount(plain, publisher) ?: publisher
+                        media.onSignal(streamId, plain, acct)
+                    }
+                }
+                return
+            }
             // Channel signals now arrive under an ephemeral publisher: the
             // seeder/leecher identity the media controller needs is the
             // account the proof recovers to (legacy signals fall back to the
@@ -4702,13 +4987,23 @@ class ChannelManager(
         partition: Int = StreamConstants.P_MESSAGES
     ) {
         // Password channels: the wire is a base64 string — decrypt first
-        val data: JSONObject = when (contentAny) {
+        var data: JSONObject = when (contentAny) {
             is JSONObject -> contentAny
             is String -> {
                 val pwd = channel.password ?: return
                 try { JSONObject(PomboCrypto.decryptString(contentAny, pwd)) } catch (e: Exception) { return }
             }
             else -> return
+        }
+        // Native channels: epoch-encrypted envelope (N-A). Unknown kid is NOT
+        // an error (§7.9) — skip; storage-backed messages come back via the
+        // refresh fired when the key is adopted.
+        if (com.pombo.android.core.EpochKeyCrypto.isEpochEnvelope(data)) {
+            if (channel.type != "native") return
+            val keysId = channel.keysStreamId.ifEmpty {
+                StreamConstants.deriveKeysId(channel.messageStreamId)
+            }
+            data = epochKeys.tryDecrypt(channel.messageStreamId, keysId, data) ?: return
         }
         // Single gate for every write below — messages, images, reactions and
         // overrides all funnel through here, from both the resend and the live
@@ -5609,7 +5904,11 @@ class ChannelManager(
             return
         }
         // Authority is the publisher: only the original author may edit or delete.
-        if (senderId == null || original.sender.lowercase() != senderId) return
+        if (senderId == null || original.sender.lowercase() != senderId.lowercase()) {
+            Log.w(TAG, "Override REJECTED (${data.optString("type")} on ${targetId.take(8)}): " +
+                "original.sender=${original.sender} override.sender=$senderId")
+            return
+        }
         // The DM inbox cache holds the message as it first arrived. Without
         // rewriting it here, reopening a DM merges the PRE-EDIT copy back in
         // and the old text (or a deleted message) flashes on screen until live

@@ -242,7 +242,13 @@ object GraphApi {
                 )
             )
         }
-        return out
+        // Revoking zeroes the on-chain entry but The Graph keeps it in the
+        // index (Streamr SDK carries the same workaround with a cleanup TODO).
+        // An address with no effective permission is an ex-member, not a row —
+        // the PUBLIC row is kept regardless.
+        return out.filter {
+            it.isPublic || it.canSubscribe || it.canPublish || it.canGrant || it.canEdit || it.canDelete
+        }
     }
 
     /**

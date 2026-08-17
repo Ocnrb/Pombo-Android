@@ -12,6 +12,8 @@ data class Channel(
     val messageStreamId: String,
     val ephemeralStreamId: String,
     val adminStreamId: String,
+    /** Keys stream (-4) — native channels only (epoch-key distribution, N-A). */
+    val keysStreamId: String = "",
     val name: String,
     val type: String,                 // 'public' | 'password' | 'native'
     val createdAt: Long = System.currentTimeMillis(),
@@ -48,6 +50,7 @@ data class Channel(
         .put("messageStreamId", messageStreamId)
         .put("ephemeralStreamId", ephemeralStreamId)
         .put("adminStreamId", adminStreamId)
+        .put("keysStreamId", keysStreamId)
         .put("name", name)
         .put("type", type)
         .put("createdAt", createdAt)
@@ -77,6 +80,7 @@ data class Channel(
                 messageStreamId = o.getString("messageStreamId"),
                 ephemeralStreamId = o.optString("ephemeralStreamId"),
                 adminStreamId = o.optString("adminStreamId"),
+                keysStreamId = o.optString("keysStreamId"),
                 name = o.optString("name", "channel"),
                 type = o.optString("type", "public"),
                 createdAt = o.optLong("createdAt", 0L),

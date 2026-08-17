@@ -142,11 +142,12 @@ object GasEstimator {
                 2 * GAS_ADD_STORAGE_NODE +
                 2 * GAS_SET_STORAGE_DAY_COUNT
         )
+        // Native adds the keys stream (-4, with storage) — N-A epoch keys.
         val nativeCost = cost(
-            3 * GAS_CREATE_STREAM +
-                3 * GAS_SET_PERMISSIONS_BATCH +
-                2 * GAS_ADD_STORAGE_NODE +
-                2 * GAS_SET_STORAGE_DAY_COUNT
+            4 * GAS_CREATE_STREAM +
+                4 * GAS_SET_PERMISSIONS_BATCH +
+                3 * GAS_ADD_STORAGE_NODE +
+                3 * GAS_SET_STORAGE_DAY_COUNT
         )
         // DM inbox: 2 streams (-1 + -2) + 2 public permissions + storage on -1.
         val dmInboxCost = cost(

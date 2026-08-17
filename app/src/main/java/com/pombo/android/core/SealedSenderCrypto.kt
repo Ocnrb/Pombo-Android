@@ -62,7 +62,7 @@ object SealedSenderCrypto {
     }
 
     /** x-coordinate (32 bytes) of privKey × pubKey — ethers computeSharedSecret bytes 1..33. */
-    private fun ecdhX(privHex: String, pubCompressedHex: String): ByteArray? {
+    internal fun ecdhX(privHex: String, pubCompressedHex: String): ByteArray? {
         val priv = BigInteger(1, hexToBytes(privHex))
         if (priv.signum() <= 0 || priv >= N) return null
         val point = CURVE.curve.decodePoint(hexToBytes(pubCompressedHex)).multiply(priv).normalize()
@@ -71,7 +71,7 @@ object SealedSenderCrypto {
     }
 
     /** RFC 5869, single expand round (L=32 ≤ hash length), matching WebCrypto HKDF. */
-    private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
+    internal fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(salt, "HmacSHA256"))
         val prk = mac.doFinal(ikm)
@@ -127,7 +127,7 @@ object SealedSenderCrypto {
         return "0x" + addr.joinToString("") { "%02x".format(it) }
     }
 
-    private fun hexToBytes(hex: String): ByteArray {
+    internal fun hexToBytes(hex: String): ByteArray {
         val h = hex.removePrefix("0x")
         return ByteArray(h.length / 2) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
     }

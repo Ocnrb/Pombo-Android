@@ -44,6 +44,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     private val blobStore = com.pombo.android.core.ImageBlobStore(app)
     private val sentDmStore = com.pombo.android.data.SentDmStore(app)
     private val sentReactionsStore = com.pombo.android.data.SentReactionsStore(app)
+    private val epochKeyStore = com.pombo.android.data.EpochKeyStore(app)
     private val notifier = com.pombo.android.core.Notifier(app)
 
     /** Set from the Activity lifecycle; notifications are suppressed while visible. */
@@ -119,6 +120,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         sentReactionsStore = sentReactionsStore,
         inviteStore = inviteStore,
         unreadStore = unreadStore,
+        epochKeyStore = epochKeyStore,
         transferDir = java.io.File(app.filesDir, "transfers"),
         isTrustedContact = { addr -> _contacts.value.any { it.address.equals(addr, ignoreCase = true) } },
         isBlockedPeer = { addr -> addr.lowercase() in settingsStore.blockedPeers },
@@ -1845,16 +1847,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
      * so a wallet that cannot pay never reaches stream creation.
      */
     fun createChannel(spec: com.pombo.android.ui.screens.NewChannel) = viewModelScope.launch {
+        val streamCount = if (spec.type == "native") 4 else 3
         chainAction(
             "Create channel",
-            "Creates \"${spec.name}\" — three streams, their permissions and storage (8 transactions)."
+            "Creates \"${spec.name}\" — $streamCount streams, their permissions and storage."
         ) {
 
-        // 3× createStream + 3× setPermissions + 2× storage = 8 on-chain steps.
-        // The web counts 10 because it issues addToStorageNode and
-        // setStorageDayCount separately; our bridge does both in one call, so
-        // claiming 10 here left the progress ring permanently stuck at 80%.
-        val totalSteps = 8
+        // createStream + setPermissions per stream + storage (bridge does
+        // addToStorageNode and setStorageDayCount in one call, unlike the web).
+        // Public/password: 3+3+2 = 8. Native adds the keys stream (-4, with
+        // storage): 4+4+3 = 11.
+        val totalSteps = if (spec.type == "native") 11 else 8
         val id = toast(
             "Creating channel...", com.pombo.android.ui.ToastKind.LOADING, Long.MAX_VALUE,
             subtitle = "This may take a minute",
@@ -1880,8 +1883,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
             ) {
                 step += 1
                 val label = when {
-                    step <= 3 -> "Creating Channel..."
-                    step <= 6 -> "Setting Permissions..."
+                    step <= streamCount -> "Creating Channel..."
+                    step <= streamCount * 2 -> "Setting Permissions..."
                     else -> "Setting Storage..."
                 }
                 setToastProgress(id, step, label)

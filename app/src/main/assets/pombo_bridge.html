@@ -488,6 +488,21 @@ const api = {
         return { ok: true, timestamp: msg.timestamp };
     },
 
+    // Publish AS THE ACCOUNT with encryptionType NONE — the keys stream (-4)
+    // and native-channel epoch envelopes (N-A). Their grants are per member
+    // address on-chain, so the account must sign; but client.publish would
+    // force the SDK's AES + group-key exchange on a members-only stream —
+    // exactly the per-publisher, publisher-must-be-online dependency the
+    // epoch protocol replaces. Content is already sealed (or public protocol
+    // data) when it gets here.
+    //   { streamId, partition, content } -> { ok, timestamp }
+    async publishAsAccount(a) {
+        if (!wallet) throw new Error('no identity');
+        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+        const msg = await api._publishAs(identity, a.streamId, a.partition, a.content);
+        return { ok: true, timestamp: msg.timestamp };
+    },
+
     // Kotlin-facing wrapper: publish under a random (or given) ephemeral key.
     //   { streamId, partition, content?|contentB64?, privateKey? }
     //   -> { ok, timestamp, publisherId }
@@ -2028,6 +2043,13 @@ async function boot() {
             // account (auth.privateKey does not count as auth.ethereum, so the
             // SDK default keeps the metrics periods). Web P0.1 equivalent.
             metrics: false,
+            // Pombo publishes NOTHING under the SDK's group-key AES any more
+            // (DMs/channels/admin all seal at the app layer and ship NONE).
+            // The only SDK-encrypted rows left are legacy history and foreign
+            // streams, and each one used to cost the DEFAULT 30s key-request
+            // timeout inside a resend drain — a native channel open stalled
+            // 20s+ on unreadable legacy ADMIN_STATE rows. Fail those fast.
+            encryption: { keyRequestTimeout: 3000 },
             network: {
                 controlLayer: {
                     maxMessageSize: 1048576,
