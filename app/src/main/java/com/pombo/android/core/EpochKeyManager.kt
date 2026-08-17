@@ -44,6 +44,13 @@ class EpochKeyManager(
     private class ChannelState {
         val epochs = HashMap<String, EpochEntry>()        // keyId -> entry
         val announces = HashMap<Int, Announce>()           // epoch -> announce
+        /**
+         * epoch -> NEWEST valid announce timestamp seen. The conflict rule
+         * (D13) deliberately keeps the OLDEST announce, so the TTL
+         * re-announce check cannot read [announces] — it would republish on
+         * every open. Freshness lives here instead.
+         */
+        val announceFreshness = HashMap<Int, Long>()
         var currentEpoch = 0
         var pendingRequest: PendingRequest? = null         // memory only (D12)
         var loaded = false
@@ -145,10 +152,24 @@ class EpochKeyManager(
      * storage, bootstrap/re-announce as admin, or request missing keys as a
      * member. Call on channel open, before the -1 history pull.
      */
-    suspend fun ensureChannelKeys(messageStreamId: String, keysStreamId: String) {
+    suspend fun ensureChannelKeys(
+        messageStreamId: String,
+        keysStreamId: String,
+        /** Channel retention (drives the announce TTL re-announce). */
+        retentionDays: Int = 180,
+        /**
+         * Whether a keyless admin may MINT epoch 1. Only true on a virgin
+         * channel (no other members): a fresh admin device minting on an
+         * established channel would fork it, and it cannot recover from
+         * member wraps either — without an announce there is no keyHash to
+         * verify them against.
+         */
+        allowMint: Boolean = true
+    ) {
         val entries = try { resendKeys(keysStreamId) } catch (e: Exception) { emptyList() }
         var toRequest = false
         var toBootstrap = false
+        var toReannounce = false
         mutex.withLock {
             val s = getState(messageStreamId)
             if (!s.loaded) { loadPersisted(messageStreamId, s); s.loaded = true }
@@ -165,16 +186,53 @@ class EpochKeyManager(
             if (changed) persist(messageStreamId, s)
             toBootstrap = s.announces.isEmpty() && isOwnAdmin(messageStreamId)
             toRequest = s.announces.isNotEmpty() && missingEpochsLocked(s).isNotEmpty()
+            if (!toBootstrap && isOwnAdmin(messageStreamId)) {
+                val cur = s.announces[s.currentEpoch]
+                if (cur != null && s.epochs.containsKey(cur.keyId)) {
+                    // freshest == 0: the announce exists only in OUR persisted
+                    // state — storage lost it (or the resend failed; a
+                    // duplicate republish is harmless). Else: nearing TTL.
+                    val freshest = s.announceFreshness[s.currentEpoch] ?: 0L
+                    val retentionMs = retentionDays.toLong() * 86_400_000L
+                    toReannounce = freshest == 0L ||
+                        System.currentTimeMillis() - freshest > (retentionMs * 0.8).toLong()
+                }
+            }
         }
-        if (toBootstrap) bootstrapOrReannounce(messageStreamId, keysStreamId)
-        else if (toRequest) sendKeyRequest(messageStreamId, keysStreamId)
-        else if (!isOwnAdmin(messageStreamId)) {
+        if (toBootstrap) bootstrapOrReannounce(messageStreamId, keysStreamId, allowMint)
+        else if (toReannounce) reannounceCurrent(messageStreamId, keysStreamId)
+        if (toRequest) sendKeyRequest(messageStreamId, keysStreamId)
+        else if (!toBootstrap && !isOwnAdmin(messageStreamId)) {
             mutex.withLock {
                 if (getState(messageStreamId).announces.isEmpty()) {
                     Log.i(TAG, "no announce yet on ${keysStreamId.takeLast(30)} — waiting for the admin")
                 }
             }
         }
+    }
+
+    /**
+     * TTL-aware re-announce (same pattern as the -3 artifacts' ttlRepublish).
+     * CONSISTENT BY CONSTRUCTION across the admin's devices: only ever
+     * republishes the PERSISTED keyId/keyHash — two devices doing it
+     * concurrently emit identical content. Minting happens nowhere here.
+     */
+    private suspend fun reannounceCurrent(messageStreamId: String, keysStreamId: String) {
+        var announce: JSONObject? = null
+        mutex.withLock {
+            val s = getState(messageStreamId)
+            val cur = s.announces[s.currentEpoch] ?: return
+            val entry = s.epochs[cur.keyId] ?: return
+            announce = JSONObject()
+                .put("t", StreamConstants.KEY_ANNOUNCE)
+                .put("epoch", s.currentEpoch)
+                .put("keyId", cur.keyId)
+                .put("keyHash", entry.keyHash)
+                .put("validFrom", System.currentTimeMillis())
+            s.announceFreshness[s.currentEpoch] = System.currentTimeMillis()
+        }
+        publishKeys(keysStreamId, announce ?: return)
+        Log.i(TAG, "re-announced current epoch (missing/aging in storage) on ${keysStreamId.takeLast(30)}")
     }
 
     private fun missingEpochsLocked(s: ChannelState): List<Int> {
@@ -187,7 +245,9 @@ class EpochKeyManager(
      * epoch (announce lost — storage race at create time, or aged past
      * retention; idempotent self-heal), or mint epoch 1 on a virgin channel.
      */
-    private suspend fun bootstrapOrReannounce(messageStreamId: String, keysStreamId: String) {
+    private suspend fun bootstrapOrReannounce(
+        messageStreamId: String, keysStreamId: String, allowMint: Boolean
+    ) {
         var announce: JSONObject? = null
         var adopt: Triple<String, String, Int>? = null   // keyId, keyHex, epoch — null on re-announce
         var keyHash = ""
@@ -202,6 +262,11 @@ class EpochKeyManager(
                     .put("keyId", existing.key)
                     .put("keyHash", keyHash)
                     .put("validFrom", System.currentTimeMillis())
+            } else if (!allowMint) {
+                Log.w(TAG, "admin device holds NO epoch keys on an established channel " +
+                    "${messageStreamId.takeLast(30)} — NOT minting (would fork the channel). " +
+                    "Recover the keys on the original device.")
+                return
             } else {
                 val keyHex = EpochKeyCrypto.generateEpochKey()
                 keyHash = EpochKeyCrypto.computeKeyHash(keyHex)
@@ -302,6 +367,12 @@ class EpochKeyManager(
         val keyId = data.optString("keyId")
         val keyHash = data.optString("keyHash").lowercase()
         if (epoch < 1 || keyId.isEmpty() || keyHash.isEmpty()) return false
+
+        // Freshness bookkeeping for the TTL re-announce — tracks the NEWEST
+        // valid copy even when the conflict rule below keeps an older one
+        if (timestamp > (s.announceFreshness[epoch] ?: 0L)) {
+            s.announceFreshness[epoch] = timestamp
+        }
 
         val incoming = Announce(keyId, keyHash, publisherId.lowercase(), timestamp)
         val existing = s.announces[epoch]
@@ -503,7 +574,9 @@ class EpochKeyManager(
             else { s.lastMissingRefresh = now; true }
         }
         if (refresh) {
-            try { ensureChannelKeys(messageStreamId, keysStreamId) } catch (e: Exception) {
+            // An unknown kid means the channel already HAS epoch traffic — by
+            // definition not virgin, so a keyless admin must never mint here.
+            try { ensureChannelKeys(messageStreamId, keysStreamId, allowMint = false) } catch (e: Exception) {
                 Log.w(TAG, "refresh after missing kid failed: ${e.message}")
             }
         }

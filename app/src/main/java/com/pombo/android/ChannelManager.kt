@@ -3620,7 +3620,10 @@ class ChannelManager(
                             delay(8_000)
                             if (!stillCurrent(generation)) return@launch
                             try {
-                                epochKeys.ensureChannelKeys(channel.messageStreamId, channel.keysStreamId)
+                                epochKeys.ensureChannelKeys(
+                                    channel.messageStreamId, channel.keysStreamId,
+                                    channel.storageDays ?: 180,
+                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000)
                             } catch (e: Exception) {
                                 Log.d(TAG, "Background epoch reconcile failed: ${e.message}")
                             }
@@ -3628,7 +3631,10 @@ class ChannelManager(
                     } else {
                         val tEnsure = System.currentTimeMillis()
                         try {
-                            epochKeys.ensureChannelKeys(channel.messageStreamId, channel.keysStreamId)
+                            epochKeys.ensureChannelKeys(
+                                channel.messageStreamId, channel.keysStreamId,
+                                channel.storageDays ?: 180,
+                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000)
                         } catch (e: Exception) {
                             Log.w(TAG, "Epoch key setup failed (messages will wait for key): ${e.message}")
                         }
@@ -4677,7 +4683,10 @@ class ChannelManager(
             var envelope = epochKeys.encryptCurrent(channel.messageStreamId, clean)
             if (envelope == null) {
                 // Cold open may not have run the bootstrap/request yet — one recovery attempt
-                epochKeys.ensureChannelKeys(channel.messageStreamId, keysId)
+                epochKeys.ensureChannelKeys(
+                    channel.messageStreamId, keysId,
+                    channel.storageDays ?: 180,
+                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000)
                 envelope = epochKeys.encryptCurrent(channel.messageStreamId, clean)
             }
             if (envelope == null) {
