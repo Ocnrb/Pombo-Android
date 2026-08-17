@@ -133,6 +133,7 @@ class ChannelManager(
      */
     private val epochKeys = com.pombo.android.core.EpochKeyManager(
         store = epochKeyStore,
+        scope = scope,
         myAddress = myAddress,
         publishKeys = { keysStreamId, data ->
             bridge.call("publishAsAccount", JSONObject()
@@ -3623,7 +3624,8 @@ class ChannelManager(
                                 epochKeys.ensureChannelKeys(
                                     channel.messageStreamId, channel.keysStreamId,
                                     channel.storageDays ?: 180,
-                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000)
+                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000,
+                                    memberCount = channel.members.size)
                             } catch (e: Exception) {
                                 Log.d(TAG, "Background epoch reconcile failed: ${e.message}")
                             }
@@ -3634,7 +3636,8 @@ class ChannelManager(
                             epochKeys.ensureChannelKeys(
                                 channel.messageStreamId, channel.keysStreamId,
                                 channel.storageDays ?: 180,
-                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000)
+                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000,
+                                    memberCount = channel.members.size)
                         } catch (e: Exception) {
                             Log.w(TAG, "Epoch key setup failed (messages will wait for key): ${e.message}")
                         }
@@ -4686,7 +4689,8 @@ class ChannelManager(
                 epochKeys.ensureChannelKeys(
                     channel.messageStreamId, keysId,
                     channel.storageDays ?: 180,
-                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000)
+                                    allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000,
+                                    memberCount = channel.members.size)
                 envelope = epochKeys.encryptCurrent(channel.messageStreamId, clean)
             }
             if (envelope == null) {
@@ -4786,7 +4790,9 @@ class ChannelManager(
             val publisher = meta.optString("publisherId").ifEmpty { null }
             val ts = meta.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
             scope.launch {
-                epochKeys.handleKeysMessage(channel.messageStreamId, streamId, content, publisher, ts)
+                epochKeys.handleKeysMessage(
+                    channel.messageStreamId, streamId, content, publisher, ts,
+                    memberCount = channel.members.size)
             }
             return
         }

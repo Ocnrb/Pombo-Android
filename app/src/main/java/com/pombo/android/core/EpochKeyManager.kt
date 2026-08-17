@@ -2,6 +2,8 @@ package com.pombo.android.core
 
 import android.util.Log
 import com.pombo.android.data.EpochKeyStore
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
@@ -27,6 +29,8 @@ import org.json.JSONObject
  */
 class EpochKeyManager(
     private val store: EpochKeyStore,
+    /** For rank-delayed answers (N-B) — never delay inline in a handler. */
+    private val scope: kotlinx.coroutines.CoroutineScope,
     private val myAddress: () -> String?,
     private val publishKeys: suspend (keysStreamId: String, data: JSONObject) -> Unit,
     private val resendKeys: suspend (keysStreamId: String) -> List<Entry>,
@@ -57,6 +61,12 @@ class EpochKeyManager(
         var lastMissingRefresh = 0L
         /** Consecutive unanswered requests — drives the retry backoff. */
         var requestAttempts = 0
+        /**
+         * requestId -> keyIds of wraps OBSERVED (live or history) — the N-B
+         * suppression signal: stay silent for epochs someone already covered.
+         * LinkedHashMap for insertion-order eviction.
+         */
+        val seenWraps = LinkedHashMap<String, MutableSet<String>>()
     }
 
     private class PendingRequest(
@@ -81,6 +91,14 @@ class EpochKeyManager(
         private const val REQUEST_FAST_ATTEMPTS = 4
         /** Laps of the caller's 10s retry loop while a channel waits for keys. */
         const val RETRY_LOOP_ATTEMPTS = 6
+        // N-B anti-stampede (§7.10): rank × step = wait before checking
+        // whether a lower rank already covered the request.
+        private const val RANK_STEP_MS = 2_000L
+        private const val RANK_MAX = 8
+        // Stored requests older than this are dead — the requester's
+        // ephemeral pair lives in memory only.
+        private const val REQUEST_ANSWER_WINDOW_MS = 10 * 60 * 1000L
+        private const val SEEN_WRAPS_MAX = 100
     }
 
     // ---- Admin set (D13): namespace address only ----
@@ -164,26 +182,39 @@ class EpochKeyManager(
          * member wraps either — without an announce there is no keyHash to
          * verify them against.
          */
-        allowMint: Boolean = true
+        allowMint: Boolean = true,
+        /** Rank domain for the anti-stampede queue (channel member count). */
+        memberCount: Int = 4
     ) {
         val entries = try { resendKeys(keysStreamId) } catch (e: Exception) { emptyList() }
         var toRequest = false
         var toBootstrap = false
         var toReannounce = false
+        val storedRequests = mutableListOf<Entry>()
+        var haveKeys = false
         mutex.withLock {
             val s = getState(messageStreamId)
             if (!s.loaded) { loadPersisted(messageStreamId, s); s.loaded = true }
             var changed = false
             for (entry in entries) {
-                if (entry.data.optString("t") == StreamConstants.KEY_ANNOUNCE) {
-                    if (applyAnnounceLocked(messageStreamId, s, entry.data, entry.publisherId, entry.timestamp)) {
-                        changed = true
+                when (entry.data.optString("t")) {
+                    StreamConstants.KEY_ANNOUNCE -> {
+                        if (applyAnnounceLocked(messageStreamId, s, entry.data, entry.publisherId, entry.timestamp)) {
+                            changed = true
+                        }
                     }
+                    // Coverage bookkeeping: a stored wrap means someone
+                    // already answered — its epochs need no re-answering
+                    StreamConstants.KEY_WRAP -> {
+                        val rid = entry.data.optString("requestId")
+                        val kid = entry.data.optString("keyId")
+                        if (rid.isNotEmpty() && kid.isNotEmpty()) recordSeenWrapLocked(s, rid, kid)
+                    }
+                    StreamConstants.KEY_REQUEST -> storedRequests.add(entry)
                 }
-                // Requests are never answered from history; wraps from history
-                // are addressed to request keys that no longer exist.
             }
             if (changed) persist(messageStreamId, s)
+            haveKeys = s.epochs.isNotEmpty()
             toBootstrap = s.announces.isEmpty() && isOwnAdmin(messageStreamId)
             toRequest = s.announces.isNotEmpty() && missingEpochsLocked(s).isNotEmpty()
             if (!toBootstrap && isOwnAdmin(messageStreamId)) {
@@ -207,6 +238,26 @@ class EpochKeyManager(
                 if (getState(messageStreamId).announces.isEmpty()) {
                     Log.i(TAG, "no announce yet on ${keysStreamId.takeLast(30)} — waiting for the admin")
                 }
+            }
+        }
+
+        // N-B: answer RECENT stored requests no wrap covers yet — a member
+        // arriving later serves whoever is still waiting, so requester and
+        // key-holder no longer have to coincide in time.
+        if (haveKeys) {
+            val me = myAddress()?.lowercase()
+            val now = System.currentTimeMillis()
+            for (entry in storedRequests) {
+                if (entry.publisherId?.lowercase() == me) continue
+                if (now - entry.timestamp > REQUEST_ANSWER_WINDOW_MS) continue
+                val requestId = entry.data.optString("requestId")
+                val pubkey = entry.data.optString("pubkey")
+                if (requestId.isEmpty() || pubkey.isEmpty()) continue
+                scheduleAnswer(
+                    messageStreamId, keysStreamId,
+                    requestId, pubkey, entry.data.optInt("fromEpoch", 1),
+                    rankFor(requestId, memberCount) * RANK_STEP_MS
+                )
             }
         }
     }
@@ -334,7 +385,9 @@ class EpochKeyManager(
 
     suspend fun handleKeysMessage(
         messageStreamId: String, keysStreamId: String,
-        data: JSONObject, publisherId: String?, timestamp: Long
+        data: JSONObject, publisherId: String?, timestamp: Long,
+        /** Rank domain for the anti-stampede queue (channel member count). */
+        memberCount: Int = 4
     ) {
         when (data.optString("t")) {
             StreamConstants.KEY_ANNOUNCE -> {
@@ -348,7 +401,7 @@ class EpochKeyManager(
                 // Pull model: a live announce for an epoch we lack triggers a request
                 if (needRequest) sendKeyRequest(messageStreamId, keysStreamId)
             }
-            StreamConstants.KEY_REQUEST -> handleRequest(messageStreamId, keysStreamId, data, publisherId)
+            StreamConstants.KEY_REQUEST -> handleRequest(messageStreamId, keysStreamId, data, publisherId, memberCount)
             StreamConstants.KEY_WRAP -> handleWrap(messageStreamId, data)
         }
     }
@@ -388,24 +441,74 @@ class EpochKeyManager(
     }
 
     /**
-     * Answer a live KEY_REQUEST with wraps for every epoch we hold from
-     * `fromEpoch` on (D14 native policy: all retained epochs). Anything we
-     * hear on -4 already passed the stream's on-chain permission check.
+     * A live KEY_REQUEST: schedule an answer behind the anti-stampede rank
+     * (§7.10, N-B). Anything we hear on -4 already passed the stream's
+     * on-chain permission check.
      */
     private suspend fun handleRequest(
-        messageStreamId: String, keysStreamId: String, data: JSONObject, publisherId: String?
+        messageStreamId: String, keysStreamId: String,
+        data: JSONObject, publisherId: String?, memberCount: Int
     ) {
         if (publisherId?.lowercase() == myAddress()?.lowercase()) return  // our own
         val pubkey = data.optString("pubkey").ifEmpty { return }
         val requestId = data.optString("requestId").ifEmpty { return }
-        val fromEpoch = data.optInt("fromEpoch", 1)
+        val haveKeys = mutex.withLock { getState(messageStreamId).epochs.isNotEmpty() }
+        if (!haveKeys) return
+        scheduleAnswer(
+            messageStreamId, keysStreamId,
+            requestId, pubkey, data.optInt("fromEpoch", 1),
+            rankFor(requestId, memberCount) * RANK_STEP_MS
+        )
+    }
 
+    /**
+     * Anti-stampede rank (§7.10): hash(identity ‖ requestId) mod N orders
+     * members deterministically WITHOUT coordination. Rank 0 answers now;
+     * each higher rank waits a step and stays silent for covered epochs.
+     */
+    private fun rankFor(requestId: String, memberCount: Int): Int {
+        val n = memberCount.coerceIn(1, RANK_MAX)
+        val me = myAddress()?.lowercase() ?: ""
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest("$me|$requestId".toByteArray(Charsets.UTF_8))
+        return (digest[0].toInt() and 0xff) % n
+    }
+
+    /** Fire-and-forget: NEVER delay inline — the -4 handler must keep flowing,
+     *  or the wraps whose arrival should silence us would queue behind us. */
+    private fun scheduleAnswer(
+        messageStreamId: String, keysStreamId: String,
+        requestId: String, pubkey: String, fromEpoch: Int, delayMs: Long
+    ) {
+        scope.launch {
+            if (delayMs > 0) delay(delayMs)
+            try {
+                answerRequest(messageStreamId, keysStreamId, requestId, pubkey, fromEpoch)
+            } catch (e: Exception) {
+                Log.w(TAG, "scheduled answer failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Answer with wraps for every epoch we hold from `fromEpoch` on (D14)
+     * MINUS the epochs an observed wrap already covers — the N-B suppression
+     * that turns thirty identical envelopes into one.
+     */
+    private suspend fun answerRequest(
+        messageStreamId: String, keysStreamId: String,
+        requestId: String, pubkey: String, fromEpoch: Int
+    ) {
         val toWrap = mutex.withLock {
-            getState(messageStreamId).epochs
+            val s = getState(messageStreamId)
+            val covered = s.seenWraps[requestId] ?: emptySet<String>()
+            s.epochs
+                .filterKeys { it !in covered }
                 .filterValues { it.epoch >= fromEpoch }
                 .map { (keyId, e) -> Triple(keyId, e.keyHex, e.epoch) }
         }
         if (toWrap.isEmpty()) return
+        var sent = 0
         for ((keyId, keyHex, epoch) in toWrap) {
             try {
                 val wrapped = EpochKeyCrypto.wrapEpochKey(keyHex, pubkey)
@@ -418,11 +521,24 @@ class EpochKeyManager(
                     .put("epk", wrapped.getString("epk"))
                     .put("iv", wrapped.getString("iv"))
                     .put("ct", wrapped.getString("ct")))
+                mutex.withLock { recordSeenWrapLocked(getState(messageStreamId), requestId, keyId) }
+                sent += 1
             } catch (e: Exception) {
                 Log.w(TAG, "failed to wrap $keyId for request $requestId: ${e.message}")
             }
         }
-        Log.d(TAG, "answered request $requestId with ${toWrap.size} wrap(s)")
+        if (sent > 0) Log.d(TAG, "answered request $requestId with $sent wrap(s)")
+    }
+
+    /** Caller holds the lock. */
+    private fun recordSeenWrapLocked(s: ChannelState, requestId: String, keyId: String) {
+        val set = s.seenWraps.getOrPut(requestId) {
+            if (s.seenWraps.size >= SEEN_WRAPS_MAX) {
+                s.seenWraps.keys.firstOrNull()?.let { s.seenWraps.remove(it) }
+            }
+            mutableSetOf()
+        }
+        set.add(keyId)
     }
 
     /**
@@ -433,6 +549,11 @@ class EpochKeyManager(
         var adoptedKeyId: String? = null
         mutex.withLock {
             val s = getState(messageStreamId)
+            // Suppression bookkeeping FIRST, for every well-formed wrap — this
+            // is what lets higher-rank answerers stay silent (N-B)
+            val rid = data.optString("requestId")
+            val kid = data.optString("keyId")
+            if (rid.isNotEmpty() && kid.isNotEmpty()) recordSeenWrapLocked(s, rid, kid)
             val pending = s.pendingRequest ?: return
             if (data.optString("requestId") != pending.requestId) return
             val keyId = data.optString("keyId").ifEmpty { return }
