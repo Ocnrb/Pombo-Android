@@ -1473,7 +1473,17 @@ const api = {
                 ? await stream.getDescription()
                 : (stream.metadata && JSON.parse(stream.metadata || '{}').description);
             const meta = JSON.parse(desc || '{}');
-            return { publicKey: meta.pk || null };
+            const pk = meta.pk || null;
+            if (!pk) return { publicKey: null };
+            // The stream namespace proves ownership on-chain, but this read
+            // travels through user-chosen RPCs with public failover — a
+            // hostile RPC forging `pk` here would be a full DM MITM. The key
+            // must BE the address.
+            if (window.ethers.computeAddress(pk).toLowerCase() !== String(a.address).toLowerCase()) {
+                console.warn('DM: inbox metadata public key does not match its owner — rejecting ' + streamId);
+                return { publicKey: null };
+            }
+            return { publicKey: pk };
         } catch (e) { return { publicKey: null }; }
     },
 
