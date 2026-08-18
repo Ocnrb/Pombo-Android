@@ -386,6 +386,63 @@ const api = {
         return s;
     },
 
+    // ===== envelope signer recovery (N-C, web envelopeSigner.js) =====
+    //
+    // In a gated channel every member publishes as the gate clone, so the
+    // on-wire publisherId names the CONTRACT. The author is whoever signed
+    // the Streamr envelope — the SDK validated that signature against the
+    // gate's isValidSignature (ERC-1271) before the message reached us, so
+    // recovering it yields an address the chain already vouched for.
+    //
+    // Digest reconstruction mirrors the SDK's createSignaturePayload for
+    // MESSAGE-type messages (v103; parity locked by web-generated vectors in
+    // docs/GATED-CHANNELS-envelope-vectors.json):
+    //   payload = utf8(streamId+partition+timestamp+seqNo+publisherId+
+    //             msgChainId[+prevTs+prevSeq]) || content bytes
+    //   digest  = EIP-191 ("\x19Ethereum Signed Message:\n" + len)
+    //
+    // ⚠️ The public Message wrapper (subscribe callbacks AND resend
+    // iterators) hides the raw StreamMessage in `.streamMessage` — recovery
+    // on the wrapper itself fails for every message.
+    _signerCache: new Map(),
+
+    _recoverEnvelopeSigner(message) {
+        try {
+            const sm = (message && message.streamMessage) ? message.streamMessage : message;
+            const id = sm && sm.messageId;
+            const content = sm && sm.content;
+            const signature = sm && sm.signature;
+            if (!id || !(content instanceof Uint8Array) ||
+                !(signature instanceof Uint8Array) || signature.length !== 65) return null;
+
+            const prev = sm.prevMsgRef;
+            const header = '' + id.streamId + id.streamPartition + id.timestamp +
+                id.sequenceNumber + id.publisherId + id.msgChainId +
+                (prev ? ('' + prev.timestamp + prev.sequenceNumber) : '');
+            const headerBytes = new TextEncoder().encode(header);
+            const payload = new Uint8Array(headerBytes.length + content.length);
+            payload.set(headerBytes, 0);
+            payload.set(content, headerBytes.length);
+
+            const digest = window.ethers.hashMessage(payload);
+            const sigHex = window.ethers.hexlify(signature);
+            // Keyed by digest+signature: the pair fully determines the result,
+            // so re-attached signatures can never poison the cache.
+            const cacheKey = digest + sigHex;
+            const cached = api._signerCache.get(cacheKey);
+            if (cached !== undefined) return cached;
+
+            const signer = window.ethers.recoverAddress(digest, sigHex).toLowerCase();
+            if (api._signerCache.size >= 500) {
+                api._signerCache.delete(api._signerCache.keys().next().value);
+            }
+            api._signerCache.set(cacheKey, signer);
+            return signer;
+        } catch (e) {
+            return null;
+        }
+    },
+
     // Streams whose publish rights are on-chain and owner/member-bound must
     // never see an ephemeral publisher: the admin stream (-3: ADMIN_STATE,
     // CHANNEL_IMAGE, PASSWORD_CHALLENGE) is refused HERE, loudly — a clever
@@ -503,6 +560,32 @@ const api = {
         return { ok: true, timestamp: msg.timestamp };
     },
 
+    // Publish AS THE GATE CLONE (N-C gated channels): the ACCOUNT key signs
+    // the envelope, the clone is the on-wire publisher, and the network
+    // validates via the clone's isValidSignature (ERC-1271). Receivers
+    // recover authorship from that signature (_recoverEnvelopeSigner).
+    // Allowed on -3 on purpose: in a gated channel the clone holds the only
+    // publish grant, and owner-only authority moved to ingest (Kotlin drops
+    // -3 messages whose SIGNER is not the namespace admin).
+    //   { streamId, partition, content?|contentB64?, gateAddress } -> { ok, timestamp }
+    async publishAsGate(a) {
+        if (!wallet) throw new Error('no identity');
+        if (!a.gateAddress) throw new Error('publishAsGate requires gateAddress');
+        const st = window.SignatureType;
+        if (!st || st.ERC_1271 == null) {
+            throw new Error('SignatureType.ERC_1271 not exposed — refresh pombo-vendor.bundle.js');
+        }
+        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+        const data = a.contentB64 != null ? b64ToU8(a.contentB64) : a.content;
+        const msg = await api._publishAs(identity, a.streamId, a.partition, data, {
+            // LOWERCASE, always — Trap 4: a checksummed publisherId makes every
+            // receiver's signature validation reject the message in silence.
+            publisherId: String(a.gateAddress).toLowerCase(),
+            signatureType: st.ERC_1271
+        });
+        return { ok: true, timestamp: msg.timestamp };
+    },
+
     // Kotlin-facing wrapper: publish under a random (or given) ephemeral key.
     //   { streamId, partition, content?|contentB64?, privateKey? }
     //   -> { ok, timestamp, publisherId }
@@ -536,7 +619,12 @@ const api = {
         // freely without keeping its own registry of what is open. The password
         // is still refreshed above, so re-subscribing can correct it.
         if (subs.has(key)) return { ok: true, already: true };
-        const sub = await client.subscribe({ streamId: a.streamId, partition: a.partition }, function (content, meta) {
+        const subscribeArgs = { streamId: a.streamId, partition: a.partition };
+        // Gated channels (N-C): prove access via the gate contract — our
+        // wallet signs, the clone's isValidSignature vouches. No per-member
+        // stream grant exists.
+        if (a.erc1271Contract) subscribeArgs.erc1271Contract = String(a.erc1271Contract).toLowerCase();
+        const sub = await client.subscribe(subscribeArgs, function (content, meta) {
             try {
                 // Publisher identity the way web streamr.js reads it:
                 // getPublisherId() FIRST, the bare property only as fallback.
@@ -559,6 +647,13 @@ const api = {
                     timestamp: meta ? meta.timestamp : null,
                     sequenceNumber: meta ? meta.sequenceNumber : null
                 };
+                // Gated (N-C): authorship = envelope signer. Recovered here —
+                // the raw StreamMessage never crosses to Kotlin — and only on
+                // request (one ecrecover per message is waste on every other
+                // stream). Policy (drop rules) stays in Kotlin.
+                if (a.recoverSigner) {
+                    metaOut.signer = api._recoverEnvelopeSigner(meta);
+                }
                 // Binary (file pieces on -2/P2) goes to its own callback so the
                 // bytes never touch JSON.stringify. Checked first: a Uint8Array
                 // IS stringifiable, so the JSON path would silently accept and
@@ -801,6 +896,7 @@ const api = {
                     timestamp: msg.timestamp
                 }
             };
+            if (a.recoverSigner) rec.meta.signer = api._recoverEnvelopeSigner(msg);
             out.push(rec);
             opener.take(rec);
         }, Date.now() + (a.budgetMs || 40000), { streamId: a.streamId, partition: a.partition });
@@ -837,6 +933,7 @@ const api = {
                     timestamp: msg.timestamp
                 }
             };
+            if (a.recoverSigner) rec.meta.signer = api._recoverEnvelopeSigner(msg);
             all.push(rec);
             opener.take(rec);
         }, Date.now() + (a.budgetMs || 40000), { streamId: a.streamId, partition: a.partition });
@@ -864,13 +961,15 @@ const api = {
         );
         const out = [];
         const partial = await api._drainResend(stream, function (msg) {
-            out.push({
+            const rec = {
                 content: msg.content,
                 meta: {
                     publisherId: msg.publisherId != null ? String(msg.publisherId) : null,
                     timestamp: msg.timestamp
                 }
-            });
+            };
+            if (a.recoverSigner) rec.meta.signer = api._recoverEnvelopeSigner(msg);
+            out.push(rec);
         }, Date.now() + (a.budgetMs || 40000), { streamId: a.streamId, partition: a.partition });
         // Reaching epoch means there is nothing older left to scan.
         return { messages: out, hasMore: windowStart > 0 || partial, windowStart: windowStart, partial: partial };
@@ -1855,7 +1954,214 @@ const api = {
             md = (typeof stream.getMetadata === 'function') ? await stream.getMetadata() : stream.metadata;
         } catch (e) { md = null; }
         return { metadata: md || {} };
-    }
+    },
+
+    // ===== PomboGate (N-C gated channels) — port of web gate.js =====
+    //
+    // One EIP-1167 clone per channel; the clone is the on-wire publisher and
+    // its checkAccess decides epoch-key distribution and UI state (never
+    // history — that is the sticky isValidSignature's job, consumed by the
+    // SDK). Reads cached 10 min per (gate,user), FAIL-CLOSED on RPC trouble.
+    // Writes are owner/moderator transactions signed by the account wallet.
+    _GATE_FACTORY: '0x14595B5F192fA56714D1F8821BD1651dC5bFd1aB', // v2 (moderators), Polygon PoS
+    _GATE_ABI: [
+        'function owner() view returns (address)',
+        'function mode() view returns (uint8)',
+        'function token() view returns (address)',
+        'function minBalance() view returns (uint256)',
+        'function price() view returns (uint256)',
+        'function duration() view returns (uint64)',
+        'function everMember(address) view returns (bool)',
+        'function banned(address) view returns (bool)',
+        'function erased(address) view returns (bool)',
+        'function allowlist(address) view returns (bool)',
+        'function moderators(address) view returns (bool)',
+        'function checkAccess(address user) view returns (bool)',
+        'function accessUntil(address user) view returns (uint64)',
+        'function allow(address user)',
+        'function allowBatch(address[] users)',
+        'function revokeAllow(address user)',
+        'function ban(address user, bool eraseHistory)',
+        'function unban(address user)',
+        'function unerase(address user)',
+        'function setModerator(address user, bool enabled)'
+    ],
+    _GATE_FACTORY_ABI: [
+        'function createGate(uint8 mode, address token, uint256 minBalance, uint256 price, uint64 duration) returns (address)',
+        'event GateCreated(address indexed gate, address indexed owner, uint8 mode)'
+    ],
+    _gateRpcIndex: 0,
+    _gateProviderUrl: null,
+    _gateProviderInst: null,
+    _gateAccessCache: new Map(), // "gate|user" -> { value, at }; TTL 10 min
+
+    _gateRpcUrl() {
+        // RPCS is the settings-derived list injected at page build — entries
+        // are Streamr-shaped ({url}); JsonRpcProvider needs the string or it
+        // treats the object as a FetchRequest.
+        const list = (typeof RPCS !== 'undefined' && RPCS && RPCS.length) ? RPCS : [{ url: 'https://polygon-bor-rpc.publicnode.com' }];
+        const entry = list[api._gateRpcIndex % list.length];
+        return typeof entry === 'string' ? entry : entry.url;
+    },
+
+    _gateProvider() {
+        const url = api._gateRpcUrl();
+        if (!api._gateProviderInst || api._gateProviderUrl !== url) {
+            api._gateProviderInst = new window.ethers.JsonRpcProvider(url, 137, {
+                staticNetwork: true, batchMaxCount: 1
+            });
+            api._gateProviderUrl = url;
+        }
+        return api._gateProviderInst;
+    },
+
+    async _gateWithProvider(op) {
+        try {
+            return await op(api._gateProvider());
+        } catch (firstError) {
+            api._gateRpcIndex++;
+            api._gateProviderInst = null;
+            console.warn('gate: RPC failed, rotating endpoint: ' + (firstError && firstError.message || firstError));
+            return op(api._gateProvider());
+        }
+    },
+
+    _gateRead(gateAddress) {
+        return new window.ethers.Contract(gateAddress, api._GATE_ABI, api._gateProvider());
+    },
+
+    _gateSigner() {
+        if (!wallet) throw new Error('no identity');
+        return new window.ethers.Wallet(wallet.privateKey, api._gateProvider());
+    },
+
+    async _gateTx(gateAddress, method, args) {
+        const gate = new window.ethers.Contract(gateAddress, api._GATE_ABI, api._gateSigner());
+        const tx = await gate[method].apply(gate, args);
+        await tx.wait();
+        // Drop cached access for this gate — membership just changed.
+        const prefix = String(gateAddress).toLowerCase();
+        Array.from(api._gateAccessCache.keys()).forEach(function (k) {
+            if (k.indexOf(prefix) === 0) api._gateAccessCache.delete(k);
+        });
+        return { ok: true, txHash: tx.hash };
+    },
+
+    // { mode, token?, minBalance?, price?, duration? } -> { gate }
+    async gateCreate(a) {
+        const factory = new window.ethers.Contract(api._GATE_FACTORY, api._GATE_FACTORY_ABI, api._gateSigner());
+        const tx = await factory.createGate(
+            a.mode || 0,
+            a.token || '0x0000000000000000000000000000000000000000',
+            a.minBalance != null ? BigInt(a.minBalance) : 0n,
+            a.price != null ? BigInt(a.price) : 0n,
+            a.duration != null ? BigInt(a.duration) : 0n
+        );
+        const receipt = await tx.wait();
+        var gateAddress = null;
+        for (var i = 0; i < receipt.logs.length; i++) {
+            try {
+                const parsed = factory.interface.parseLog(receipt.logs[i]);
+                if (parsed && parsed.name === 'GateCreated') { gateAddress = parsed.args.gate; break; }
+            } catch (e) { /* foreign log */ }
+        }
+        if (!gateAddress) throw new Error('gateCreate: no GateCreated event in receipt');
+        return { gate: String(gateAddress).toLowerCase(), txHash: tx.hash };
+    },
+
+    // { gate, user } -> { access } — cached 10 min, FAIL-CLOSED: an RPC
+    // outage reports no access rather than handing an epoch key to someone
+    // the chain might have cut; failures are never cached.
+    async gateCheckAccess(a) {
+        const cacheKey = String(a.gate).toLowerCase() + '|' + String(a.user).toLowerCase();
+        const cached = api._gateAccessCache.get(cacheKey);
+        if (cached && Date.now() - cached.at < 10 * 60 * 1000) return { access: cached.value };
+        var value;
+        try {
+            value = await api._gateWithProvider(function () {
+                return api._gateRead(a.gate).checkAccess(a.user);
+            });
+        } catch (e) {
+            console.warn('gate: checkAccess failed (fail-closed): ' + (e && e.message || e));
+            return { access: false };
+        }
+        if (api._gateAccessCache.size > 2000) {
+            api._gateAccessCache.delete(api._gateAccessCache.keys().next().value);
+        }
+        api._gateAccessCache.set(cacheKey, { value: !!value, at: Date.now() });
+        return { access: !!value };
+    },
+
+    // { gate } -> { owner, mode, token, minBalance, price, duration }
+    async gateInfo(a) {
+        return api._gateWithProvider(async function () {
+            const gate = api._gateRead(a.gate);
+            const r = await Promise.all([
+                gate.owner(), gate.mode(), gate.token(),
+                gate.minBalance(), gate.price(), gate.duration()
+            ]);
+            return {
+                owner: String(r[0]).toLowerCase(), mode: Number(r[1]),
+                token: String(r[2]).toLowerCase(), minBalance: String(r[3]),
+                price: String(r[4]), duration: String(r[5])
+            };
+        });
+    },
+
+    // { gate, candidates: [addr] } -> { members: [{address, isOwner, allowed,
+    // banned, everMember, erased, moderator}] } — candidate flags, NO event
+    // scan (free RPCs cap eth_getLogs at 10k blocks; enumeration → indexer, N-D).
+    async gateMembers(a) {
+        return api._gateWithProvider(async function () {
+            const gate = api._gateRead(a.gate);
+            const owner = String(await gate.owner()).toLowerCase();
+            const gateAddr = String(a.gate).toLowerCase();
+            const set = {};
+            set[owner] = true;
+            (a.candidates || []).forEach(function (c) {
+                const addr = String(c || '').toLowerCase();
+                if (/^0x[0-9a-f]{40}$/.test(addr) && addr !== gateAddr) set[addr] = true;
+            });
+            const addresses = Object.keys(set);
+            const members = await Promise.all(addresses.map(async function (address) {
+                const f = await Promise.all([
+                    gate.allowlist(address), gate.banned(address),
+                    gate.everMember(address), gate.erased(address),
+                    gate.moderators(address).catch(function () { return false; }) // v1 gates predate the getter
+                ]);
+                return {
+                    address: address, allowed: !!f[0], banned: !!f[1],
+                    everMember: !!f[2], erased: !!f[3], moderator: !!f[4],
+                    isOwner: address === owner
+                };
+            }));
+            members.sort(function (x, y) {
+                return (y.isOwner - x.isOwner) || (y.moderator - x.moderator) ||
+                    (y.allowed - x.allowed) || x.address.localeCompare(y.address);
+            });
+            return { members: members };
+        });
+    },
+
+    // { gate, user } -> { canModerate } — owner or moderator
+    async gateCanModerate(a) {
+        try {
+            const info = await api.gateInfo(a);
+            if (info.owner === String(a.user).toLowerCase()) return { canModerate: true };
+        } catch (e) { /* fall through to the moderator read */ }
+        try {
+            const isMod = await api._gateWithProvider(function () {
+                return api._gateRead(a.gate).moderators(a.user);
+            });
+            return { canModerate: !!isMod };
+        } catch (e) { return { canModerate: false }; }
+    },
+
+    async gateAllow(a) { return api._gateTx(a.gate, 'allow', [a.user]); },
+    async gateAllowBatch(a) { return api._gateTx(a.gate, 'allowBatch', [a.users || []]); },
+    async gateBan(a) { return api._gateTx(a.gate, 'ban', [a.user, !!a.erase]); },
+    async gateUnban(a) { return api._gateTx(a.gate, 'unban', [a.user]); },
+    async gateSetModerator(a) { return api._gateTx(a.gate, 'setModerator', [a.user, !!a.enabled]); }
 };
 
 // Generic RPC: Kotlin -> bridgeCall(id, method, argsB64) -> Native.result(id, ok, payloadB64)

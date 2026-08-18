@@ -898,6 +898,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     fun ensureEns(address: String?) = manager.ensureEns(address)
     val initialLoad get() = manager.initialLoad
     val hasMoreHistory get() = manager.hasMoreHistory
+    val waitingForKeys get() = manager.waitingForKeys
     val loadingHistory get() = manager.loadingHistory
     val isPreview get() = manager.isPreview
 
@@ -1847,7 +1848,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
      * so a wallet that cannot pay never reaches stream creation.
      */
     fun createChannel(spec: com.pombo.android.ui.screens.NewChannel) = viewModelScope.launch {
-        val streamCount = if (spec.type == "native") 4 else 3
+        val streamCount = if (spec.type == "native" || spec.type == "gated") 4 else 3
         chainAction(
             "Create channel",
             "Creates \"${spec.name}\" — $streamCount streams, their permissions and storage."
@@ -1857,7 +1858,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         // addToStorageNode and setStorageDayCount in one call, unlike the web).
         // Public/password: 3+3+2 = 8. Native adds the keys stream (-4, with
         // storage): 4+4+3 = 11.
-        val totalSteps = if (spec.type == "native") 11 else 8
+        // Gated adds the gate deploy: 1+4+4+3 = 12.
+        val totalSteps = when (spec.type) {
+            "gated" -> 12
+            "native" -> 11
+            else -> 8
+        }
         val id = toast(
             "Creating channel...", com.pombo.android.ui.ToastKind.LOADING, Long.MAX_VALUE,
             subtitle = "This may take a minute",

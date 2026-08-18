@@ -35,14 +35,25 @@ class EpochKeyManager(
     private val publishKeys: suspend (keysStreamId: String, data: JSONObject) -> Unit,
     private val resendKeys: suspend (keysStreamId: String) -> List<Entry>,
     /** Fired on adoption — the channel layer re-pulls history so parked messages open. */
-    private val onKeyAdopted: (messageStreamId: String, keyId: String) -> Unit
+    private val onKeyAdopted: (messageStreamId: String, keyId: String) -> Unit,
+    /**
+     * Gated channels (N-C): the CURRENT gate check, consulted before wrapping
+     * a key for a requester — one cached eth_call, FAIL-CLOSED. Ungated
+     * channels return true. This is where the write-cut for ex-members lives:
+     * the sticky envelope signature keeps their history valid, this keeps new
+     * epochs out of their hands.
+     */
+    private val checkGateAccess: suspend (messageStreamId: String, requester: String) -> Boolean =
+        { _, _ -> true }
 ) {
     data class Entry(val data: JSONObject, val publisherId: String?, val timestamp: Long)
 
     private class EpochEntry(val keyHex: String, val keyHash: String, val epoch: Int)
     private class Announce(
         val keyId: String, val keyHash: String,
-        val publisher: String, val timestamp: Long
+        val publisher: String, val timestamp: Long,
+        /** Epoch validity start — the kid-freshness rule's anchor (N-C). */
+        val validFrom: Long
     )
 
     private class ChannelState {
@@ -99,6 +110,9 @@ class EpochKeyManager(
         // ephemeral pair lives in memory only.
         private const val REQUEST_ANSWER_WINDOW_MS = 10 * 60 * 1000L
         private const val SEEN_WRAPS_MAX = 100
+        /** Post-rotation window in which the previous epoch's kid stays
+         *  acceptable on LIVE gated traffic (web: kidFreshnessToleranceMs). */
+        private const val KID_FRESHNESS_TOLERANCE_MS = 10 * 60 * 1000L
     }
 
     // ---- Admin set (D13): namespace address only ----
@@ -134,7 +148,8 @@ class EpochKeyManager(
                 val a = anns.optJSONObject(epochStr) ?: continue
                 s.announces[epoch] = Announce(
                     a.optString("keyId"), a.optString("keyHash"),
-                    a.optString("publisher"), a.optLong("timestamp"))
+                    a.optString("publisher"), a.optLong("timestamp"),
+                    a.optLong("validFrom", a.optLong("timestamp")))
             }
         }
         val cur = persisted.optInt("currentEpoch", 0)
@@ -153,7 +168,8 @@ class EpochKeyManager(
         for ((epoch, a) in s.announces) {
             announces.put(epoch.toString(), JSONObject()
                 .put("keyId", a.keyId).put("keyHash", a.keyHash)
-                .put("publisher", a.publisher).put("timestamp", a.timestamp))
+                .put("publisher", a.publisher).put("timestamp", a.timestamp)
+                .put("validFrom", a.validFrom))
         }
         store.save(messageStreamId, JSONObject()
             .put("epochs", epochs).put("announces", announces).put("currentEpoch", s.currentEpoch))
@@ -256,7 +272,8 @@ class EpochKeyManager(
                 scheduleAnswer(
                     messageStreamId, keysStreamId,
                     requestId, pubkey, entry.data.optInt("fromEpoch", 1),
-                    rankFor(requestId, memberCount) * RANK_STEP_MS
+                    rankFor(requestId, memberCount) * RANK_STEP_MS,
+                    requester = entry.publisherId
                 )
             }
         }
@@ -427,7 +444,9 @@ class EpochKeyManager(
             s.announceFreshness[epoch] = timestamp
         }
 
-        val incoming = Announce(keyId, keyHash, publisherId.lowercase(), timestamp)
+        val incoming = Announce(
+            keyId, keyHash, publisherId.lowercase(), timestamp,
+            data.optLong("validFrom", timestamp))
         val existing = s.announces[epoch]
         if (existing != null) {
             // Same epoch: older timestamp wins; tie -> lower publisher address
@@ -457,7 +476,8 @@ class EpochKeyManager(
         scheduleAnswer(
             messageStreamId, keysStreamId,
             requestId, pubkey, data.optInt("fromEpoch", 1),
-            rankFor(requestId, memberCount) * RANK_STEP_MS
+            rankFor(requestId, memberCount) * RANK_STEP_MS,
+            requester = publisherId
         )
     }
 
@@ -478,12 +498,13 @@ class EpochKeyManager(
      *  or the wraps whose arrival should silence us would queue behind us. */
     private fun scheduleAnswer(
         messageStreamId: String, keysStreamId: String,
-        requestId: String, pubkey: String, fromEpoch: Int, delayMs: Long
+        requestId: String, pubkey: String, fromEpoch: Int, delayMs: Long,
+        requester: String?
     ) {
         scope.launch {
             if (delayMs > 0) delay(delayMs)
             try {
-                answerRequest(messageStreamId, keysStreamId, requestId, pubkey, fromEpoch)
+                answerRequest(messageStreamId, keysStreamId, requestId, pubkey, fromEpoch, requester)
             } catch (e: Exception) {
                 Log.w(TAG, "scheduled answer failed: ${e.message}")
             }
@@ -497,8 +518,18 @@ class EpochKeyManager(
      */
     private suspend fun answerRequest(
         messageStreamId: String, keysStreamId: String,
-        requestId: String, pubkey: String, fromEpoch: Int
+        requestId: String, pubkey: String, fromEpoch: Int,
+        requester: String?
     ) {
+        // Gated (N-C): the epoch key only goes to whoever passes the CURRENT
+        // gate. Fail-closed inside checkGateAccess — RPC trouble means no
+        // wrap from us; the requester's retry finds a healthier responder.
+        if (requester == null || !checkGateAccess(messageStreamId, requester)) {
+            if (requester != null) {
+                Log.i(TAG, "KEY_REQUEST from $requester refused by gate on ${messageStreamId.takeLast(20)}")
+            }
+            return
+        }
         val toWrap = mutex.withLock {
             val s = getState(messageStreamId)
             val covered = s.seenWraps[requestId] ?: emptySet<String>()
@@ -666,24 +697,68 @@ class EpochKeyManager(
      * NOT an error (§7.9): the missing key triggers a rate-limited refresh
      * and the caller skips; storage-backed messages come back via the
      * refresh fired on adoption.
+     *
+     * Kid freshness (N-C, `gated` only — native's on-chain revocation cuts
+     * harder): sticky signatures mean an ex-member still authors valid
+     * envelopes, so old epoch keys must stop being ACCEPTABLE. Live traffic
+     * must use the current epoch (previous tolerated 10 min post-rotation);
+     * history must use the kid in force at the message timestamp (highest
+     * validFrom <= ts). A violation returns null WITHOUT the missing-kid
+     * refresh — it is stale-key spam, not a missing key. Accepted residual:
+     * forged timestamps can backdate into old windows (Q11, v0-accept).
      */
     suspend fun tryDecrypt(
-        messageStreamId: String, keysStreamId: String, envelope: JSONObject
+        messageStreamId: String, keysStreamId: String, envelope: JSONObject,
+        gated: Boolean = false, live: Boolean = true, timestamp: Long = 0L
     ): JSONObject? {
         val kid = envelope.optString("k")
-        val keyHex = mutex.withLock {
-            state[messageStreamId]?.epochs?.get(kid)?.keyHex
+        val lookup = mutex.withLock {
+            val s = state[messageStreamId]
+            val entry = s?.epochs?.get(kid)
+            if (entry == null) null else {
+                val fresh = !gated || kidIsFreshLocked(s, kid, entry.epoch, live, timestamp)
+                Pair(entry.keyHex, fresh)
+            }
         }
-        if (keyHex == null) {
+        if (lookup == null) {
             noteMissingKid(messageStreamId, keysStreamId)
             return null
         }
+        if (!lookup.second) {
+            Log.w(TAG, "kid freshness violation (kid $kid, live=$live) — dropping")
+            return null
+        }
         return try {
-            EpochKeyCrypto.decryptWithEpochKey(envelope, keyHex)
+            EpochKeyCrypto.decryptWithEpochKey(envelope, lookup.first)
         } catch (e: Exception) {
             Log.w(TAG, "epoch envelope failed to open (kid $kid): ${e.message}")
             null
         }
+    }
+
+    /** The kid-freshness rule (caller holds the lock). True = acceptable. */
+    private fun kidIsFreshLocked(
+        s: ChannelState, kid: String, kidEpoch: Int, live: Boolean, timestamp: Long
+    ): Boolean {
+        val current = s.announces[s.currentEpoch] ?: return true  // no anchor — cannot judge
+        if (kid == current.keyId) return true                     // current epoch always fine
+        if (live) {
+            // Previous epoch tolerated briefly after a rotation (messages in
+            // flight, slow adopters); anything older is stale-key spam.
+            return kidEpoch == s.currentEpoch - 1 &&
+                System.currentTimeMillis() - current.validFrom < KID_FRESHNESS_TOLERANCE_MS
+        }
+        // History: the epoch in force at the message timestamp.
+        if (timestamp <= 0L) return false
+        var epochInForce = 0
+        var bestValidFrom = Long.MIN_VALUE
+        for ((epoch, announce) in s.announces) {
+            if (announce.validFrom <= timestamp && announce.validFrom > bestValidFrom) {
+                bestValidFrom = announce.validFrom
+                epochInForce = epoch
+            }
+        }
+        return kidEpoch == epochInForce
     }
 
     /** Unknown kid seen: refresh key state at most once per interval. */

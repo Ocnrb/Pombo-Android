@@ -12,10 +12,18 @@ data class Channel(
     val messageStreamId: String,
     val ephemeralStreamId: String,
     val adminStreamId: String,
-    /** Keys stream (-4) — native channels only (epoch-key distribution, N-A). */
+    /** Keys stream (-4) — native/gated channels (epoch-key distribution, N-A/N-C). */
     val keysStreamId: String = "",
     val name: String,
-    val type: String,                 // 'public' | 'password' | 'native'
+    val type: String,                 // 'public' | 'password' | 'native' | 'gated'
+    /**
+     * Gated channels (N-C): the PomboGate clone address (lowercase). The chain
+     * is the system of record — this is a warm cache of the -1 metadata's `g`
+     * field, repaired from it when lost. Gated code paths select on TYPE, not
+     * on this being present: a gated channel with a missing gate address must
+     * fail loudly, never fall back to a key the network rejects.
+     */
+    val gateAddress: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val createdBy: String? = null,
     val joinedAt: Long? = null,
@@ -53,6 +61,9 @@ data class Channel(
         .put("keysStreamId", keysStreamId)
         .put("name", name)
         .put("type", type)
+        // Same shape as the web ({ address }) — sync merges whole channel
+        // objects, so the two platforms must serialize the gate identically.
+        .put("gate", gateAddress?.let { JSONObject().put("address", it) } ?: JSONObject.NULL)
         .put("createdAt", createdAt)
         .put("createdBy", createdBy ?: JSONObject.NULL)
         .put("joinedAt", joinedAt ?: JSONObject.NULL)
@@ -83,6 +94,8 @@ data class Channel(
                 keysStreamId = o.optString("keysStreamId"),
                 name = o.optString("name", "channel"),
                 type = o.optString("type", "public"),
+                gateAddress = o.optJSONObject("gate")
+                    ?.optString("address")?.lowercase()?.ifEmpty { null },
                 createdAt = o.optLong("createdAt", 0L),
                 // isNull first: Android's optString yields the literal "null" for JSON null.
                 createdBy = if (o.isNull("createdBy")) null else o.optString("createdBy").ifEmpty { null },

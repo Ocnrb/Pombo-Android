@@ -910,7 +910,7 @@ enum class ChannelKind(val id: String, val label: String, val blurb: String) {
         "Password protected channel. Only users with the correct password can join and read messages."
     ),
     CLOSED(
-        "native", "Closed",
+        "gated", "Closed",
         "Private channel with on-chain verified membership. Each member is authorized by account address."
     )
 }
@@ -2061,6 +2061,7 @@ fun ChatScreen(vm: AppViewModel) {
     val hasMoreHistory by vm.hasMoreHistory.collectAsState()
     val loadingHistory by vm.loadingHistory.collectAsState()
     val loadingInitial by vm.initialLoad.collectAsState()
+    val waitingForKeys by vm.waitingForKeys.collectAsState()
 
     // NATIVE reverse-layout chat (deliberate divergence from the web's
     // top-down DOM): the LazyColumn runs with reverseLayout, so index 0 is the
@@ -2403,7 +2404,22 @@ fun ChatScreen(vm: AppViewModel) {
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
                 ) {
-                    if (terminalEmpty) {
+                    if (terminalEmpty && waitingForKeys) {
+                        CircularProgressIndicator(
+                            color = Color.White.copy(alpha = 0.30f),
+                            strokeWidth = 2.dp, modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text(
+                            "Waiting for channel keys…",
+                            color = Color.White.copy(alpha = 0.40f), fontSize = 14.sp
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Another member needs to be online to share them",
+                            color = Color.White.copy(alpha = 0.25f), fontSize = 12.sp
+                        )
+                    } else if (terminalEmpty) {
                         Text(
                             "No messages yet. Start the conversation!",
                             color = Color.White.copy(alpha = 0.40f), fontSize = 14.sp
@@ -3128,7 +3144,7 @@ private val SendPlaneIcon: androidx.compose.ui.graphics.vector.ImageVector by la
 private fun ChannelTypeIcon(type: String, readOnly: Boolean, tint: Color, size: Dp = 13.dp) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         when (type) {
-            "native" -> EthereumIcon(tint, Modifier.size(size))
+            "native", "gated" -> EthereumIcon(tint, Modifier.size(size))
             "password" -> Icon(Icons.Outlined.Lock, null, tint = tint, modifier = Modifier.size(size))
             "dm" -> Icon(Icons.Outlined.MailOutline, null, tint = tint, modifier = Modifier.size(size))
             else -> Icon(Icons.Outlined.Public, null, tint = tint, modifier = Modifier.size(size))
@@ -3549,7 +3565,7 @@ private fun ChannelDetailsMain(
         val accessTint = Color.White.copy(alpha = 0.70f)
         val accessText: String
         // Native uses the Ethereum mark, drawn (not a Material icon).
-        if (channel.type == "native" && !channel.readOnly) {
+        if ((channel.type == "native" || channel.type == "gated") && !channel.readOnly) {
             EthereumIcon(accessTint, Modifier.size(16.dp))
             accessText = "Verified Membership"
         } else {
@@ -3592,7 +3608,7 @@ private fun ChannelDetailsMain(
     Spacer(Modifier.height(24.dp))
     Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.05f)))
     Spacer(Modifier.height(16.dp))
-    val isNative = channel.type == "native"
+    val isNative = channel.type == "native" || channel.type == "gated"
     if (isNative) {
         ChannelNavRow("Members", leadingIcon = Icons.Outlined.People) { onOpenSub(ChannelSubPanel.MEMBERS) }
         Spacer(Modifier.height(8.dp))
@@ -3777,7 +3793,7 @@ private fun ChannelMembersPanel(vm: AppViewModel, channel: Channel, canModerate:
     }
 
     // ── ADD MEMBERS (owner / GRANT only) ────────────────────────────
-    if (perms.canGrant && channel.type == "native") {
+    if (perms.canGrant && (channel.type == "native" || channel.type == "gated")) {
         Spacer(Modifier.height(16.dp))
         Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.05f)))
         Spacer(Modifier.height(16.dp))
@@ -3884,7 +3900,7 @@ private fun ChannelMembersPanel(vm: AppViewModel, channel: Channel, canModerate:
     }
 
     // ── STREAM PERMISSIONS (owner only) ─────────────────────────────
-    if (canModerate && channel.type == "native") {
+    if (canModerate && (channel.type == "native" || channel.type == "gated")) {
         Spacer(Modifier.height(16.dp))
         Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.05f)))
         Spacer(Modifier.height(16.dp))
@@ -5764,7 +5780,7 @@ private fun CrownIcon(tint: Color, modifier: Modifier = Modifier) {
 internal fun channelTypeLabel(type: String): String = when (type) {
     "public" -> "Public"
     "password" -> "Password protected"
-    "native" -> "Private (members)"
+    "native", "gated" -> "Private (members)"
     "dm" -> "Direct message"
     else -> type
 }

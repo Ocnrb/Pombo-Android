@@ -30,15 +30,19 @@ object InviteToken {
         val streamId: String,
         val name: String?,
         val type: String?,
-        val password: String?
+        val password: String?,
+        /** Gated (N-C): the PomboGate clone address — the whole invite surface;
+         *  mode/params are read from the chain by the joiner. */
+        val gateAddress: String? = null
     )
 
-    fun generate(streamId: String, name: String?, type: String?, password: String?): String {
+    fun generate(streamId: String, name: String?, type: String?, password: String?, gateAddress: String? = null): String {
         val payload = JSONObject()
             .put("s", streamId)
             .put("n", name ?: JSONObject.NULL)
             .put("t", type ?: JSONObject.NULL)
         if (!password.isNullOrEmpty()) payload.put("p", password)
+        if (!gateAddress.isNullOrEmpty()) payload.put("k", gateAddress)
 
         val rnd = SecureRandom()
         val keyBytes = ByteArray(KEY_LEN).also { rnd.nextBytes(it) }
@@ -54,8 +58,8 @@ object InviteToken {
         return listOf(iv, ciphertext, keyBytes).joinToString(".") { b64UrlEncode(it) }
     }
 
-    fun link(streamId: String, name: String?, type: String?, password: String?): String =
-        "$BASE_URL#/invite/${generate(streamId, name, type, password)}"
+    fun link(streamId: String, name: String?, type: String?, password: String?, gateAddress: String? = null): String =
+        "$BASE_URL#/invite/${generate(streamId, name, type, password, gateAddress)}"
 
     /** Returns null on any malformed or undecryptable token, like the web. */
     fun parse(tokenRaw: String): Invite? = try {
@@ -78,7 +82,8 @@ object InviteToken {
             streamId = streamId,
             name = json.optStringOrNull("n"),
             type = json.optStringOrNull("t"),
-            password = json.optStringOrNull("p")
+            password = json.optStringOrNull("p"),
+            gateAddress = json.optStringOrNull("k")?.lowercase()
         )
     } catch (e: Exception) {
         null
@@ -89,6 +94,7 @@ object InviteToken {
         "public" -> "Public Channel"
         "password" -> "Password Protected"
         "native" -> "Native Encryption"
+        "gated" -> "Gated Channel (on-chain)"
         else -> type?.ifEmpty { null } ?: "Unknown"
     }
 

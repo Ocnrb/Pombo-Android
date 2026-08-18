@@ -90,7 +90,7 @@ class PushRelayClient(
      */
     suspend fun subscribeChannel(streamId: String, type: String, name: String): Boolean {
         if (!enabled) return false
-        val native = type == "native"
+        val native = type == "native" || type == "gated"
         val tag = bridge.call(
             "pushTag",
             JSONObject().put("streamId", streamId).put("native", native)

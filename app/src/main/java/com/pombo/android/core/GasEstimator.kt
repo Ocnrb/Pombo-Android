@@ -61,7 +61,7 @@ object GasEstimator {
     ) {
         /** Cost for a channel `type` as used by NewChannel/Channel. */
         fun forType(type: String): BigInteger = when (type) {
-            "native" -> native
+            "native", "gated" -> native
             "dmInbox" -> dmInbox
             else -> public
         }

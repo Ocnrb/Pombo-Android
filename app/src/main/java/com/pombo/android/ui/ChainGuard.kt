@@ -66,7 +66,15 @@ object ChainGuard {
         "removeStorageNode",
         "setStorageDays",
         "createDMInbox",
-        "repairDmInbox"
+        "repairDmInbox",
+        // PomboGate transactions (N-C gated channels). Reads (gateCheckAccess,
+        // gateInfo, gateMembers, gateCanModerate) are free eth_calls.
+        "gateCreate",
+        "gateAllow",
+        "gateAllowBatch",
+        "gateBan",
+        "gateUnban",
+        "gateSetModerator"
     )
 
     private const val WARNING =

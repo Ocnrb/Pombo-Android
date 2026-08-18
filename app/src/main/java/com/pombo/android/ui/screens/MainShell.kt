@@ -503,7 +503,7 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
     }
     val filtered = when (filter) {
         ChannelFilter.ALL -> ordered
-        ChannelFilter.PERSONAL -> ordered.filter { it.type == "dm" || it.type == "native" }
+        ChannelFilter.PERSONAL -> ordered.filter { it.type == "dm" || it.type == "native" || it.type == "gated" }
         ChannelFilter.COMMUNITIES -> ordered.filter { it.type == "public" || it.type == "password" }
     }
 

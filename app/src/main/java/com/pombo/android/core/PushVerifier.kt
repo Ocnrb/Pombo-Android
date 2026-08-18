@@ -98,7 +98,7 @@ object PushVerifier {
      * never leak content, public channels show the text.
      */
     fun preview(type: String, content: JSONObject?): String {
-        if (type == "dm" || type == "native" || type == "dm-inbox") return "New direct message"
+        if (type == "dm" || type == "native" || type == "gated" || type == "dm-inbox") return "New direct message"
         if (type == "private") return "New encrypted message"
         if (content == null) return "New message"
         return when (content.optString("type")) {
