@@ -2088,6 +2088,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                 // Lazy pass: last message + channel image per channel, patching
                 // the list as each answer arrives.
                 for (info in ordered) {
+                    // Gated cards: resolve mode + access condition (cached
+                    // reads) — drives the Open/Gated/Paid markers and the
+                    // access line on the card.
+                    if (info.type == "gated" && info.gateAddress != null) {
+                        launch {
+                            manager.gateCardInfo(info.gateAddress)?.let { card ->
+                                _explore.value = _explore.value.map {
+                                    if (it.messageStreamId == info.streamId)
+                                        it.copy(
+                                            gateMode = card.mode, gateVerb = card.verb,
+                                            gateValue = card.value, gateQualifier = card.qualifier
+                                        ) else it
+                                }
+                            }
+                        }
+                    }
                     launch {
                         manager.ensureChannelImage(
                             com.pombo.android.core.StreamConstants.deriveAdminId(info.streamId)

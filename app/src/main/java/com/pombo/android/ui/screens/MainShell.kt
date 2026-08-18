@@ -2898,6 +2898,9 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
     /** Web #explore-language-filter: "" is All Languages. */
     var language by remember { mutableStateOf("") }
     var privateOnly by remember { mutableStateOf(false) }
+    // Access-type marker (N-D): "open" | "gated" | "paid" ("" = all).
+    // Explore OPENS on Open — gate-backed storefronts are a tap away.
+    var accessFilter by remember { mutableStateOf("open") }
     var categoriesExpanded by remember { mutableStateOf(false) }
     var passwordFor by remember { mutableStateOf<com.pombo.android.ExploreChannel?>(null) }
     androidx.compose.runtime.LaunchedEffect(Unit) { vm.loadExplore() }
@@ -2991,6 +2994,38 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
         }
         Spacer(Modifier.height(10.dp))
 
+        // Access-type markers (N-D): Open / Gated / Paid — exclusive
+        // toggles, none active shows every type. Gated vs Paid is the
+        // on-chain gate MODE, resolved per card by loadExplore's lazy pass.
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            listOf("open" to "Open", "gated" to "Gated", "paid" to "Paid").forEachIndexed { i, (value, label) ->
+                if (i > 0) Text(
+                    "|", color = Color.White.copy(alpha = 0.15f), fontSize = 14.sp,
+                    modifier = Modifier.padding(horizontal = 4.dp)
+                )
+                val active = accessFilter == value
+                Text(
+                    label,
+                    color = if (active) Color.Black else Color.White.copy(alpha = 0.50f),
+                    fontSize = 14.sp,
+                    fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
+                    modifier = Modifier
+                        .background(if (active) Color.White else Color.Transparent, RoundedCornerShape(6.dp))
+                        .clickableNoRipple {
+                            accessFilter = if (active) "" else value
+                            // Password view and the markers are disjoint universes
+                            if (accessFilter.isNotEmpty()) privateOnly = false
+                        }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+
         // Category chips. Collapsed they scroll sideways in one rail; the
         // chevron expands them into rows so every filter is visible at once
         // (web: .explore-category-rail + #explore-toggle-categories-btn).
@@ -3001,12 +3036,12 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) { ExploreChips(category, privateOnly, nsfw, { category = it; privateOnly = false }, { privateOnly = !privateOnly }) }
+                    ) { ExploreChips(category, privateOnly, nsfw, { category = it; privateOnly = false }, { privateOnly = !privateOnly; if (privateOnly) accessFilter = "" }) }
                 } else {
                     Row(
                         Modifier.fillMaxWidth().horizontalScroll(androidx.compose.foundation.rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) { ExploreChips(category, privateOnly, nsfw, { category = it; privateOnly = false }, { privateOnly = !privateOnly }) }
+                    ) { ExploreChips(category, privateOnly, nsfw, { category = it; privateOnly = false }, { privateOnly = !privateOnly; if (privateOnly) accessFilter = "" }) }
                 }
             }
             Spacer(Modifier.width(8.dp))
@@ -3031,6 +3066,14 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
             // out-of-band; everything else, public AND gate-backed
             // (gated/paid), is a storefront and lists in the main view.
             val matchesType = if (privateOnly) c.type == "password" else c.type != "password"
+            // Access markers: Open = public; Gated vs Paid split by the gate
+            // MODE (unresolved counts as Gated until the cached read lands).
+            val matchesAccess = when (accessFilter) {
+                "open" -> c.type == "public"
+                "gated" -> c.type == "gated" && c.gateMode != 3
+                "paid" -> c.type == "gated" && c.gateMode == 3
+                else -> true
+            }
             // Web filterChannels: NSFW/Adult channels stay hidden unless that
             // very category is selected or "Show Sensitive Content" is on.
             val sensitive = c.category.equals("nsfw", true) || c.category.equals("adult", true)
@@ -3038,7 +3081,7 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
             // Web: the language filter only applies once a specific one is
             // picked; "All Languages" is the empty value.
             val matchesLanguage = language.isEmpty() || c.language.equals(language, true)
-            matchesQuery && (privateOnly || matchesCategory) && matchesType && nsfwOk && matchesLanguage
+            matchesQuery && (privateOnly || matchesCategory) && matchesType && matchesAccess && nsfwOk && matchesLanguage
         }
 
         when {
@@ -3187,18 +3230,18 @@ private fun ExploreCard(
     ensNames: Map<String, String> = emptyMap(),
     onOpen: () -> Unit
 ) {
-    // Web card: `p-3.5 bg-white/[0.03] border border-white/[0.05] rounded-2xl`.
-    // PomboColors.Surface is true black and Border is white/8 — both wrong here,
-    // which is why the cards read flat against the background.
+    // Web card is bg-white/[0.03]; on the phone's OLED black that read too
+    // dark, so the card sits a touch lighter for contrast against the
+    // background (user call, 2026-08-18).
     Column(
         Modifier.fillMaxWidth()
-            .background(Color.White.copy(alpha = 0.03f), RoundedCornerShape(16.dp))
-            .border(1.dp, Color.White.copy(alpha = 0.05f), RoundedCornerShape(16.dp))
+            .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(16.dp))
+            .border(1.dp, Color.White.copy(alpha = 0.07f), RoundedCornerShape(16.dp))
             .clickableNoRipple(onOpen)
             .padding(14.dp)
     ) {
         Row(verticalAlignment = Alignment.Top) {
-            // Web thumb: `rounded-full`, 52×52, avatar fallback at fraction 0.5.
+            // Channel thumb: `rounded-full`, 56×56, avatar fallback at 0.5.
             if (image != null) {
                 androidx.compose.foundation.Image(
                     bitmap = remember(image) {
@@ -3206,10 +3249,10 @@ private fun ExploreCard(
                     },
                     contentDescription = null,
                     contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-                    modifier = Modifier.size(52.dp).clip(CircleShape)
+                    modifier = Modifier.size(56.dp).clip(CircleShape)
                 )
             } else {
-                Avatar(ch.messageStreamId, size = 52.dp, cornerRadiusFraction = 0.5)
+                Avatar(ch.messageStreamId, size = 56.dp, cornerRadiusFraction = 0.5)
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
@@ -3259,25 +3302,60 @@ private fun ExploreCard(
                 modifier = Modifier.size(16.dp)
             )
         }
-        // Tags (gated / category / language) — `px-1.5 py-1 bg-white/5
-        // text-white/50 text-[11px] rounded`, category hidden when default.
+        // Tags (category / language) — `px-1.5 py-1 bg-white/5 text-white/50
+        // text-[11px] rounded`, category hidden when it is the default.
         val tags = listOfNotNull(
-            "Gated".takeIf { ch.type == "gated" },
             ch.category.takeIf { it.isNotEmpty() && !it.equals("general", true) }?.replaceFirstChar { it.uppercase() },
             ch.language.takeIf { it.isNotEmpty() }?.uppercase()
         )
-        if (tags.isNotEmpty()) {
-            Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                tags.forEach { t ->
-                    Text(
-                        t,
-                        color = Color.White.copy(alpha = 0.50f), fontSize = 11.exp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier
-                            .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(4.dp))
-                            .padding(horizontal = 6.dp, vertical = 4.dp)
-                    )
+        // Access stack (N-D) + tags share ONE zone: the stack (VERB / VALUE /
+        // QUALIFIER) anchors the center, the badges sit on the bottom-right
+        // corner at the same height — one row of card height instead of two,
+        // and no orphaned lone badge. Subscribe = recurring (accent-tinted
+        // verb); Hold = mere possession, "in your wallet" = "you pay nothing".
+        if (ch.gateVerb != null || tags.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            Box(Modifier.fillMaxWidth()) {
+                ch.gateVerb?.let { verb ->
+                    Column(
+                        Modifier.align(Alignment.Center),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            verb.uppercase(),
+                            color = if (ch.gateMode == 3) PomboColors.Accent.copy(alpha = 0.70f)
+                                else Color.White.copy(alpha = 0.40f),
+                            fontSize = 10.exp, fontWeight = FontWeight.Medium, letterSpacing = 1.sp
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            ch.gateValue ?: "",
+                            color = Color.White.copy(alpha = 0.90f),
+                            fontSize = 15.exp, fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            ch.gateQualifier ?: "",
+                            color = Color.White.copy(alpha = 0.40f), fontSize = 11.exp
+                        )
+                    }
+                }
+                if (tags.isNotEmpty()) {
+                    Row(
+                        Modifier.align(Alignment.BottomEnd),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        tags.forEach { t ->
+                            Text(
+                                t,
+                                color = Color.White.copy(alpha = 0.50f), fontSize = 11.exp,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier
+                                    .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
                 }
             }
         }

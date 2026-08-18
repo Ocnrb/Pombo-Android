@@ -47,7 +47,14 @@ data class ExploreChannel(
     val readOnly: Boolean = false,
     /** Gated (N-D): the PomboGate clone from metadata `g` — routes the tap
      *  (TOKEN/NFT with access → preview; PAID / no access → join flow). */
-    val gateAddress: String? = null
+    val gateAddress: String? = null,
+    /** Resolved gate mode (drives the Open/Gated/Paid markers). */
+    val gateMode: Int? = null,
+    /** 3-line access stack on the card: VERB / VALUE / QUALIFIER
+     *  ("Subscribe" / "500 POL" / "30 days" · "Hold" / … / "in your wallet"). */
+    val gateVerb: String? = null,
+    val gateValue: String? = null,
+    val gateQualifier: String? = null
 )
 
 /** Quoted message carried by a reply (web: msg.replyTo). */
@@ -1099,6 +1106,46 @@ class ChannelManager(
             }
         } catch (e: Exception) { null }
     }
+
+    /**
+     * Explore card access info (N-D), as the 3-line pricing anatomy the
+     * cards render: VERB (Subscribe = recurring payment, Hold = mere
+     * possession — the semantic split users must get) / VALUE / QUALIFIER
+     * ('in your wallet' says "you pay nothing"). POL for WPOL-priced
+     * gates; NONE never lists (null parts); null result = unreadable.
+     */
+    data class GateCardInfo(
+        val mode: Int, val verb: String?, val value: String?, val qualifier: String?
+    )
+
+    suspend fun gateCardInfo(gateAddress: String): GateCardInfo? = try {
+        val info = bridge.call("gateInfo", JSONObject().put("gate", gateAddress))
+        val mode = info.optInt("mode", GATE_MODE_NONE)
+        if (mode == GATE_MODE_NONE) GateCardInfo(mode, null, null, null)
+        else {
+            val meta = bridge.call("gateTokenMeta", JSONObject().put("token", info.optString("token")))
+            val symbol = meta.optString("symbol")
+            val decimals = if (meta.isNull("decimals")) 0 else meta.optInt("decimals")
+            fun fmt(raw: String) = java.math.BigDecimal(raw)
+                .movePointLeft(decimals).stripTrailingZeros().toPlainString()
+            when (mode) {
+                GATE_MODE_TOKEN -> GateCardInfo(
+                    mode, "Hold", "${fmt(info.optString("minBalance", "0"))} $symbol", "in your wallet")
+                GATE_MODE_NFT -> GateCardInfo(mode, "Hold", "$symbol NFT", "in your wallet")
+                GATE_MODE_PAID -> {
+                    val days = (info.optString("duration", "0").toLongOrNull() ?: 0L) / 86_400.0
+                    val d = if (days == days.toLong().toDouble()) days.toLong().toString()
+                        else "%.1f".format(days)
+                    val sym = if (info.optString("token").lowercase() == WRAPPED_NATIVE) "POL" else symbol
+                    // "per" spells out the recurrence under SUBSCRIBE
+                    GateCardInfo(mode, "Subscribe",
+                        "${fmt(info.optString("price", "0"))} $sym",
+                        if (d == "1") "per day" else "per $d days")
+                }
+                else -> GateCardInfo(mode, null, null, null)
+            }
+        }
+    } catch (e: Exception) { null }
 
     /** Gate mode of the CURRENT channel; null = not gated or unreadable. */
     suspend fun currentGateMode(): Int? {
