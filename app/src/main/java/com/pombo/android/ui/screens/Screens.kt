@@ -14,6 +14,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.content.consume
 import androidx.compose.foundation.content.contentReceiver
 import androidx.compose.foundation.content.hasMediaType
@@ -309,6 +310,141 @@ fun PomboApp(vm: AppViewModel) {
                 onDecline = vm::dismissIncomingInvite,
                 onAccept = { vm.acceptIncomingInvite(inv) }
             )
+        }
+
+        // Gate entry screen (N-D): a gated channel refused the join — show the
+        // on-chain requirement and the pay()/join() actions instead of a toast.
+        val gateEntry by vm.gateEntry.collectAsState()
+        gateEntry?.let { entry -> GateEntryDialog(vm, entry) }
+    }
+}
+
+/** N-D gate entry (web #gate-entry-modal): requirement, standing, actions. */
+@Composable
+internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
+    val info = entry.info
+    fun fmt(raw: String, dec: Int?): String = try {
+        java.math.BigDecimal(raw).movePointLeft(dec ?: 0).stripTrailingZeros().toPlainString()
+    } catch (e: Exception) { raw }
+
+    val holds = try {
+        when (info.mode) {
+            GateModes.TOKEN -> java.math.BigInteger(info.balance) >= java.math.BigInteger(info.minBalance)
+            GateModes.NFT -> java.math.BigInteger(info.balance).signum() > 0
+            else -> false
+        }
+    } catch (e: Exception) { false }
+    val subscribed = info.mode == GateModes.PAID && info.paidUntil * 1000L > System.currentTimeMillis()
+    val days = info.durationSeconds / 86_400.0
+    val daysLabel = if (days == days.toLong().toDouble()) days.toLong().toString() else "%.1f".format(days)
+
+    // WPOL-priced gates read POL everywhere the user sees a cost — gatePay
+    // auto-wraps, plain POL is literally what they spend
+    val paySymbol = if (info.tokenSymbol == "WPOL") "POL" else info.tokenSymbol
+    val requirement = when (info.mode) {
+        GateModes.TOKEN -> "Hold at least ${fmt(info.minBalance, info.tokenDecimals)} ${info.tokenSymbol}."
+        GateModes.NFT -> "Hold a ${info.tokenSymbol} NFT."
+        GateModes.PAID -> "${fmt(info.price, info.tokenDecimals)} $paySymbol for $daysLabel days. " +
+            "Renewing extends from the current end."
+        else -> "This is a closed channel — members are added by the owner. " +
+            "Ask the owner to add your address, then check again."
+    }
+    val status = when (info.mode) {
+        GateModes.TOKEN -> "Your balance: ${fmt(info.balance, info.tokenDecimals)} ${info.tokenSymbol}" +
+            if (holds) " — access granted" else ""
+        GateModes.NFT ->
+            if (holds) "You hold ${info.balance} — access granted"
+            else "You hold none — acquire one to enter"
+        GateModes.PAID ->
+            if (subscribed) "Subscribed until " + java.text.SimpleDateFormat(
+                "yyyy-MM-dd HH:mm", java.util.Locale.getDefault()
+            ).format(java.util.Date(info.paidUntil * 1000L))
+            else "No active subscription"
+        else -> null
+    }
+
+    androidx.activity.compose.BackHandler(onBack = vm::dismissGateEntry)
+    Box(
+        Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.80f)).clickableNoRipple { },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            Modifier.padding(24.dp).fillMaxWidth()
+                .background(Color(0xFF111113), RoundedCornerShape(16.dp))
+                .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(16.dp))
+                .padding(20.dp)
+        ) {
+            Text(
+                entry.channelName?.let { "Join $it" } ?: "Join Gated Channel",
+                color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium
+            )
+
+            Spacer(Modifier.height(14.dp))
+            Text("REQUIREMENT", color = Color.White.copy(alpha = 0.30f), fontSize = 10.sp, letterSpacing = 0.8.sp)
+            Spacer(Modifier.height(4.dp))
+            Text(requirement, color = Color.White.copy(alpha = 0.80f), fontSize = 14.sp, lineHeight = 20.sp)
+
+            status?.let {
+                Spacer(Modifier.height(12.dp))
+                Text("YOUR STATUS", color = Color.White.copy(alpha = 0.30f), fontSize = 10.sp, letterSpacing = 0.8.sp)
+                Spacer(Modifier.height(4.dp))
+                Text(it, color = Color.White.copy(alpha = 0.80f), fontSize = 14.sp, lineHeight = 20.sp)
+            }
+
+            if (info.mode == GateModes.PAID && !subscribed && info.tokenSymbol == "WPOL") {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Plain POL works — it is wrapped automatically when you pay.",
+                    color = Color.White.copy(alpha = 0.30f), fontSize = 12.sp
+                )
+            }
+
+            if ((info.mode == GateModes.TOKEN || info.mode == GateModes.NFT) && holds) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "Register membership on-chain (1 tx) — keeps your messages valid even after you sell the asset.",
+                    color = Color.White.copy(alpha = 0.40f), fontSize = 12.sp,
+                    textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline,
+                    modifier = Modifier.clickableNoRipple { vm.gateEntryJoin() }
+                )
+            }
+
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Box(
+                    Modifier.weight(1f)
+                        .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp))
+                        .clickableNoRipple(vm::dismissGateEntry)
+                        .padding(vertical = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) { Text("Cancel", color = Color.White.copy(alpha = 0.50f), fontSize = 13.sp, fontWeight = FontWeight.Medium) }
+
+                Box(
+                    Modifier.weight(1f)
+                        .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp))
+                        .clickableNoRipple { vm.gateEntryRecheck() }
+                        .padding(vertical = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) { Text("Check Again", color = Color.White.copy(alpha = 0.70f), fontSize = 13.sp, fontWeight = FontWeight.Medium) }
+
+                val primary: Pair<String, () -> Unit>? = when {
+                    info.mode == GateModes.PAID && !subscribed ->
+                        "Pay ${fmt(info.price, info.tokenDecimals)} $paySymbol" to { vm.gateEntryPay(); Unit }
+                    subscribed || holds -> "Enter" to { vm.gateEntryEnter(); Unit }
+                    else -> null
+                }
+                primary?.let { (label, action) ->
+                    Box(
+                        Modifier.weight(1f)
+                            .background(Color.White, RoundedCornerShape(12.dp))
+                            .clickableNoRipple(action)
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) { Text(label, color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1) }
+                }
+            }
         }
     }
 }
@@ -899,7 +1035,10 @@ fun MnemonicScreen(mnemonic: String, onDone: () -> Unit) {
     }
 }
 
-/** Web new-channel modal: Open / Protected / Closed, with the same copy. */
+/** Web new-channel modal: Open / Protected / Closed / Gated / Paid, same copy.
+ *  The last three share `id = "gated"` — one PomboGate clone per channel; the
+ *  tab only picks the MODE (Closed = NONE allowlist, Gated = TOKEN/NFT
+ *  holding, Paid = subscription), mirroring the web's handleCreate. */
 enum class ChannelKind(val id: String, val label: String, val blurb: String) {
     OPEN(
         "public", "Open",
@@ -912,8 +1051,41 @@ enum class ChannelKind(val id: String, val label: String, val blurb: String) {
     CLOSED(
         "gated", "Closed",
         "Private channel with on-chain verified membership. Each member is authorized by account address."
+    ),
+    GATED(
+        "gated", "Gated",
+        "Access follows an on-chain asset: anyone holding the token or NFT can join, read and write. " +
+            "Selling the asset cuts new access; messages already published stay."
+    ),
+    PAID(
+        "gated", "Paid",
+        "Subscription channel: members pay a fixed price in an ERC-20 token for a period of access. " +
+            "Payments go directly to your wallet; renewing extends from the current end."
     )
 }
+
+/** PomboGate.Mode — ABI order, never reorder. */
+object GateModes {
+    const val NONE = 0; const val TOKEN = 1; const val NFT = 2; const val PAID = 3
+}
+
+/**
+ * Quick-pick tokens (Polygon PoS mainnet), mirroring web CONFIG.gate
+ * .tokenPresets. POL diverges by context: 0x…1010 is the native coin's
+ * system contract — balanceOf mirrors the native balance so balance GATES
+ * work, but it has no usable transferFrom, so the PAID side prices in WPOL
+ * (gatePay auto-wraps the payer's shortfall from plain POL).
+ */
+val GATE_TOKEN_PRESETS = listOf(
+    Triple("pol", "POL", "0x0000000000000000000000000000000000001010"),
+    Triple("usdc", "USDC", "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
+    Triple("data", "DATA", "0x3a9a81d576d83ff21f26f325066054540720fc34")
+)
+val PAY_TOKEN_PRESETS = listOf(
+    Triple("pol", "POL", "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"),
+    Triple("usdc", "USDC", "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
+    Triple("data", "DATA", "0x3a9a81d576d83ff21f26f325066054540720fc34")
+)
 
 val CHANNEL_LANGUAGES = listOf(
     "en" to "English", "pt" to "Português", "es" to "Español", "fr" to "Français",
@@ -945,8 +1117,44 @@ data class NewChannel(
     val members: List<String>,
     val storageProvider: String,
     val customStorageAddress: String?,
-    val storageDays: Int
+    val storageDays: Int,
+    // N-D gate params (type == "gated"); raw units as decimal strings.
+    val gateMode: Int = GateModes.NONE,
+    val gateToken: String? = null,
+    val gateMinBalance: String? = null,
+    val gatePrice: String? = null,
+    val gateDurationSeconds: Long? = null
 )
+
+/** Quick-pick token chips (N-D): presets + Custom. */
+@Composable
+private fun TokenPresetRow(
+    presets: List<Triple<String, String, String>>,
+    selected: String,
+    onSelect: (String) -> Unit
+) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        (presets.map { it.first to it.second } + ("custom" to "Custom")).forEach { (value, label) ->
+            val active = selected == value
+            Box(
+                Modifier.weight(1f)
+                    .background(
+                        if (active) Color.White.copy(alpha = 0.10f) else Color.White.copy(alpha = 0.05f),
+                        RoundedCornerShape(8.dp)
+                    )
+                    .border(1.dp, Color.White.copy(alpha = if (active) 0.10f else 0.05f), RoundedCornerShape(8.dp))
+                    .clickableNoRipple { onSelect(value) }
+                    .padding(vertical = 10.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    label, color = if (active) Color.White else Color.White.copy(alpha = 0.50f),
+                    fontSize = 12.sp, fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+}
 
 /**
  * Create Channel — the web's #new-channel-modal adapted to the phone: the
@@ -970,6 +1178,16 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
     var customStorage by remember { mutableStateOf("") }
     var storageDays by remember { mutableStateOf(180f) }
     var showPassword by remember { mutableStateOf(false) }
+
+    // N-D gate fields (Gated/Paid tabs)
+    var gateAsset by remember { mutableStateOf("token") }      // token | nft
+    var gatePreset by remember { mutableStateOf("pol") }       // pol | usdc | data | custom
+    var gateTokenCustom by remember { mutableStateOf("") }
+    var gateMinBalanceText by remember { mutableStateOf("") }
+    var paidPreset by remember { mutableStateOf("usdc") }
+    var paidTokenCustom by remember { mutableStateOf("") }
+    var paidPriceText by remember { mutableStateOf("") }
+    var paidDurationDays by remember { mutableStateOf("30") }
 
     // One line per address, exactly like the web (ChannelModalsUI.js:567).
     // Splitting on any whitespace and silently dropping non-matching entries
@@ -1013,14 +1231,87 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
         storageDays = storageDays.toInt()
     )
 
+    // Low-balance confirm fires AFTER async gate resolution — remember the
+    // resolved spec so "Create anyway" does not rebuild it without the params.
+    var pendingSpec by remember { mutableStateOf<NewChannel?>(null) }
+
+    /**
+     * Gated/Paid tabs (N-D): resolve preset/custom token, probe it on-chain
+     * (an address without a working balanceOf would mint a gate that fails
+     * checkAccess for everyone, forever) and convert human amounts with the
+     * token's REAL decimals. Returns null after setting `notice`.
+     */
+    suspend fun resolveGateSpec(): NewChannel? {
+        if (kind != ChannelKind.GATED && kind != ChannelKind.PAID) return buildSpec()
+        val warn = com.pombo.android.ui.ToastKind.WARNING
+        val isPaid = kind == ChannelKind.PAID
+        val presets = if (isPaid) PAY_TOKEN_PRESETS else GATE_TOKEN_PRESETS
+        val presetKey = if (isPaid) paidPreset else gatePreset
+        val custom = (if (isPaid) paidTokenCustom else gateTokenCustom).trim()
+        // NFT gates are always a custom collection address (presets are ERC-20)
+        val useCustom = presetKey == "custom" || (!isPaid && gateAsset == "nft")
+        val token = if (useCustom) custom.lowercase()
+            else presets.first { it.first == presetKey }.third
+        if (!evmRegex.matches(token)) {
+            notice = "Enter a valid token contract address (0x…)" to warn
+            return null
+        }
+        val meta = try {
+            vm.gateTokenBalance(token)
+            vm.gateTokenMeta(token)
+        } catch (e: Exception) {
+            notice = "That address does not look like a token contract on Polygon" to warn
+            return null
+        }
+        fun parseUnits(amount: String, dec: Int): java.math.BigInteger? = try {
+            java.math.BigDecimal(amount.trim()).movePointRight(dec)
+                .toBigIntegerExact().takeIf { it.signum() > 0 }
+        } catch (e: Exception) { null }
+        return when {
+            isPaid -> {
+                val dec = meta.second
+                if (dec == null) {
+                    notice = "The payment token must be an ERC-20 contract" to warn
+                    return null
+                }
+                val price = parseUnits(paidPriceText, dec)
+                if (price == null) {
+                    notice = "Enter a price greater than zero" to warn
+                    return null
+                }
+                val days = paidDurationDays.trim().toIntOrNull()?.takeIf { it >= 1 }
+                if (days == null) {
+                    notice = "Enter a subscription period of at least 1 day" to warn
+                    return null
+                }
+                buildSpec().copy(
+                    gateMode = GateModes.PAID, gateToken = token,
+                    gatePrice = price.toString(), gateDurationSeconds = days.toLong() * 86_400L)
+            }
+            gateAsset == "nft" -> buildSpec().copy(gateMode = GateModes.NFT, gateToken = token)
+            else -> {
+                val minBal = parseUnits(gateMinBalanceText, meta.second ?: 0)
+                if (minBal == null) {
+                    notice = "Enter a minimum balance greater than zero" to warn
+                    return null
+                }
+                buildSpec().copy(
+                    gateMode = GateModes.TOKEN, gateToken = token,
+                    gateMinBalance = minBal.toString())
+            }
+        }
+    }
+
     /** Balance pre-flight, then create. */
     fun runPreflight() {
         scope.launch {
+            val spec = resolveGateSpec() ?: return@launch
+            pendingSpec = spec
             when (val check = vm.checkSpendCost(kind.id)) {
                 is AppViewModel.CostCheck.Blocked ->
                     notice = check.message to com.pombo.android.ui.ToastKind.ERROR
                 is AppViewModel.CostCheck.Low -> lowBalance = check
-                AppViewModel.CostCheck.Ok -> onCreate(buildSpec())
+                AppViewModel.CostCheck.Ok -> onCreate(spec)
             }
         }
     }
@@ -1090,20 +1381,24 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
                     .verticalScroll(androidx.compose.foundation.rememberScrollState())
                     .padding(20.dp)
             ) {
-                // Type tabs (web sidebar)
+                // Type tabs (web sidebar). Five entries since N-D — a scroll
+                // row of chips instead of equal weights, or "Protected" clips.
                 SectionLabel("Type")
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    Modifier.fillMaxWidth()
+                        .horizontalScroll(androidx.compose.foundation.rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     ChannelKind.entries.forEach { k ->
                         val active = k == kind
                         Box(
                             Modifier
-                                .weight(1f)
                                 .background(
                                     if (active) Color.White.copy(alpha = 0.10f) else Color.White.copy(alpha = 0.03f),
                                     RoundedCornerShape(8.dp)
                                 )
                                 .clickableNoRipple { kind = k }
-                                .padding(vertical = 10.dp),
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
@@ -1115,7 +1410,7 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
                     }
                 }
 
-                // Type blurb, with the "Most Secure" tag the web puts on Closed.
+                // Type blurb
                 Spacer(Modifier.height(12.dp))
                 Column(
                     Modifier.fillMaxWidth()
@@ -1123,17 +1418,6 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
                         .border(1.dp, Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp))
                         .padding(16.dp)
                 ) {
-                    if (kind == ChannelKind.CLOSED) {
-                        Text(
-                            "MOST SECURE",
-                            color = Color.White.copy(alpha = 0.60f), fontSize = 10.sp,
-                            letterSpacing = 0.8.sp,
-                            modifier = Modifier
-                                .background(Color.White.copy(alpha = 0.10f), RoundedCornerShape(4.dp))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                        Spacer(Modifier.height(8.dp))
-                    }
                     Text(kind.blurb, color = Color.White.copy(alpha = 0.50f), fontSize = 14.sp, lineHeight = 20.sp)
                 }
 
@@ -1177,6 +1461,148 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
                         color = Color.White.copy(alpha = 0.30f), fontSize = 12.sp,
                         modifier = Modifier.padding(top = 6.dp)
                     )
+                }
+
+                if (kind == ChannelKind.GATED) {
+                    Spacer(Modifier.height(16.dp))
+                    SectionLabel("Asset Type")
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("token" to "Token", "nft" to "NFT").forEach { (value, label) ->
+                            val active = gateAsset == value
+                            Box(
+                                Modifier.weight(1f)
+                                    .background(
+                                        if (active) Color.White.copy(alpha = 0.10f) else Color.White.copy(alpha = 0.05f),
+                                        RoundedCornerShape(8.dp)
+                                    )
+                                    .clickableNoRipple { gateAsset = value }
+                                    .padding(vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    label, color = if (active) Color.White else Color.White.copy(alpha = 0.50f),
+                                    fontSize = 12.sp, fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+                    if (gateAsset == "token") {
+                        SectionLabel("Token")
+                        TokenPresetRow(GATE_TOKEN_PRESETS, gatePreset) { gatePreset = it }
+                        if (gatePreset == "custom") {
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = gateTokenCustom, onValueChange = { gateTokenCustom = it },
+                                placeholder = { Text("0x…", color = Color.White.copy(alpha = 0.20f), fontSize = 13.sp) },
+                                singleLine = true, shape = RoundedCornerShape(12.dp),
+                                textStyle = androidx.compose.ui.text.TextStyle(
+                                    fontSize = 13.sp, color = PomboColors.Text,
+                                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                                ),
+                                colors = pomboFieldColors(), modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        Text(
+                            when (gatePreset) {
+                                "pol" -> "Gates on the member's native POL balance."
+                                "custom" -> "ERC-20 contract on Polygon."
+                                else -> "${GATE_TOKEN_PRESETS.first { it.first == gatePreset }.second} on Polygon."
+                            },
+                            color = Color.White.copy(alpha = 0.30f), fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+                        SectionLabel("Minimum Balance")
+                        OutlinedTextField(
+                            value = gateMinBalanceText, onValueChange = { gateMinBalanceText = it },
+                            placeholder = { Text("e.g. 100", color = Color.White.copy(alpha = 0.20f), fontSize = 14.sp) },
+                            singleLine = true, shape = RoundedCornerShape(12.dp),
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal),
+                            textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = PomboColors.Text),
+                            colors = pomboFieldColors(), modifier = Modifier.fillMaxWidth()
+                        )
+                        Text(
+                            "Balance a member must hold to read and write.",
+                            color = Color.White.copy(alpha = 0.30f), fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    } else {
+                        SectionLabel("Collection Contract")
+                        OutlinedTextField(
+                            value = gateTokenCustom, onValueChange = { gateTokenCustom = it },
+                            placeholder = { Text("0x…", color = Color.White.copy(alpha = 0.20f), fontSize = 13.sp) },
+                            singleLine = true, shape = RoundedCornerShape(12.dp),
+                            textStyle = androidx.compose.ui.text.TextStyle(
+                                fontSize = 13.sp, color = PomboColors.Text,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                            ),
+                            colors = pomboFieldColors(), modifier = Modifier.fillMaxWidth()
+                        )
+                        Text(
+                            "ERC-721 collection on Polygon — holding any token grants access.",
+                            color = Color.White.copy(alpha = 0.30f), fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    }
+                }
+
+                if (kind == ChannelKind.PAID) {
+                    Spacer(Modifier.height(16.dp))
+                    SectionLabel("Payment Token")
+                    TokenPresetRow(PAY_TOKEN_PRESETS, paidPreset) { paidPreset = it }
+                    if (paidPreset == "custom") {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = paidTokenCustom, onValueChange = { paidTokenCustom = it },
+                            placeholder = { Text("0x… (e.g. USDC)", color = Color.White.copy(alpha = 0.20f), fontSize = 13.sp) },
+                            singleLine = true, shape = RoundedCornerShape(12.dp),
+                            textStyle = androidx.compose.ui.text.TextStyle(
+                                fontSize = 13.sp, color = PomboColors.Text,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                            ),
+                            colors = pomboFieldColors(), modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    Text(
+                        when (paidPreset) {
+                            "pol" -> "Priced in Wrapped POL (WPOL) — plain POL is wrapped automatically at payment."
+                            "custom" -> "ERC-20 token subscribers pay with, on Polygon."
+                            else -> "Subscribers pay in ${PAY_TOKEN_PRESETS.first { it.first == paidPreset }.second}."
+                        },
+                        color = Color.White.copy(alpha = 0.30f), fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+
+                    Spacer(Modifier.height(16.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Column(Modifier.weight(1f)) {
+                            SectionLabel("Price")
+                            OutlinedTextField(
+                                value = paidPriceText, onValueChange = { paidPriceText = it },
+                                placeholder = { Text("e.g. 5", color = Color.White.copy(alpha = 0.20f), fontSize = 14.sp) },
+                                singleLine = true, shape = RoundedCornerShape(12.dp),
+                                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                    keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal),
+                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = PomboColors.Text),
+                                colors = pomboFieldColors(), modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        Column(Modifier.weight(1f)) {
+                            SectionLabel("Period (days)")
+                            OutlinedTextField(
+                                value = paidDurationDays, onValueChange = { paidDurationDays = it },
+                                singleLine = true, shape = RoundedCornerShape(12.dp),
+                                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                    keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = PomboColors.Text),
+                                colors = pomboFieldColors(), modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
                 }
 
                 if (kind == ChannelKind.CLOSED) {
@@ -1470,7 +1896,7 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
                 message = "Your balance (${low.balance}) is close to the estimated cost " +
                     "(${low.estimate}). If gas spikes, the transaction may fail. Continue anyway?",
                 confirmLabel = "Create anyway",
-                onConfirm = { lowBalance = null; onCreate(buildSpec()) },
+                onConfirm = { lowBalance = null; onCreate(pendingSpec ?: buildSpec()) },
                 onCancel = { lowBalance = null }
             )
         }
@@ -3559,6 +3985,15 @@ private fun ChannelDetailsMain(
     // ACCESS — the web shows an icon + label per type (HeaderUI type lines):
     // native = Ethereum diamond + "Verified Membership", password = lock +
     // "Password Protected", public = globe + "Open".
+    // N-D: only Closed (NONE) keeps "Verified Membership" — token/NFT show
+    // the condition, paid the price/period, same lineup as Create Channel.
+    // Async on purpose: the default stands until the (cached) chain answers.
+    var gateAccess by remember(channel.messageStreamId) { mutableStateOf<String?>(null) }
+    if (channel.type == "gated") {
+        LaunchedEffect(channel.messageStreamId) {
+            gateAccess = vm.gateAccessLabel()
+        }
+    }
     Spacer(Modifier.height(20.dp))
     SectionLabel("Access")
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -3567,7 +4002,7 @@ private fun ChannelDetailsMain(
         // Native uses the Ethereum mark, drawn (not a Material icon).
         if ((channel.type == "native" || channel.type == "gated") && !channel.readOnly) {
             EthereumIcon(accessTint, Modifier.size(16.dp))
-            accessText = "Verified Membership"
+            accessText = gateAccess ?: "Verified Membership"
         } else {
             val icon = when {
                 channel.readOnly -> Icons.Outlined.Campaign
@@ -3699,11 +4134,16 @@ private fun ChannelMembersPanel(vm: AppViewModel, channel: Channel, canModerate:
     var batchText by remember { mutableStateOf("") }
     var confirmRemove by remember { mutableStateOf<String?>(null) }
     var kebabFor by remember { mutableStateOf<String?>(null) }
+    // N-D: TOKEN/NFT/PAID gates have no owner-minted members — allow() is
+    // NONE-only on-chain, so manual add would be a guaranteed revert there.
+    var gateMode by remember { mutableStateOf<Int?>(null) }
 
     LaunchedEffect(channel.messageStreamId, reloadKey) {
         members = vm.channelMembers()
         permissions = if (canModerate) vm.streamPermissions() else emptyList()
+        gateMode = vm.currentGateMode()
     }
+    val manualAddAllowed = channel.type != "gated" || gateMode == null || gateMode == GateModes.NONE
     // canGrant per member, from the on-chain permission matrix.
     val grantByAddr = remember(permissions) {
         permissions.associate { it.userAddress.lowercase() to it.canGrant }
@@ -3792,8 +4232,9 @@ private fun ChannelMembersPanel(vm: AppViewModel, channel: Channel, canModerate:
         }
     }
 
-    // ── ADD MEMBERS (owner / GRANT only) ────────────────────────────
-    if (perms.canGrant && (channel.type == "native" || channel.type == "gated")) {
+    // ── ADD MEMBERS (owner / GRANT only; NONE gates — allow() reverts
+    // WrongMode on TOKEN/NFT/PAID, whose members join()/pay() themselves) ──
+    if (perms.canGrant && (channel.type == "native" || channel.type == "gated") && manualAddAllowed) {
         Spacer(Modifier.height(16.dp))
         Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.05f)))
         Spacer(Modifier.height(16.dp))

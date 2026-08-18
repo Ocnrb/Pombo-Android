@@ -68,13 +68,18 @@ object ChainGuard {
         "createDMInbox",
         "repairDmInbox",
         // PomboGate transactions (N-C gated channels). Reads (gateCheckAccess,
-        // gateInfo, gateMembers, gateCanModerate) are free eth_calls.
+        // gateInfo, gateMembers, gateCanModerate, gateTokenMeta,
+        // gateTokenBalance, gatePaidUntil) are free eth_calls.
         "gateCreate",
         "gateAllow",
         "gateAllowBatch",
         "gateBan",
         "gateUnban",
-        "gateSetModerator"
+        "gateSetModerator",
+        // N-D member transactions. gatePay's wrap/approve sub-txs run inside
+        // the same bridge call, so one approval window covers the sequence.
+        "gateJoin",
+        "gatePay"
     )
 
     private const val WARNING =

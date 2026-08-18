@@ -44,7 +44,10 @@ data class ExploreChannel(
     /** Raw address behind [lastSender], so the card can resolve ENS at render. */
     val lastSenderAddress: String = "",
     /** Drives the megaphone on the Explore card, as in the web's readOnlyBadge. */
-    val readOnly: Boolean = false
+    val readOnly: Boolean = false,
+    /** Gated (N-D): the PomboGate clone from metadata `g` — routes the tap
+     *  (TOKEN/NFT with access → preview; PAID / no access → join flow). */
+    val gateAddress: String? = null
 )
 
 /** Quoted message carried by a reply (web: msg.replyTo). */
@@ -187,7 +190,7 @@ class ChannelManager(
         },
         onKeyAdopted = { messageStreamId, _ -> refreshAfterEpochKey(messageStreamId) },
         checkGateAccess = { messageStreamId, requester ->
-            val channel = _channels.value.find { it.messageStreamId == messageStreamId }
+            val channel = channelByStream(messageStreamId)
             if (channel?.type != "gated") true
             else {
                 val gate = channel.gateAddress
@@ -199,6 +202,20 @@ class ChannelManager(
                     Log.w(TAG, "gateCheckAccess failed (fail-closed): ${e.message}")
                     false
                 }
+            }
+        },
+        currentEpochOnly = { messageStreamId ->
+            val channel = channelByStream(messageStreamId)
+            val gate = channel?.takeIf { it.type == "gated" }?.gateAddress
+            if (gate == null) false
+            else try {
+                // gateInfo params are immutable — the bridge caches nothing,
+                // but the mode read shares the answerRequest's rare cadence
+                bridge.call("gateInfo", JSONObject().put("gate", gate))
+                    .optInt("mode", GATE_MODE_PAID) == GATE_MODE_PAID
+            } catch (e: Exception) {
+                Log.w(TAG, "gateInfo failed, answering current epoch only: ${e.message}")
+                true
             }
         }
     )
@@ -757,10 +774,15 @@ class ChannelManager(
         timeoutMs: Long = 30_000
     ): JSONObject? {
         bridge.awaitConnected()
+        val gatedChannel = channelByStream(adminStreamId)?.takeIf { it.type == "gated" }
+        // recoverSigner unconditionally: an Explore fetch of a visible gated
+        // storefront has no channel object, yet its authority check below
+        // still needs the envelope signer.
         val res = bridge.call("resend", JSONObject()
             .put("streamId", adminStreamId)
             .put("partition", StreamConstants.ADMIN_CHANNEL_IMAGE)
-            .put("last", 1), timeoutMs)
+            .put("last", 1)
+            .put("recoverSigner", true), timeoutMs)
         val arr = res.optJSONArray("messages") ?: return null
         if (arr.length() == 0) return null
         val entry = arr.getJSONObject(arr.length() - 1)
@@ -774,16 +796,33 @@ class ChannelManager(
             }
             else -> return null
         }
-        // Native: CHANNEL_IMAGE arrives as an epoch envelope (N-A)
+        // Native/gated: CHANNEL_IMAGE arrives as an epoch envelope (N-A)
         if (com.pombo.android.core.EpochKeyCrypto.isEpochEnvelope(data)) {
             val messageStreamId = adminStreamId.replace(Regex("-3$"), StreamConstants.SUFFIX_MESSAGE)
             val keysId = StreamConstants.deriveKeysId(messageStreamId)
+            // List/Explore fetch channels that were never OPENED this session
+            // — the epoch state only loads on open, so without this the image
+            // stays undecryptable everywhere but inside the channel.
+            epochKeys.loadPersistedState(messageStreamId)
             data = epochKeys.tryDecrypt(messageStreamId, keysId, data) ?: return null
         }
         if (data.optString("type") != "CHANNEL_IMAGE") return null
-        val senderId = meta.optString("publisherId").lowercase()
-        val owner = adminStreamId.substringBefore('/').lowercase()
-        if (senderId.isNotEmpty() && senderId != owner) return null
+        if (gatedChannel != null) {
+            // Gated: the transport publisher is the CLONE for everyone —
+            // authority is the recovered envelope signer, and gatedAuthor
+            // already enforces signer == namespace admin on -3 (D10c: never
+            // fall back to the transport publisher).
+            gatedAuthor(gatedChannel, adminStreamId, meta) ?: return null
+        } else {
+            // Unknown channels (Explore) may be gated storefronts: the clone
+            // publishes for every member, so a non-owner transport publisher
+            // is only acceptable when the envelope SIGNER is the owner —
+            // otherwise any member could plant an image on the card.
+            val senderId = meta.optString("publisherId").lowercase()
+            val owner = adminStreamId.substringBefore('/').lowercase()
+            if (senderId.isNotEmpty() && senderId != owner
+                && meta.optString("signer").lowercase() != owner) return null
+        }
         return data
     }
 
@@ -867,12 +906,26 @@ class ChannelManager(
         if (isEpochChannel(channel)) {
             // Epoch envelope, same reason as ADMIN_STATE: the SDK's group-key
             // AES on -3 is unreadable cross-device on native channels.
-            val envelope = epochKeys.encryptCurrent(channel.messageStreamId, payload)
+            // Visible channels are STOREFRONTS instead: the image is the
+            // marketing and publishes in the CLEAR so non-members (Explore)
+            // can render it — only the transport differs.
+            val content = if (channel.exposure == "visible") payload
+            else epochKeys.encryptCurrent(channel.messageStreamId, payload)
                 ?: throw IllegalStateException("No epoch key — cannot publish the channel image yet")
-            bridge.call("publishAsAccount", JSONObject()
+            val args = JSONObject()
                 .put("streamId", channel.adminStreamId)
                 .put("partition", StreamConstants.ADMIN_CHANNEL_IMAGE)
-                .put("content", envelope), 60_000)
+                .put("content", content)
+            // Gated: the clone holds the only grant on -3 — the account key
+            // signs, the clone is the on-wire publisher (ERC-1271); receivers
+            // enforce admin authority on the recovered signer.
+            val method = if (channel.type == "gated") {
+                val gate = channel.gateAddress ?: throw IllegalStateException(
+                    "Gate address unknown for ${channel.messageStreamId} — cannot publish the channel image")
+                args.put("gateAddress", gate)
+                "publishAsGate"
+            } else "publishAsAccount"
+            bridge.call(method, args, 60_000)
         } else {
             bridge.call("publish", JSONObject()
                 .put("streamId", channel.adminStreamId)
@@ -901,17 +954,26 @@ class ChannelManager(
         return false
     }
 
+    /** Whether this channel's name/description live in PUBLIC on-chain
+     *  metadata — visible channels of any access type. Hidden channels keep
+     *  their name off-chain: writing it into the public stream registry
+     *  would leak a private channel's name (N-D parity with the web). */
+    fun hasPublicMetadata(channel: Channel): Boolean = channel.exposure == "visible"
+
     /**
      * Renames / re-describes the channel (web: streamr.js updateStreamMetadata).
-     * Owner-only and a single on-chain transaction, so it costs gas.
+     * Owner-only. Visible channels: a single on-chain transaction (gas).
+     * Hidden channels: LOCAL rename only, propagated by sync like a DM's.
      */
     suspend fun updateChannelMetadata(name: String?, description: String?) {
         val channel = _current.value ?: throw IllegalStateException("No channel open")
         if (!amOwner(channel)) throw IllegalStateException("Only the channel admin can edit the channel")
-        val args = JSONObject().put("streamId", channel.messageStreamId)
-        name?.trim()?.takeIf { it.isNotEmpty() }?.let { args.put("name", it) }
-        description?.let { args.put("description", it.trim()) }
-        bridge.call("updateStreamMetadata", args, 120_000)
+        if (hasPublicMetadata(channel)) {
+            val args = JSONObject().put("streamId", channel.messageStreamId)
+            name?.trim()?.takeIf { it.isNotEmpty() }?.let { args.put("name", it) }
+            description?.let { args.put("description", it.trim()) }
+            bridge.call("updateStreamMetadata", args, 120_000)
+        }
 
         val updated = channel.copy(
             name = name?.trim()?.ifEmpty { null } ?: channel.name,
@@ -966,12 +1028,165 @@ class ChannelManager(
     /**
      * Members of a Closed channel, read from The Graph's permission list
      * (web: graphAPI.getStreamMembers). Owner first, then the rest.
+     *
+     * Gated (N-D): the Graph's grantee list is exactly the clone — membership
+     * lives on the GATE. Candidates: the local cache (owner-minted members)
+     * plus the KEY_REQUEST authors seen on -4 (join()/pay() members never
+     * pass through the owner, but every reader must request keys). Their
+     * CURRENT state comes from the contract; `access` is the mode-aware
+     * membership signal (allowlist only means Closed).
      */
     suspend fun channelMembers(): List<String> {
         val channel = _current.value ?: return emptyList()
+        if (channel.type == "gated") {
+            val gate = channel.gateAddress ?: return channel.members
+            val candidates = (channel.members + epochKeys.seenRequesters(channel.messageStreamId))
+                .map { it.lowercase() }.distinct()
+            return try {
+                val res = bridge.call("gateMembers", JSONObject()
+                    .put("gate", gate)
+                    .put("candidates", JSONArray(candidates)), 60_000)
+                val arr = res.optJSONArray("members") ?: return channel.members
+                val out = mutableListOf<String>()
+                for (i in 0 until arr.length()) {
+                    val m = arr.optJSONObject(i) ?: continue
+                    if (!m.optBoolean("isOwner") && !m.optBoolean("moderator")
+                        && !m.optBoolean("access")) continue   // banned/ex-members
+                    m.optString("address").ifEmpty { null }?.let { out.add(it) }
+                }
+                out
+            } catch (e: Exception) {
+                Log.w(TAG, "gateMembers failed, using local cache: ${e.message}")
+                channel.members
+            }
+        }
         val owner = channelOwner(channel)
         val members = com.pombo.android.core.GraphApi.streamMembers(channel.messageStreamId)
         return (listOfNotNull(owner) + members.filter { !it.equals(owner, ignoreCase = true) }).distinct()
+    }
+
+    /**
+     * Channel Details access line for the CURRENT channel's gate (N-D):
+     * NONE 'Verified Membership' · TOKEN 'Gated · ≥ N SYM' · NFT
+     * 'Gated · SYM NFT' · PAID 'N SYM / D days'. Null = not gated or
+     * unreadable — the caller keeps its default label.
+     */
+    suspend fun gateAccessLabel(): String? {
+        val channel = _current.value?.takeIf { it.type == "gated" } ?: return null
+        val gate = channel.gateAddress ?: return null
+        return try {
+            val info = bridge.call("gateInfo", JSONObject().put("gate", gate))
+            val mode = info.optInt("mode", GATE_MODE_NONE)
+            if (mode == GATE_MODE_NONE) return "Verified Membership"
+            val meta = bridge.call("gateTokenMeta", JSONObject().put("token", info.optString("token")))
+            val symbol = meta.optString("symbol")
+            val decimals = if (meta.isNull("decimals")) 0 else meta.optInt("decimals")
+            fun fmt(raw: String) = java.math.BigDecimal(raw)
+                .movePointLeft(decimals).stripTrailingZeros().toPlainString()
+            when (mode) {
+                GATE_MODE_TOKEN -> "Gated · Hold ≥ ${fmt(info.optString("minBalance", "0"))} $symbol"
+                GATE_MODE_NFT -> "Gated · Hold $symbol NFT"
+                GATE_MODE_PAID -> {
+                    val days = (info.optString("duration", "0").toLongOrNull() ?: 0L) / 86_400.0
+                    val d = if (days == days.toLong().toDouble()) days.toLong().toString()
+                        else "%.1f".format(days)
+                    // WPOL-priced gates display POL: gatePay auto-wraps, so
+                    // plain POL is literally what the subscriber spends.
+                    val paySymbol = if (info.optString("token").lowercase() == WRAPPED_NATIVE) "POL" else symbol
+                    "Paid · ${fmt(info.optString("price", "0"))} $paySymbol / $d ${if (d == "1") "day" else "days"}"
+                }
+                else -> null
+            }
+        } catch (e: Exception) { null }
+    }
+
+    /** Gate mode of the CURRENT channel; null = not gated or unreadable. */
+    suspend fun currentGateMode(): Int? {
+        val channel = _current.value?.takeIf { it.type == "gated" } ?: return null
+        val gate = channel.gateAddress ?: return null
+        return try {
+            bridge.call("gateInfo", JSONObject().put("gate", gate))
+                .optInt("mode", -1).takeIf { it >= 0 }
+        } catch (e: Exception) { null }
+    }
+
+    /** Everything the gate entry screen renders, in one fetch. */
+    data class GateEntryInfo(
+        val gateAddress: String, val mode: Int, val token: String,
+        val minBalance: String, val price: String, val durationSeconds: Long,
+        val tokenSymbol: String,
+        /** null = ERC-721 collection (no decimals getter) — whole units. */
+        val tokenDecimals: Int?,
+        /** TOKEN/NFT: the user's raw-unit balance of the gate asset. */
+        val balance: String,
+        /** PAID: subscription end, unix seconds (0 = never paid). */
+        val paidUntil: Long
+    )
+
+    suspend fun gateEntryInfo(gateAddress: String): GateEntryInfo {
+        val info = bridge.call("gateInfo", JSONObject().put("gate", gateAddress))
+        val mode = info.optInt("mode", GATE_MODE_NONE)
+        val token = info.optString("token")
+        val me = myAddress() ?: throw IllegalStateException("No identity")
+        var symbol = ""
+        var decimals: Int? = null
+        var balance = "0"
+        var paidUntil = 0L
+        if (mode != GATE_MODE_NONE && token.isNotEmpty()) {
+            val meta = bridge.call("gateTokenMeta", JSONObject().put("token", token))
+            symbol = meta.optString("symbol")
+            decimals = if (meta.isNull("decimals")) null else meta.optInt("decimals")
+            if (mode == GATE_MODE_PAID) {
+                paidUntil = bridge.call("gatePaidUntil", JSONObject()
+                    .put("gate", gateAddress).put("user", me))
+                    .optString("paidUntil", "0").toLongOrNull() ?: 0L
+            } else {
+                balance = bridge.call("gateTokenBalance", JSONObject()
+                    .put("token", token).put("user", me)).optString("balance", "0")
+            }
+        }
+        return GateEntryInfo(
+            gateAddress.lowercase(), mode, token,
+            info.optString("minBalance", "0"), info.optString("price", "0"),
+            info.optString("duration", "0").toLongOrNull() ?: 0L,
+            symbol, decimals, balance, paidUntil)
+    }
+
+    /** Creation-form helper: token metadata (also probes the contract). */
+    suspend fun gateTokenMeta(token: String): Pair<String, Int?> {
+        val meta = bridge.call("gateTokenMeta", JSONObject().put("token", token))
+        return Pair(meta.optString("symbol"),
+            if (meta.isNull("decimals")) null else meta.optInt("decimals"))
+    }
+
+    /**
+     * Creation-form probe: an address without a working balanceOf would mint
+     * a gate that fails checkAccess for everyone, forever. Throws on failure.
+     */
+    suspend fun gateTokenBalance(token: String, user: String? = null): String {
+        val who = user ?: myAddress() ?: throw IllegalStateException("No identity")
+        return bridge.call("gateTokenBalance", JSONObject()
+            .put("token", token).put("user", who)).optString("balance", "0")
+    }
+
+    /** Drop the bridge's cached (fail-closed) access verdicts for a gate. */
+    suspend fun gateInvalidateAccess(gateAddress: String) {
+        runCatching {
+            bridge.call("gateInvalidateAccess", JSONObject().put("gate", gateAddress))
+        }
+    }
+
+    /**
+     * PAID gates: pay one subscription period (wrap/approve/pay inside the
+     * bridge call — the deny cache for the payer clears with the tx).
+     */
+    suspend fun gatePay(gateAddress: String) {
+        bridge.call("gatePay", JSONObject().put("gate", gateAddress), 600_000)
+    }
+
+    /** TOKEN/NFT gates: opt in to sticky membership (everMember). */
+    suspend fun gateJoin(gateAddress: String) {
+        bridge.call("gateJoin", JSONObject().put("gate", gateAddress), 180_000)
     }
 
     /**
@@ -1306,6 +1521,16 @@ class ChannelManager(
         customStorageAddress: String? = null,
         /** Retention in days (web slider: 1..365, default 180). */
         storageDays: Int = 180,
+        /** Gate mode (N-D): NONE (Closed), TOKEN, NFT or PAID. */
+        gateMode: Int = GATE_MODE_NONE,
+        /** TOKEN/NFT/PAID: asset or payment token contract (lowercase 0x…). */
+        gateToken: String? = null,
+        /** TOKEN: raw-unit minimum balance (decimal string — uint256). */
+        gateMinBalance: String? = null,
+        /** PAID: raw-unit price (decimal string — uint256). */
+        gatePrice: String? = null,
+        /** PAID: subscription period in SECONDS. */
+        gateDuration: Long? = null,
         /** Called once per on-chain step so the UI can drive the progress ring. */
         onProgress: () -> Unit = {}
     ): Channel {
@@ -1315,8 +1540,16 @@ class ChannelManager(
         // Gated (N-C): the gate clone comes FIRST — its address goes into the
         // -1 metadata and receives every stream grant. One factory tx; the
         // creator becomes the gate owner and is everMember from block one.
+        // N-D: the mode and its params come from the caller — the UI already
+        // validated them against PomboGate.initialize's per-mode rules (a bad
+        // combination reverts InvalidParams after the deploy gas was spent).
         val gateAddress: String? = if (type == "gated") {
-            val res = bridge.call("gateCreate", JSONObject().put("mode", 0), 180_000)
+            val createArgs = JSONObject().put("mode", gateMode)
+            gateToken?.let { createArgs.put("token", it) }
+            gateMinBalance?.let { createArgs.put("minBalance", it) }
+            gatePrice?.let { createArgs.put("price", it) }
+            gateDuration?.let { createArgs.put("duration", it) }
+            val res = bridge.call("gateCreate", createArgs, 180_000)
             val gate = res.optString("gate").lowercase().ifEmpty { null }
                 ?: throw IllegalStateException("gateCreate returned no clone address")
             Log.i(TAG, "Gate clone created: " + gate)
@@ -1329,13 +1562,15 @@ class ChannelManager(
         val ephemeralStreamId = "$base${StreamConstants.SUFFIX_EPHEMERAL}"
         val adminStreamId = "$base${StreamConstants.SUFFIX_ADMIN}"
         val keysStreamId = "$base${StreamConstants.SUFFIX_KEYS}"
-        // Closed channels are never discoverable: the web forces exposure to
-        // 'hidden' for `native` (ChannelModalsUI.js:525) and hides the whole
-        // section. Honouring a caller-supplied 'visible' here would publish the
+        // Closed channels are never discoverable: exposure is forced to
+        // 'hidden' — honouring a caller-supplied 'visible' would publish the
         // channel name and description in PLAINTEXT on-chain metadata for a
-        // channel whose entire point is that membership is private — and would
-        // emit a combination the web can never produce.
-        val effectiveExposure = if (type == "native" || type == "gated") "hidden" else exposure
+        // channel whose entire point is that membership is private. N-D:
+        // token/NFT/paid gates are the opposite — storefronts — so only the
+        // NONE mode keeps the clamp (mirrors web handleCreate).
+        val effectiveExposure =
+            if (type == "native" || (type == "gated" && gateMode == GATE_MODE_NONE)) "hidden"
+            else exposure
         val visible = effectiveExposure == "visible"
 
         // Pombo metadata in the description (same short keys AND the same key
@@ -1412,9 +1647,19 @@ class ChannelManager(
                 val clonePerms = JSONArray().put(JSONObject()
                     .put("userId", gateAddress)
                     .put("permissions", JSONArray(listOf("subscribe", "publish"))))
+                // Visible gated channels are storefronts: -3 gains public
+                // SUBSCRIBE so non-members (Explore) can read the channel
+                // image. P0 (ADMIN_STATE) stays an epoch envelope — the
+                // public only ever sees ciphertext. Hidden channels keep the
+                // clone as the sole grantee.
+                val adminPerms = if (visible) JSONArray().apply {
+                    put(clonePerms.getJSONObject(0))
+                    put(JSONObject().put("public", true)
+                        .put("permissions", JSONArray(listOf("subscribe"))))
+                } else clonePerms
                 setPermissionsRetry(messageStreamId, clonePerms); onProgress()
                 setPermissionsRetry(ephemeralStreamId, clonePerms); onProgress()
-                setPermissionsRetry(adminStreamId, clonePerms); onProgress()
+                setPermissionsRetry(adminStreamId, adminPerms); onProgress()
                 setPermissionsRetry(keysStreamId, clonePerms); onProgress()
                 // Initial members: ONE gate transaction. Failure is non-fatal
                 // (the owner re-adds from the members UI).
@@ -1622,7 +1867,9 @@ class ChannelManager(
             val access = bridge.call("gateCheckAccess", JSONObject()
                 .put("gate", gateAddress).put("user", me)).optBoolean("access", false)
             if (!access) {
-                throw IllegalStateException("You do not have access to this gated channel. Ask the owner to add you.")
+                // Typed for the UI (N-D): the gate entry screen reads the mode
+                // on-chain and offers pay()/join() instead of a toast.
+                throw GateAccessDenied(gateAddress)
             }
             canPublish = true
             canSubscribe = true
@@ -3639,13 +3886,20 @@ class ChannelManager(
             openChannel(messageStreamId)
             return
         }
+        // Gated (TOKEN/NFT holder browsing before committing): the preview
+        // channel must carry the FULL gated context — the gate drives the
+        // clone transport/subscribe, and the -4 is where the epoch keys come
+        // from. Without them the open dies on the SDK's subscribe guard.
+        val gated = preview.type == "gated" && preview.gateAddress != null
         openInternal(
             Channel(
                 messageStreamId = messageStreamId,
                 ephemeralStreamId = StreamConstants.deriveEphemeralId(messageStreamId),
                 adminStreamId = StreamConstants.deriveAdminId(messageStreamId),
+                keysStreamId = if (gated) StreamConstants.deriveKeysId(messageStreamId) else "",
                 name = preview.name.ifEmpty { messageStreamId.substringAfterLast('/') },
                 type = preview.type.ifEmpty { "public" },
+                gateAddress = if (gated) preview.gateAddress else null,
                 // Carry the Explore metadata so the settings sheet isn't blank —
                 // anything listed in Explore is by definition exposure=visible.
                 description = preview.description,
@@ -3656,6 +3910,21 @@ class ChannelManager(
             ),
             preview = true
         )
+    }
+
+    /** Gate mode for an arbitrary clone (Explore tap routing); null = unreadable. */
+    suspend fun gateModeOf(gateAddress: String): Int? = try {
+        bridge.call("gateInfo", JSONObject().put("gate", gateAddress))
+            .optInt("mode", -1).takeIf { it >= 0 }
+    } catch (e: Exception) { null }
+
+    /** Whether OUR account passes a gate right now (cached, fail-closed). */
+    suspend fun gateAccessSelf(gateAddress: String): Boolean {
+        val me = myAddress() ?: return false
+        return try {
+            bridge.call("gateCheckAccess", JSONObject()
+                .put("gate", gateAddress).put("user", me)).optBoolean("access", false)
+        } catch (e: Exception) { false }
     }
 
     /**
@@ -3800,7 +4069,8 @@ class ChannelManager(
                                     channel.messageStreamId, channel.keysStreamId,
                                     channel.storageDays ?: 180,
                                     allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000,
-                                    memberCount = channel.members.size)
+                                    memberCount = channel.members.size,
+                                    gated = channel.type == "gated")
                             } catch (e: Exception) {
                                 Log.d(TAG, "Background epoch reconcile failed: ${e.message}")
                             }
@@ -3812,7 +4082,8 @@ class ChannelManager(
                                 channel.messageStreamId, channel.keysStreamId,
                                 channel.storageDays ?: 180,
                                     allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000,
-                                    memberCount = channel.members.size)
+                                    memberCount = channel.members.size,
+                                    gated = channel.type == "gated")
                         } catch (e: Exception) {
                             Log.w(TAG, "Epoch key setup failed (messages will wait for key): ${e.message}")
                         }
@@ -4888,7 +5159,8 @@ class ChannelManager(
                     channel.messageStreamId, keysId,
                     channel.storageDays ?: 180,
                                     allowMint = System.currentTimeMillis() - channel.createdAt < 3_600_000,
-                                    memberCount = channel.members.size)
+                                    memberCount = channel.members.size,
+                                    gated = channel.type == "gated")
                 envelope = epochKeys.encryptCurrent(channel.messageStreamId, clean)
             }
             if (envelope == null) {
@@ -4930,9 +5202,15 @@ class ChannelManager(
     }
 
     /** Channel lookup by ANY of its streams, for transports that only know a stream id. */
-    private fun channelByStream(streamId: String): Channel? = _channels.value.find {
-        it.messageStreamId == streamId || it.ephemeralStreamId == streamId ||
-            it.adminStreamId == streamId || (it.keysStreamId.isNotEmpty() && it.keysStreamId == streamId)
+    private fun channelByStream(streamId: String): Channel? {
+        val match: (Channel) -> Boolean = {
+            it.messageStreamId == streamId || it.ephemeralStreamId == streamId ||
+                it.adminStreamId == streamId || (it.keysStreamId.isNotEmpty() && it.keysStreamId == streamId)
+        }
+        // Preview channels live only in _current, never in _channels — the
+        // gated paths (epoch ingest, clone transport, gate checks) must still
+        // find them or a gated preview silently degrades to ungated handling.
+        return _channels.value.find(match) ?: _current.value?.takeIf(match)
     }
 
     /** Native and gated channels share the epoch-key machinery (N-A/N-C). */
@@ -6338,8 +6616,23 @@ class ChannelManager(
         return v.ifEmpty { null }
     }
 
+    /**
+     * A gated channel refused the join at the CONTRACT (checkAccess false).
+     * Carries the clone address so the entry screen can read the requirement
+     * (mode/token/price) and offer pay()/join() instead of a dead-end toast.
+     */
+    class GateAccessDenied(val gateAddress: String) :
+        IllegalStateException("You do not have access to this gated channel.")
+
     companion object {
         private const val TAG = "PomboChannels"
+        /** Canonical wrapped-native on Polygon (WPOL) — bridge `_WRAPPED_NATIVE`. */
+        const val WRAPPED_NATIVE = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"
+        /** PomboGate.Mode — ABI order, never reorder (NONE=0, TOKEN=1, NFT=2, PAID=3). */
+        const val GATE_MODE_NONE = 0
+        const val GATE_MODE_TOKEN = 1
+        const val GATE_MODE_NFT = 2
+        const val GATE_MODE_PAID = 3
         const val STORAGE_NODE = "0xae340e799e8151f6a4999d245e466197aa217667"
         /** Web CONFIG.push.pushStreamId — the shared relay wake-signal stream. */
         const val PUSH_STREAM_ID = "0xae340e799e8151f6a4999d245e466197aa217667/push"

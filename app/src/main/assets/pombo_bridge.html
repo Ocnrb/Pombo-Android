@@ -1978,9 +1978,13 @@ const api = {
         'function moderators(address) view returns (bool)',
         'function checkAccess(address user) view returns (bool)',
         'function accessUntil(address user) view returns (uint64)',
+        'function paidUntil(address) view returns (uint64)',
         'function allow(address user)',
         'function allowBatch(address[] users)',
         'function revokeAllow(address user)',
+        'function join()',
+        'function pay()',
+        'function payWithPermit(uint256 permitValue, uint256 deadline, uint8 v, bytes32 r, bytes32 s)',
         'function ban(address user, bool eraseHistory)',
         'function unban(address user)',
         'function unerase(address user)',
@@ -1990,6 +1994,20 @@ const api = {
         'function createGate(uint8 mode, address token, uint256 minBalance, uint256 price, uint64 duration) returns (address)',
         'event GateCreated(address indexed gate, address indexed owner, uint8 mode)'
     ],
+    // balanceOf covers ERC-721 too (same selector); decimals/allowance are ERC-20 only.
+    _GATE_TOKEN_ABI: [
+        'function balanceOf(address) view returns (uint256)',
+        'function allowance(address owner, address spender) view returns (uint256)',
+        'function approve(address spender, uint256 value) returns (bool)',
+        'function decimals() view returns (uint8)',
+        'function symbol() view returns (string)'
+    ],
+    // Canonical wrapped-native on Polygon (WPOL, WETH9 code). gatePay auto-
+    // wraps native POL into it when the WPOL balance is short — deposit() is
+    // only assumed safe for THIS address, never for arbitrary payment tokens.
+    _WRAPPED_NATIVE: '0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270',
+    _WRAPPED_NATIVE_ABI: ['function deposit() payable'],
+    _gateTokenMetaCache: new Map(), // token -> { symbol, decimals|null }
     _gateRpcIndex: 0,
     _gateProviderUrl: null,
     _gateProviderInst: null,
@@ -2127,17 +2145,19 @@ const api = {
                 const f = await Promise.all([
                     gate.allowlist(address), gate.banned(address),
                     gate.everMember(address), gate.erased(address),
-                    gate.moderators(address).catch(function () { return false; }) // v1 gates predate the getter
+                    gate.moderators(address).catch(function () { return false; }), // v1 gates predate the getter
+                    // Mode-aware CURRENT membership — `allowed` only means NONE
+                    gate.checkAccess(address).catch(function () { return false; })
                 ]);
                 return {
                     address: address, allowed: !!f[0], banned: !!f[1],
                     everMember: !!f[2], erased: !!f[3], moderator: !!f[4],
-                    isOwner: address === owner
+                    access: !!f[5], isOwner: address === owner
                 };
             }));
             members.sort(function (x, y) {
                 return (y.isOwner - x.isOwner) || (y.moderator - x.moderator) ||
-                    (y.allowed - x.allowed) || x.address.localeCompare(y.address);
+                    (y.access - x.access) || x.address.localeCompare(y.address);
             });
             return { members: members };
         });
@@ -2161,7 +2181,106 @@ const api = {
     async gateAllowBatch(a) { return api._gateTx(a.gate, 'allowBatch', [a.users || []]); },
     async gateBan(a) { return api._gateTx(a.gate, 'ban', [a.user, !!a.erase]); },
     async gateUnban(a) { return api._gateTx(a.gate, 'unban', [a.user]); },
-    async gateSetModerator(a) { return api._gateTx(a.gate, 'setModerator', [a.user, !!a.enabled]); }
+    async gateSetModerator(a) { return api._gateTx(a.gate, 'setModerator', [a.user, !!a.enabled]); },
+
+    _gateReadToken(tokenAddress) {
+        return new window.ethers.Contract(tokenAddress, api._GATE_TOKEN_ABI, api._gateProvider());
+    },
+
+    // { token } -> { symbol, decimals|null } — null decimals = ERC-721
+    // collection (the getter does not exist there), render whole units.
+    async gateTokenMeta(a) {
+        const key = String(a.token).toLowerCase();
+        if (api._gateTokenMetaCache.has(key)) return api._gateTokenMetaCache.get(key);
+        const meta = await api._gateWithProvider(async function () {
+            const token = api._gateReadToken(a.token);
+            const r = await Promise.all([
+                token.symbol().catch(function () { return key.slice(0, 6) + '…' + key.slice(-4); }),
+                token.decimals().then(function (d) { return Number(d); }).catch(function () { return null; })
+            ]);
+            return { symbol: r[0], decimals: r[1] };
+        });
+        api._gateTokenMetaCache.set(key, meta);
+        return meta;
+    },
+
+    // { token, user } -> { balance } string bigint (ERC-721 = owned count)
+    async gateTokenBalance(a) {
+        const balance = await api._gateWithProvider(function () {
+            return api._gateReadToken(a.token).balanceOf(a.user);
+        });
+        return { balance: String(balance) };
+    },
+
+    // { gate, user } -> { paidUntil } unix seconds string; '0' = never paid
+    async gatePaidUntil(a) {
+        const until = await api._gateWithProvider(function () {
+            return api._gateRead(a.gate).paidUntil(a.user);
+        });
+        return { paidUntil: String(until) };
+    },
+
+    // { gate, user? } — drop cached access. The entry screen's recheck/enter
+    // need this: the deny that opened it is cached fail-closed for 10 min,
+    // so a user who just paid/bought would still be refused.
+    async gateInvalidateAccess(a) {
+        const prefix = String(a.gate).toLowerCase();
+        const exact = a.user ? prefix + '|' + String(a.user).toLowerCase() : null;
+        Array.from(api._gateAccessCache.keys()).forEach(function (k) {
+            if (k.indexOf(prefix) !== 0) return;
+            if (exact && k !== exact) return;
+            api._gateAccessCache.delete(k);
+        });
+        return { ok: true };
+    },
+
+    // { gate } — TOKEN/NFT gates: opt in to sticky membership (everMember).
+    // Optional by design — without it, selling the asset before ever joining
+    // forfeits the published history (§7.11).
+    async gateJoin(a) { return api._gateTx(a.gate, 'join', []); },
+
+    // { gate } -> { ok, txHash, wrapped, approved } — pay one subscription
+    // period (renewing early extends from the current end). WPOL-priced gates
+    // wrap native POL to cover any shortfall first; then the gate is approved
+    // for exactly `price` when the standing allowance is short (reset to 0
+    // first — USDT-style tokens revert on non-zero → non-zero). Three txs
+    // worst case, one when balance and allowance already cover it.
+    async gatePay(a) {
+        const info = await api.gateInfo(a);
+        const price = BigInt(info.price);
+        const signer = api._gateSigner();
+        const token = new window.ethers.Contract(info.token, api._GATE_TOKEN_ABI, signer);
+        var wrapped = false, approved = false;
+
+        if (info.token === api._WRAPPED_NATIVE) {
+            const balance = await token.balanceOf(signer.address);
+            if (balance < price) {
+                const shortfall = price - balance;
+                const native = await signer.provider.getBalance(signer.address);
+                if (native <= shortfall) throw new Error('Not enough POL to cover the subscription price');
+                const wrapper = new window.ethers.Contract(info.token, api._WRAPPED_NATIVE_ABI, signer);
+                const wrapTx = await wrapper.deposit({ value: shortfall });
+                await wrapTx.wait();
+                wrapped = true;
+            }
+        }
+
+        const allowance = await token.allowance(signer.address, a.gate);
+        if (allowance < price) {
+            if (allowance > 0n) {
+                const resetTx = await token.approve(a.gate, 0n);
+                await resetTx.wait();
+            }
+            const approveTx = await token.approve(a.gate, price);
+            await approveTx.wait();
+            approved = true;
+        }
+
+        const result = await api._gateTx(a.gate, 'pay', []);
+        result.wrapped = wrapped;
+        result.approved = approved;
+        return result;
+    }
 };
 
 // Generic RPC: Kotlin -> bridgeCall(id, method, argsB64) -> Native.result(id, ok, payloadB64)

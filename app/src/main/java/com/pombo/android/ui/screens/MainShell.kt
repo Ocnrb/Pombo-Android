@@ -3026,11 +3026,11 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
             val matchesQuery = query.isBlank() ||
                 c.name.contains(query, true) || c.description.contains(query, true)
             val matchesCategory = category == "All" || c.category.equals(categoryValue(category), true)
-            // Web `filterChannels`: `browseTypeFilter` starts at 'public' and the
-            // Private chip flips it to 'password' — an exclusive either/or, not
-            // an additive filter. Ours only filtered when the chip was ON, so
-            // password channels were listed by default.
-            val matchesType = c.type == (if (privateOnly) "password" else "public")
+            // Web `filterChannels` (N-D semantics): password channels live
+            // behind the Private chip — their access is a secret shared
+            // out-of-band; everything else, public AND gate-backed
+            // (gated/paid), is a storefront and lists in the main view.
+            val matchesType = if (privateOnly) c.type == "password" else c.type != "password"
             // Web filterChannels: NSFW/Adult channels stay hidden unless that
             // very category is selected or "Show Sensitive Content" is on.
             val sensitive = c.category.equals("nsfw", true) || c.category.equals("adult", true)
@@ -3075,7 +3075,14 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
                     ) {
                         // Protected channels need the password before anything
                         // can be decrypted, so ask up front (web JoinChannelUI).
-                        if (ch.type == "password") passwordFor = ch else vm.previewChannel(ch)
+                        // Gated routes by mode: TOKEN/NFT holders get a real
+                        // preview (browse before committing); PAID and
+                        // non-holders go through the join flow (entry screen).
+                        when {
+                            ch.type == "password" -> passwordFor = ch
+                            ch.type == "gated" -> vm.openGatedExplore(ch)
+                            else -> vm.previewChannel(ch)
+                        }
                     }
                 }
             }
@@ -3252,9 +3259,10 @@ private fun ExploreCard(
                 modifier = Modifier.size(16.dp)
             )
         }
-        // Tags (category / language) — `px-1.5 py-1 bg-white/5 text-white/50
-        // text-[11px] rounded`, category hidden when it is the default.
+        // Tags (gated / category / language) — `px-1.5 py-1 bg-white/5
+        // text-white/50 text-[11px] rounded`, category hidden when default.
         val tags = listOfNotNull(
+            "Gated".takeIf { ch.type == "gated" },
             ch.category.takeIf { it.isNotEmpty() && !it.equals("general", true) }?.replaceFirstChar { it.uppercase() },
             ch.language.takeIf { it.isNotEmpty() }?.uppercase()
         )

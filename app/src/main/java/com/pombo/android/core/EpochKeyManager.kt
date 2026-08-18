@@ -44,7 +44,17 @@ class EpochKeyManager(
      * epochs out of their hands.
      */
     private val checkGateAccess: suspend (messageStreamId: String, requester: String) -> Boolean =
-        { _, _ -> true }
+        { _, _ -> true },
+    /**
+     * D14 per-mode history scope (N-D): true when this channel's gate hands
+     * out ONLY the current epoch — PAID gates, where a subscription buys the
+     * future, never the channel's past. The wiring is FAIL-CLOSED: a gated
+     * channel whose mode cannot be read answers current-only (missing old
+     * epochs get re-requested once the RPC heals; leaked ones cannot be
+     * taken back). Ungated channels return false.
+     */
+    private val currentEpochOnly: suspend (messageStreamId: String) -> Boolean =
+        { _ -> false }
 ) {
     data class Entry(val data: JSONObject, val publisherId: String?, val timestamp: Long)
 
@@ -78,6 +88,15 @@ class EpochKeyManager(
          * LinkedHashMap for insertion-order eviction.
          */
         val seenWraps = LinkedHashMap<String, MutableSet<String>>()
+        /**
+         * Addresses seen authoring a KEY_REQUEST (live or -4 history). Every
+         * reader of a gated channel must request keys, so this enumerates
+         * members for TOKEN/NFT/PAID gates where join()/pay() bypasses the
+         * owner — the N-D no-indexer decision.
+         */
+        val seenRequesters = LinkedHashSet<String>()
+        /** N-D weekly rotation timer (gated channels, admin-side). */
+        var rotationJob: kotlinx.coroutines.Job? = null
     }
 
     private class PendingRequest(
@@ -113,6 +132,13 @@ class EpochKeyManager(
         /** Post-rotation window in which the previous epoch's kid stays
          *  acceptable on LIVE gated traffic (web: kidFreshnessToleranceMs). */
         private const val KID_FRESHNESS_TOLERANCE_MS = 10 * 60 * 1000L
+        // N-D (§7.12): gated channels rotate on a cadence — selling the asset
+        // or a lapsed subscription only cuts reads at the NEXT rotation, so
+        // without a schedule the cut never lands. Weekly for every gate mode.
+        private const val ROTATION_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000L
+        private const val ROTATION_RETRY_MS = 60 * 60 * 1000L
+        private const val SEEN_REQUESTERS_MAX = 500
+        private val ADDR_RE = Regex("^0x[0-9a-f]{40}$")
     }
 
     // ---- Admin set (D13): namespace address only ----
@@ -177,7 +203,7 @@ class EpochKeyManager(
 
     /** Drop runtime + persisted state (channel left/deleted). */
     suspend fun forgetChannel(messageStreamId: String) = mutex.withLock {
-        state.remove(messageStreamId)
+        state.remove(messageStreamId)?.rotationJob?.cancel()
         store.clear(messageStreamId)
     }
 
@@ -200,7 +226,9 @@ class EpochKeyManager(
          */
         allowMint: Boolean = true,
         /** Rank domain for the anti-stampede queue (channel member count). */
-        memberCount: Int = 4
+        memberCount: Int = 4,
+        /** Gated channels arm the weekly rotation (admin-side, N-D). */
+        gated: Boolean = false
     ) {
         val entries = try { resendKeys(keysStreamId) } catch (e: Exception) { emptyList() }
         var toRequest = false
@@ -226,7 +254,10 @@ class EpochKeyManager(
                         val kid = entry.data.optString("keyId")
                         if (rid.isNotEmpty() && kid.isNotEmpty()) recordSeenWrapLocked(s, rid, kid)
                     }
-                    StreamConstants.KEY_REQUEST -> storedRequests.add(entry)
+                    StreamConstants.KEY_REQUEST -> {
+                        storedRequests.add(entry)
+                        recordRequesterLocked(s, entry.publisherId)
+                    }
                 }
             }
             if (changed) persist(messageStreamId, s)
@@ -277,6 +308,65 @@ class EpochKeyManager(
                 )
             }
         }
+
+        if (gated && isOwnAdmin(messageStreamId)) {
+            mutex.withLock {
+                armRotationLocked(messageStreamId, keysStreamId, getState(messageStreamId))
+            }
+        }
+    }
+
+    /**
+     * Arm the weekly rotation timer (N-D, gated channels, admin-side). The
+     * timer checks the CURRENT epoch's age on fire — a manual rotation (ban)
+     * in between simply makes the check a no-op and the timer re-arm. If the
+     * admin is offline past the due time, the epoch lives longer and the next
+     * channel open rotates. Caller holds the lock.
+     */
+    private fun armRotationLocked(messageStreamId: String, keysStreamId: String, s: ChannelState) {
+        if (s.rotationJob?.isActive == true) return
+        val born = s.announces[s.currentEpoch]?.validFrom ?: return
+        val dueIn = (born + ROTATION_INTERVAL_MS - System.currentTimeMillis())
+            .coerceIn(0L, ROTATION_INTERVAL_MS) + 1_000L
+        s.rotationJob = scope.launch {
+            delay(dueIn)
+            try {
+                val due = mutex.withLock {
+                    val st = state[messageStreamId] ?: return@launch   // left/deleted
+                    val cur = st.announces[st.currentEpoch]
+                    cur != null && System.currentTimeMillis() - cur.validFrom >= ROTATION_INTERVAL_MS
+                }
+                if (due && isOwnAdmin(messageStreamId)) {
+                    rotateEpoch(messageStreamId, keysStreamId)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "scheduled rotation failed (retrying later): ${e.message}")
+                delay(ROTATION_RETRY_MS)
+            }
+            mutex.withLock {
+                state[messageStreamId]?.let { st ->
+                    st.rotationJob = null
+                    armRotationLocked(messageStreamId, keysStreamId, st)
+                }
+            }
+        }
+    }
+
+    /** Caller holds the lock. */
+    private fun recordRequesterLocked(s: ChannelState, publisherId: String?) {
+        val addr = publisherId?.lowercase() ?: return
+        if (!ADDR_RE.matches(addr)) return
+        if (s.seenRequesters.size >= SEEN_REQUESTERS_MAX && addr !in s.seenRequesters) return
+        s.seenRequesters.add(addr)
+    }
+
+    /**
+     * Member candidates observed on -4 (KEY_REQUEST authors) — the candidate
+     * source for enumerating TOKEN/NFT/PAID gate members without an indexer
+     * (N-D). Misses whoever paid/joined but never opened the channel.
+     */
+    suspend fun seenRequesters(messageStreamId: String): List<String> = mutex.withLock {
+        state[messageStreamId]?.seenRequesters?.toList() ?: emptyList()
     }
 
     /**
@@ -468,6 +558,7 @@ class EpochKeyManager(
         messageStreamId: String, keysStreamId: String,
         data: JSONObject, publisherId: String?, memberCount: Int
     ) {
+        mutex.withLock { recordRequesterLocked(getState(messageStreamId), publisherId) }
         if (publisherId?.lowercase() == myAddress()?.lowercase()) return  // our own
         val pubkey = data.optString("pubkey").ifEmpty { return }
         val requestId = data.optString("requestId").ifEmpty { return }
@@ -530,12 +621,15 @@ class EpochKeyManager(
             }
             return
         }
+        // D14: a PAID gate hands out ONLY the current epoch — the history
+        // scope of a subscription is the future (fail-closed in the wiring).
+        val paidOnly = currentEpochOnly(messageStreamId)
         val toWrap = mutex.withLock {
             val s = getState(messageStreamId)
             val covered = s.seenWraps[requestId] ?: emptySet<String>()
             s.epochs
                 .filterKeys { it !in covered }
-                .filterValues { it.epoch >= fromEpoch }
+                .filterValues { it.epoch >= fromEpoch && (!paidOnly || it.epoch == s.currentEpoch) }
                 .map { (keyId, e) -> Triple(keyId, e.keyHex, e.epoch) }
         }
         if (toWrap.isEmpty()) return

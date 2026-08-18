@@ -52,7 +52,9 @@ object GraphApi {
         val createdAt: Long,
         val updatedAt: Long,
         /** Streamr guarantees the address prefixing the stream ID owns it. */
-        val createdBy: String
+        val createdBy: String,
+        /** Gated (N-C): the PomboGate clone from metadata `g`, lowercase. */
+        val gateAddress: String? = null
     )
 
     private suspend fun query(cacheKey: String, gql: String): JSONObject? {
@@ -114,13 +116,23 @@ object GraphApi {
             exposure = meta.str("e", "hidden"),
             createdAt = meta.optLong("ts", 0L).takeIf { it > 0 } ?: (createdAt * 1000),
             updatedAt = updatedAt * 1000,
-            createdBy = streamId.substringBefore('/')
+            createdBy = streamId.substringBefore('/'),
+            gateAddress = meta.str("g").lowercase()
+                .takeIf { Regex("^0x[0-9a-f]{40}$").matches(it) }
         )
     }
 
     /**
-     * Public channels for the Explore view: streams with a public permission
-     * whose metadata mentions pombo. Only `exposure: visible` ones are listed.
+     * Discoverable (exposure: visible) channels for the Explore view — any
+     * access type. Filtered by metadata, NOT by public permissions: gated
+     * channels grant everything to their clone and nothing to the zero
+     * address, so a permission filter can never list them (N-D). The exact
+     * `\"e\":\"visible\"` marker is NOT expressible in metadata_contains —
+     * graph-node feeds the pattern to a LIKE where backslash escapes
+     * (verified against the real subgraph: it returns zero rows) — so the
+     * subgraph narrows with two backslash-free substrings and the loop below
+     * applies the exact a/e checks. Hidden channels never carry "visible"
+     * anywhere (n/d/l/c are omitted when hidden).
      */
     suspend fun getPublicPomboChannels(first: Int = 50, skip: Int = 0): List<ChannelInfo> {
         val gql = """
@@ -130,10 +142,10 @@ object GraphApi {
                     skip: $skip,
                     orderBy: updatedAt,
                     orderDirection: desc,
-                    where: {
-                        permissions_: { userAddress: "0x0000000000000000000000000000000000000000" },
-                        metadata_contains: "pombo"
-                    },
+                    where: { and: [
+                        { metadata_contains: "pombo" },
+                        { metadata_contains: "visible" }
+                    ] },
                     subgraphError: allow
                 ) { id metadata createdAt updatedAt }
             }

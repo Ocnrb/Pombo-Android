@@ -655,7 +655,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
 
     /** Accepts an invite that arrived over DM (web: joinChannelFromInvite). */
     fun acceptInvite(invite: ChannelManager.PendingInvite) = viewModelScope.launch {
-        runWithToast("Joining channel...", "Joined channel successfully!", "Failed to join channel") {
+        runJoinToast("Joining channel...", "Joined channel successfully!", "Failed to join channel") {
             val channel = manager.joinChannel(invite.streamId, invite.password)
             manager.openChannel(channel.messageStreamId)
             autoEnableChannelPush(channel)
@@ -685,7 +685,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
 
     fun acceptIncomingInvite(invite: InviteToken.Invite) = viewModelScope.launch {
         _incomingInvite.value = null
-        runWithToast("Joining channel...", "Joined channel successfully!", "Failed to join channel") {
+        runJoinToast("Joining channel...", "Joined channel successfully!", "Failed to join channel",
+            channelName = invite.name) {
             val channel = manager.joinChannel(invite.streamId, invite.password)
             manager.openChannel(channel.messageStreamId)
         }
@@ -920,6 +921,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     fun setChatOrigin(origin: ChatOrigin) { _chatOrigin.value = origin }
 
     /** Reads a public channel without joining it (web: preview mode). */
+    /**
+     * Explore tap on a gated channel (N-D). Routing by MODE:
+     *  - TOKEN/NFT with access → PREVIEW (browse without committing; the
+     *    Join button in the header adds it to the list)
+     *  - PAID, no access, or unreadable gate → the join flow, which lands on
+     *    the entry screen when the gate refuses (paying IS the commitment)
+     */
+    fun openGatedExplore(channel: ExploreChannel) = viewModelScope.launch {
+        val gate = channel.gateAddress
+        if (gate != null) {
+            val mode = manager.gateModeOf(gate)
+            val holding = mode == ChannelManager.GATE_MODE_TOKEN || mode == ChannelManager.GATE_MODE_NFT
+            if (holding && manager.gateAccessSelf(gate)) {
+                manager.previewChannel(channel)
+                return@launch
+            }
+        }
+        joinChannel(channel.messageStreamId, null)
+    }
+
     fun previewChannel(channel: ExploreChannel) {
         _chatOrigin.value = ChatOrigin.EXPLORE
         manager.previewChannel(channel)
@@ -927,7 +948,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
 
     /** Join button in the preview header. */
     fun joinPreview() = viewModelScope.launch {
-        runWithToast("Joining channel…", "Joined channel", "Failed to join channel") {
+        runJoinToast("Joining channel…", "Joined channel", "Failed to join channel") {
             manager.joinPreview()?.let { autoEnableChannelPush(it) }
         }
     }
@@ -1885,7 +1906,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                 classification = spec.classification,
                 storageProvider = spec.storageProvider,
                 customStorageAddress = spec.customStorageAddress,
-                storageDays = spec.storageDays
+                storageDays = spec.storageDays,
+                gateMode = spec.gateMode,
+                gateToken = spec.gateToken,
+                gateMinBalance = spec.gateMinBalance,
+                gatePrice = spec.gatePrice,
+                gateDuration = spec.gateDurationSeconds
             ) {
                 step += 1
                 val label = when {
@@ -1909,7 +1935,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     }
 
     fun joinChannel(input: String, password: String?) = viewModelScope.launch {
-        runWithToast("Joining channel…", "Joined channel", "Failed to join channel") {
+        runJoinToast("Joining channel…", "Joined channel", "Failed to join channel") {
             val channel = manager.joinChannel(input, password?.ifEmpty { null })
             manager.openChannel(channel.messageStreamId)
             autoEnableChannelPush(channel)
@@ -1919,6 +1945,86 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         // is already up.
         runCatching { manager.refreshChannelMetadataFromGraph() }
     }
+
+    // ---- Gate entry screen (N-D): a gated channel refused the join ----
+
+    data class GateEntry(
+        val info: ChannelManager.GateEntryInfo,
+        val channelName: String?,
+        val retry: suspend () -> Unit
+    )
+
+    private val _gateEntry = MutableStateFlow<GateEntry?>(null)
+    val gateEntry: StateFlow<GateEntry?> = _gateEntry.asStateFlow()
+
+    fun dismissGateEntry() { _gateEntry.value = null }
+
+    private suspend fun openGateEntry(gateAddress: String, channelName: String?, retry: suspend () -> Unit) {
+        try {
+            _gateEntry.value = GateEntry(manager.gateEntryInfo(gateAddress), channelName, retry)
+        } catch (e: Exception) {
+            toast(
+                "Could not read the gate contract: ${com.pombo.android.core.ChainErrors.friendly(e)}",
+                com.pombo.android.ui.ToastKind.ERROR, 5000L
+            )
+        }
+    }
+
+    /** Re-read the on-chain standing (balance / paidUntil are never cached). */
+    fun gateEntryRecheck() = viewModelScope.launch {
+        val entry = _gateEntry.value ?: return@launch
+        manager.gateInvalidateAccess(entry.info.gateAddress)
+        openGateEntry(entry.info.gateAddress, entry.channelName, entry.retry)
+    }
+
+    /** Enter: the deny that opened this screen is cached fail-closed 10 min —
+     *  invalidate before the retry or the user pays and still gets refused. */
+    fun gateEntryEnter() = viewModelScope.launch {
+        val entry = _gateEntry.value ?: return@launch
+        _gateEntry.value = null
+        manager.gateInvalidateAccess(entry.info.gateAddress)
+        entry.retry()
+    }
+
+    fun gateEntryPay() = viewModelScope.launch {
+        val entry = _gateEntry.value ?: return@launch
+        chainAction(
+            "Pay subscription",
+            "Pays one subscription period to this channel's gate (may wrap POL and approve the token first)."
+        ) {
+            val ok = runWithToast("Paying subscription…", null, "Payment failed") {
+                manager.gatePay(entry.info.gateAddress)
+            }
+            if (ok) {
+                _gateEntry.value = null
+                entry.retry()
+            }
+        }
+    }
+
+    /** Optional TOKEN/NFT membership registration (sticky everMember). */
+    fun gateEntryJoin() = viewModelScope.launch {
+        val entry = _gateEntry.value ?: return@launch
+        chainAction(
+            "Register membership",
+            "Registers your address on this channel's gate so your messages stay valid even after selling the asset."
+        ) {
+            runWithToast("Registering membership…", "Membership registered on-chain", "Registration failed") {
+                manager.gateJoin(entry.info.gateAddress)
+            }
+        }
+    }
+
+    // ---- Create-form helpers (N-D token fields) ----
+
+    suspend fun gateTokenMeta(token: String) = manager.gateTokenMeta(token)
+    suspend fun gateTokenBalance(token: String) = manager.gateTokenBalance(token)
+
+    /** Members panel: NONE gates take manual adds, TOKEN/NFT/PAID never. */
+    suspend fun currentGateMode(): Int? = manager.currentGateMode()
+
+    /** Channel Details access line (null → keep the default label). */
+    suspend fun gateAccessLabel(): String? = manager.gateAccessLabel()
 
     /**
      * Loads the Explore tab (web: channels.js getPublicChannels + exploreCuration).
@@ -1973,7 +2079,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                         lastSender = cached?.sender.orEmpty(),
                         lastText = cached?.text.orEmpty(),
                         lastSenderAddress = cached?.senderAddress.orEmpty(),
-                        readOnly = info.readOnly
+                        readOnly = info.readOnly,
+                        gateAddress = info.gateAddress
                     )
                 }
                 _exploreLoading.value = false
@@ -2583,6 +2690,43 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
             return
         }
         com.pombo.android.ui.ChainGuard.holding(block)
+    }
+
+    /**
+     * runWithToast for JOIN flows (N-D): a [ChannelManager.GateAccessDenied]
+     * is not a failure — it opens the gate entry screen with a retry that
+     * re-runs [block] (a repeat denial re-opens the screen with fresh state).
+     */
+    private suspend fun runJoinToast(
+        loading: String,
+        success: String?,
+        failure: String,
+        channelName: String? = null,
+        block: suspend () -> Unit
+    ): Boolean {
+        val id = toast(loading, com.pombo.android.ui.ToastKind.LOADING, Long.MAX_VALUE)
+        _busy.value = true
+        return try {
+            block()
+            dismissToast(id)
+            success?.let { toast(it, com.pombo.android.ui.ToastKind.SUCCESS) }
+            true
+        } catch (e: ChannelManager.GateAccessDenied) {
+            dismissToast(id)
+            openGateEntry(e.gateAddress, channelName) {
+                runJoinToast(loading, success, failure, channelName, block)
+            }
+            false
+        } catch (e: Exception) {
+            dismissToast(id)
+            toast(
+                "$failure: ${com.pombo.android.core.ChainErrors.friendly(e)}",
+                com.pombo.android.ui.ToastKind.ERROR, 5000L
+            )
+            false
+        } finally {
+            _busy.value = false
+        }
     }
 
     /** Returns whether the block succeeded, so callers can keep a form open on failure. */
