@@ -110,11 +110,24 @@ class PomboBridge(
         @SuppressLint("SetJavaScriptEnabled")
         webView = WebView(appContext).apply {
             settings.javaScriptEnabled = true
+            // Kept on: the SDK caches group keys for legacy history in
+            // IndexedDB; without DOM storage every such row costs a key
+            // request round-trip per boot.
             settings.domStorageEnabled = true
-            // https:// origin (loadDataWithBaseURL) but SDK connections may be ws://.
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            // This page holds the identity key, so everything it does not
+            // need is closed off. Cleartext ws:// peers were already dead
+            // under usesCleartextTraffic="false", and the https:// web build
+            // proves the wss/WebRTC-only topology works without them.
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            settings.allowFileAccess = false
+            settings.allowContentAccess = false
             addJavascriptInterface(JsApi(), "Native")
             webViewClient = object : WebViewClient() {
+                // Loaded via loadDataWithBaseURL and replaced only through
+                // reconnect() — the page itself never navigates, so any
+                // navigation request is dropped.
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest) = true
+
                 override fun onPageFinished(view: WebView, url: String) {
                     // bridgeCall only exists after the page script has run; calls
                     // issued before this point were silently lost.
