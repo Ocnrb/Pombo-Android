@@ -520,7 +520,12 @@ private fun ErrorBanner(text: String, onDismiss: () -> Unit, modifier: Modifier 
  * and white import card, discreet "restore" link.
  */
 @Composable
-fun ConnectAccountDialog(onCreate: () -> Unit, onImport: () -> Unit, onDismiss: () -> Unit) {
+fun ConnectAccountDialog(
+    onCreate: () -> Unit,
+    onImport: () -> Unit,
+    onRestore: () -> Unit,
+    onDismiss: () -> Unit
+) {
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         Column(
             Modifier
@@ -576,7 +581,10 @@ fun ConnectAccountDialog(onCreate: () -> Unit, onImport: () -> Unit, onDismiss: 
                 horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("↻ restore", color = Color.White.copy(alpha = 0.40f), fontSize = 11.sp)
+                Text(
+                    "↻ restore", color = Color.White.copy(alpha = 0.40f), fontSize = 11.sp,
+                    modifier = Modifier.clickableNoRipple(onRestore).padding(4.dp)
+                )
             }
         }
     }

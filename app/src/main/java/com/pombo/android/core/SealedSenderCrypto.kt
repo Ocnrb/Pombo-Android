@@ -38,27 +38,169 @@ object SealedSenderCrypto {
             if (envelope.optInt("v") != 2 || envelope.optString("e") != "aes-256-gcm") return null
             val epk = envelope.optString("epk").ifEmpty { return null }
 
-            val shared = ecdhX(myPrivateKeyHex, epk) ?: return null
-            val aesKey = hkdfSha256(shared, "pombo-dm-sealed-v2".toByteArray(), "aes-256-gcm".toByteArray())
+            val aesKey = sealedKey(myPrivateKeyHex, epk) ?: return null
 
             // java.util, not android.util: identical on device (minSdk ≥ 26)
             // and real in JVM unit tests, where the android.util stub throws.
             val iv = java.util.Base64.getDecoder().decode(envelope.optString("iv"))
             val ct = java.util.Base64.getDecoder().decode(envelope.optString("ct"))
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), GCMParameterSpec(128, iv))
-            val inner = JSONObject(String(cipher.doFinal(ct), Charsets.UTF_8))
+            val inner = JSONObject(String(aesGcm(Cipher.DECRYPT_MODE, aesKey, iv, ct), Charsets.UTF_8))
 
             val proof = inner.optString("p").ifEmpty { return null }
-            val digest = keccak256(
-                "POMBO_DM_BIND_V2|${myAddress.lowercase()}|$epk".toByteArray(Charsets.UTF_8)
-            )
-            val sender = ecrecover(digest, hexToBytes(proof)) ?: return null
+            val sender = ecrecover(bindDigest(myAddress, epk), hexToBytes(proof)) ?: return null
             inner.remove("p")
             sender to inner
         } catch (e: Exception) {
             null
         }
+    }
+
+    /**
+     * Seal side of the same envelope — web dmCrypto.seal / bridge dmSealPublish.
+     * The ephemeral private key doubles as the Streamr publishing identity, so
+     * the caller gets it back alongside the envelope.
+     */
+    fun seal(
+        message: JSONObject,
+        senderPrivateKeyHex: String,
+        recipientAddress: String,
+        recipientPublicKeyHex: String
+    ): Pair<JSONObject, String> {
+        val ephemeralPk = generateEphemeralKey()
+        val iv = ByteArray(12).also { java.security.SecureRandom().nextBytes(it) }
+        return seal(message, senderPrivateKeyHex, recipientAddress, recipientPublicKeyHex, ephemeralPk, iv) to ephemeralPk
+    }
+
+    /** Deterministic form — vector tests inject the ephemeral key and IV. */
+    internal fun seal(
+        message: JSONObject,
+        senderPrivateKeyHex: String,
+        recipientAddress: String,
+        recipientPublicKeyHex: String,
+        ephemeralPrivateKeyHex: String,
+        iv: ByteArray
+    ): JSONObject {
+        val epk = EthereumSigner.compressedPublicKey(ephemeralPrivateKeyHex)
+        val aesKey = sealedKey(ephemeralPrivateKeyHex, recipientPublicKeyHex)
+            ?: throw IllegalArgumentException("invalid key material")
+        val proof = EthereumSigner.toHex(
+            EthereumSigner.signDigest(bindDigest(recipientAddress, epk), senderPrivateKeyHex)
+        )
+
+        val inner = JSONObject(message.toString()).put("p", proof)
+        val ct = aesGcm(Cipher.ENCRYPT_MODE, aesKey, iv, inner.toString().toByteArray(Charsets.UTF_8))
+        val b64 = java.util.Base64.getEncoder()
+        return JSONObject()
+            .put("v", 2)
+            .put("epk", epk)
+            .put("ct", b64.encodeToString(ct))
+            .put("iv", b64.encodeToString(iv))
+            .put("e", "aes-256-gcm")
+    }
+
+    // ===== sealed sender — binary (media pieces / storage chunks) =====
+    //   wire:      [v:1=0x02][epk:33][iv:12][ct...]
+    //   plaintext: [proof:65][payload...]
+    // One ephemeral key per TRANSFER: epk/key/proof are computed once by the
+    // caller (the sealer state) and reused for every piece.
+
+    /** Per-transfer sealer state — epk, AES key and proof fixed for the transfer. */
+    class BinarySealer internal constructor(
+        val ephemeralPrivateKeyHex: String,
+        val epkHex: String,
+        internal val aesKey: ByteArray,
+        internal val proofBytes: ByteArray
+    )
+
+    fun binarySealer(
+        senderPrivateKeyHex: String,
+        recipientAddress: String,
+        recipientPublicKeyHex: String
+    ): BinarySealer {
+        val ephemeralPk = generateEphemeralKey()
+        val epk = EthereumSigner.compressedPublicKey(ephemeralPk)
+        val aesKey = sealedKey(ephemeralPk, recipientPublicKeyHex)
+            ?: throw IllegalArgumentException("invalid key material")
+        val proof = EthereumSigner.signDigest(bindDigest(recipientAddress, epk), senderPrivateKeyHex)
+        return BinarySealer(ephemeralPk, epk, aesKey, proof)
+    }
+
+    fun sealBinary(sealer: BinarySealer, payload: ByteArray): ByteArray {
+        val iv = ByteArray(12).also { java.security.SecureRandom().nextBytes(it) }
+        return sealBinary(sealer, payload, iv)
+    }
+
+    internal fun sealBinary(sealer: BinarySealer, payload: ByteArray, iv: ByteArray): ByteArray {
+        val ct = aesGcm(Cipher.ENCRYPT_MODE, sealer.aesKey, iv, sealer.proofBytes + payload)
+        return byteArrayOf(0x02) + hexToBytes(sealer.epkHex) + iv + ct
+    }
+
+    /** @return (sender lowercase, payload), or null — same contract as [open]. */
+    fun openBinary(wire: ByteArray, myPrivateKeyHex: String, myAddress: String): Pair<String, ByteArray>? {
+        return try {
+            if (wire.size < 1 + 33 + 12 + 65 || wire[0].toInt() != 0x02) return null
+            val epk = EthereumSigner.toHex(wire.copyOfRange(1, 34))
+            val iv = wire.copyOfRange(34, 46)
+            val aesKey = sealedKey(myPrivateKeyHex, epk) ?: return null
+            val pt = aesGcm(Cipher.DECRYPT_MODE, aesKey, iv, wire.copyOfRange(46, wire.size))
+            if (pt.size < 65) return null
+            val sender = ecrecover(bindDigest(myAddress, epk), pt.copyOfRange(0, 65)) ?: return null
+            sender to pt.copyOfRange(65, pt.size)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // ===== v1 pair-static key (DM storage chunks) =====
+    // Web dmCrypto.deriveSharedKey / bridge _dmKey — the v1 salt is domain
+    // separation from the sealed v2 scheme. Chunk rows are [iv:12][ct+tag].
+
+    fun pairKey(myPrivateKeyHex: String, peerPublicKeyHex: String): ByteArray? {
+        val shared = ecdhX(myPrivateKeyHex, peerPublicKeyHex) ?: return null
+        return hkdfSha256(shared, "pombo-dm-e2e-v1".toByteArray(), "aes-256-gcm".toByteArray())
+    }
+
+    fun pairSeal(payload: ByteArray, key: ByteArray): ByteArray {
+        val iv = ByteArray(12).also { java.security.SecureRandom().nextBytes(it) }
+        return pairSeal(payload, key, iv)
+    }
+
+    internal fun pairSeal(payload: ByteArray, key: ByteArray, iv: ByteArray): ByteArray =
+        iv + aesGcm(Cipher.ENCRYPT_MODE, key, iv, payload)
+
+    fun pairOpen(row: ByteArray, key: ByteArray): ByteArray? {
+        return try {
+            if (row.size < 12 + 16) return null
+            aesGcm(Cipher.DECRYPT_MODE, key, row.copyOfRange(0, 12), row.copyOfRange(12, row.size))
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** HKDF(x-coord of ECDH, v2 salt) — the sealed-envelope AES key, both directions. */
+    internal fun sealedKey(privHex: String, pubCompressedHex: String): ByteArray? {
+        val shared = ecdhX(privHex, pubCompressedHex) ?: return null
+        return hkdfSha256(shared, "pombo-dm-sealed-v2".toByteArray(), "aes-256-gcm".toByteArray())
+    }
+
+    internal fun bindDigest(recipientAddress: String, epkHex: String): ByteArray =
+        keccak256("POMBO_DM_BIND_V2|${recipientAddress.lowercase()}|$epkHex".toByteArray(Charsets.UTF_8))
+
+    /** Throwaway secp256k1 key straight from the CSPRNG — retry the ~2^-128 out-of-range draw. */
+    fun generateEphemeralKey(): String {
+        val random = java.security.SecureRandom()
+        repeat(4) {
+            val bytes = ByteArray(32).also { random.nextBytes(it) }
+            val k = BigInteger(1, bytes)
+            if (k.signum() > 0 && k < N) return EthereumSigner.toHex(bytes)
+        }
+        throw IllegalStateException("Could not generate a valid ephemeral key")
+    }
+
+    private fun aesGcm(mode: Int, key: ByteArray, iv: ByteArray, data: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(mode, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        return cipher.doFinal(data)
     }
 
     /** x-coordinate (32 bytes) of privKey × pubKey — ethers computeSharedSecret bytes 1..33. */

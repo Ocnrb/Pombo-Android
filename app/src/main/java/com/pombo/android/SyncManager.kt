@@ -32,6 +32,7 @@ class SyncManager(
     private val store: com.pombo.android.data.SyncStore,
     private val blobStore: com.pombo.android.core.ImageBlobStore,
     private val myAddress: () -> String?,
+    private val myPrivateKey: () -> String?,
     private val isGuest: () -> Boolean,
     /** Snapshot of this device's state, in the web's payload shape. */
     private val exportLocal: () -> JSONObject,
@@ -121,13 +122,7 @@ class SyncManager(
             // Sealed-to-self v2 under a throwaway publisher (web pushSync):
             // only this account's static key opens it, and the proof inside
             // recovers to this wallet — which the pull verifies.
-            val pk = bridge.call("getMyPublicKey").getString("publicKey")
-            bridge.call("dmSealPublish", JSONObject()
-                .put("streamId", inbox)
-                .put("partition", StreamConstants.P_SYNC)
-                .put("recipientAddress", myAddress()!!.lowercase())
-                .put("recipientPublicKey", pk)
-                .put("message", payload), 60_000)
+            sealPublishToSelf(inbox, StreamConstants.P_SYNC, payload)
 
             // Our own snapshot is by definition already applied locally.
             store.recordApplied(listOf(ts))
@@ -278,17 +273,11 @@ class SyncManager(
         if (pending.isEmpty()) return
         if (!inboxExists()) return
 
-        val pk = bridge.call("getMyPublicKey").getString("publicKey")
-        val meAddr = myAddress()?.lowercase() ?: return
+        if (myAddress() == null) return
 
         // Sealed-to-self v2 under a throwaway publisher, one seal per message.
         suspend fun publish(payload: JSONObject) {
-            bridge.call("dmSealPublish", JSONObject()
-                .put("streamId", inbox)
-                .put("partition", StreamConstants.P_SYNC_BLOBS)
-                .put("recipientAddress", meAddr)
-                .put("recipientPublicKey", pk)
-                .put("message", payload), 60_000)
+            sealPublishToSelf(inbox, StreamConstants.P_SYNC_BLOBS, payload)
         }
 
         for (record in pending) {
@@ -440,20 +429,44 @@ class SyncManager(
         return out
     }
 
-    /** One dmOpenBatch over a resend page; null-per-entry for anything not v2-sealed or not ours. */
+    /** Native sealed open over a resend page; null-per-entry for anything not v2-sealed or not ours. */
     private suspend fun openAllSealed(arr: JSONArray): JSONArray? {
-        val items = JSONArray()
-        for (i in 0 until arr.length()) {
-            val content = arr.optJSONObject(i)?.opt("content")
-            items.put(
-                if (content is JSONObject && content.optInt("v") == 2 && content.has("epk")) content
-                else JSONObject.NULL
-            )
+        val myPk = myPrivateKey() ?: return null
+        val me = myAddress() ?: return null
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            val out = JSONArray()
+            for (i in 0 until arr.length()) {
+                val content = arr.optJSONObject(i)?.opt("content")
+                val opened =
+                    if (content is JSONObject && content.optInt("v") == 2 && content.has("epk"))
+                        com.pombo.android.core.SealedSenderCrypto.open(content, myPk, me)
+                    else null
+                out.put(
+                    opened?.let { JSONObject().put("sender", it.first).put("message", it.second) }
+                        ?: JSONObject.NULL
+                )
+            }
+            out
         }
-        return try {
-            bridge.call("dmOpenBatch", JSONObject().put("items", items), 60_000)
-                .optJSONArray("results")
-        } catch (e: Exception) { null }
+    }
+
+    /**
+     * Sealed-to-self v2, sealed natively — the identity key never enters the
+     * WebView; the throwaway key crosses because it is also the publishing
+     * identity (bridge publishAs).
+     */
+    private suspend fun sealPublishToSelf(streamId: String, partition: Int, payload: JSONObject) {
+        val myPk = myPrivateKey() ?: return
+        val me = myAddress()?.lowercase() ?: return
+        val recipientPub = com.pombo.android.core.EthereumSigner.compressedPublicKey(myPk)
+        val (envelope, ephemeralPk) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            com.pombo.android.core.SealedSenderCrypto.seal(payload, myPk, me, recipientPub)
+        }
+        bridge.call("publishAs", JSONObject()
+            .put("streamId", streamId)
+            .put("partition", partition)
+            .put("content", envelope)
+            .put("privateKey", ephemeralPk), 60_000)
     }
 
     private suspend fun inboxExists(): Boolean = try {

@@ -31,8 +31,11 @@
 <script>
 'use strict';
 
-// Token substituted by Kotlin before load (empty = no identity yet).
-const BRIDGE_PK = '__BRIDGE_PK__';
+// Tokens substituted by Kotlin before load (empty = no identity yet). The
+// private key never enters this page: every signature is delegated to the
+// native oracle (Native.signMessagePayload / Native.signTransactionPayload).
+const BRIDGE_ADDRESS = '__BRIDGE_ADDR__';
+const BRIDGE_PUBKEY = '__BRIDGE_PUB__';
 
 // Polygon RPCs. The user's preference (Settings → API) is injected by Kotlin;
 // when nothing is injected we fall back to the endpoints that answer CORS in
@@ -64,7 +67,7 @@ const ENS_DECOY_COUNT = 2;
 let ensProviders = null;
 
 let client = null;   // StreamrClient (only with an identity)
-let wallet = null;   // ethers.Wallet of the active identity
+let wallet = null;   // { address, publicKey } of the active identity — never the key
 const subs = new Map();       // 'streamId|partition' -> subscription
 const pubChains = new Map();  // 'streamId|partition' -> promise chain (publish order)
 // 'streamId|partition' -> channel password, for BINARY payloads only (see
@@ -77,11 +80,6 @@ const subPasswords = new Map();
 // with EncryptionType.NONE under a throwaway identity, sealed at the app
 // layer (sealed sender v2); a DECRYPT_ERROR on a subscription is foreign
 // traffic or pre-migration history and there is no key left to add for it.
-//
-// peerPublicKeyHex -> Promise<CryptoKey> (v1 pair AES key; see api._dmKey).
-// Still used by DM STORAGE CHUNKS only: the web kept chunk rows on the v1
-// pair-static key (no epk per row), so the seal/open here must match.
-const dmSharedKeyCache = {};
 // Push wake-signal constants (web CONFIG.push). tagBytes=1 keeps 256 possible
 // tags, which is what gives K-anonymity while the user base is small.
 const PUSH_TAG_BYTES = 1;
@@ -475,24 +473,21 @@ const api = {
         return String(streamId).replace(/-[123]$/, '');
     },
 
-    _channelIdentity(streamId) {
+    // Kotlin mints the channel pseudonym natively (ChannelIdentities) and
+    // hands the entry in with the publish; the page only caches it so the
+    // chunk publishes reuse the same pseudonym as the announce.
+    _channelIdentity(streamId, provided) {
         const key = api._baseChannelId(streamId);
+        if (provided && provided.identityPk) {
+            api._channelIdentities[key] = {
+                identityPk: String(provided.identityPk),
+                publisherId: String(provided.publisherId),
+                proof: String(provided.proof)
+            };
+        }
         const existing = api._channelIdentities[key];
-        if (existing) return existing;
-        if (!wallet) throw new Error('no identity');
-        const pk = api._genEphemeralPk();
-        const publisherId = new window.ethers.Wallet(pk).address;
-        // One proof per key, reused by every message: the digest covers only
-        // the publisher (POMBO_PUB_V1), so it does not change until rotation.
-        const digest = window.ethers.keccak256(window.ethers.toUtf8Bytes(
-            'POMBO_PUB_V1|' + publisherId.toLowerCase()));
-        const entry = {
-            identityPk: pk,
-            publisherId: publisherId,
-            proof: new window.ethers.SigningKey(wallet.privateKey).sign(digest).serialized
-        };
-        api._channelIdentities[key] = entry;
-        return entry;
+        if (!existing) throw new Error('no channel identity for ' + streamId);
+        return existing;
     },
 
     async dropChannelIdentity(a) {
@@ -526,7 +521,7 @@ const api = {
     //   { streamId, partition, content, password? } -> { ok, timestamp }
     async publishAsChannel(a) {
         api._refuseAdminStream(a.streamId);
-        const entry = api._channelIdentity(a.streamId);
+        const entry = api._channelIdentity(a.streamId, a.identity);
         const payload = api._stripLocalFields(a.content);
         payload.proof = entry.proof;
         // A password-sealed payload goes out as a JSON STRING (base64), same
@@ -555,7 +550,7 @@ const api = {
     //   { streamId, partition, content } -> { ok, timestamp }
     async publishAsAccount(a) {
         if (!wallet) throw new Error('no identity');
-        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+        const identity = nativeIdentity;
         const msg = await api._publishAs(identity, a.streamId, a.partition, a.content);
         return { ok: true, timestamp: msg.timestamp };
     },
@@ -575,7 +570,7 @@ const api = {
         if (!st || st.ERC_1271 == null) {
             throw new Error('SignatureType.ERC_1271 not exposed — refresh pombo-vendor.bundle.js');
         }
-        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+        const identity = nativeIdentity;
         const data = a.contentB64 != null ? b64ToU8(a.contentB64) : a.content;
         const msg = await api._publishAs(identity, a.streamId, a.partition, data, {
             // LOWERCASE, always — Trap 4: a checksummed publisherId makes every
@@ -680,28 +675,10 @@ const api = {
                             console.warn('binary decrypt failed on ' + a.streamId +
                                 '#' + a.partition + ': ' + (e && e.message || e));
                         });
-                    } else if (wallet && String(a.streamId).toLowerCase() ===
-                            wallet.address.toLowerCase() + '/pombo-dm-2') {
-                        // A binary on MY OWN DM inbox is a sealed-sender 0x02
-                        // envelope: the epk in the header is everything needed
-                        // to open it with our static key — no peer registry,
-                        // no publisher hint (the publisher is a throwaway).
-                        // The recovered sender rides to Kotlin as `account`;
-                        // what does not open is not ours and is dropped, which
-                        // also covers the 1-in-256 legacy v1 payload whose
-                        // random IV byte happens to be 0x02.
-                        api._openBinary(bin).then(function (opened) {
-                            if (!opened) {
-                                console.warn('DM binary did not open on ' + a.streamId +
-                                    '#' + a.partition + ' — dropped');
-                                return;
-                            }
-                            metaOut.account = opened.sender;
-                            deliver(opened.bytes);
-                        }, function (e) {
-                            console.warn('DM binary open failed: ' + (e && e.message || e));
-                        });
                     } else {
+                        // Sealed DM pieces (0x02 on the own inbox) cross RAW:
+                        // Kotlin opens them natively (SealedSenderCrypto) with
+                        // the static key that never enters this page.
                         deliver(bin);
                     }
                     return;
@@ -1185,220 +1162,6 @@ const api = {
         return { address: null };
     },
 
-    // ===== DMs — sealed sender v2, byte-compatible with web dmCrypto.js =====
-    //
-    // v1 derived the conversation key from ECDH(sender.static, recipient.static),
-    // so the recipient had to know WHO sent a message before picking a key —
-    // the sender's identity had to ride the publisherId, handing the full
-    // (sender → recipient) edge to anyone watching the inbox stream.
-    //
-    // v2 replaces the sender's static key with a throwaway one:
-    //
-    //     AES = HKDF( ECDH(ephemeral.priv, recipient.staticPub) )
-    //
-    // The recipient does ECDH with its OWN static key and the cleartext `epk`
-    // — no idea who sent it, and no need to guess. O(1), not trial decryption.
-    // The real sender is inside the ciphertext, as `p`: a signature binding
-    // their wallet to this ephemeral key FOR THIS RECIPIENT, so a captured
-    // proof cannot be replayed into someone else's inbox. The same ephemeral
-    // key doubles as the Streamr publishing identity.
-
-    // Throwaway secp256k1 key from the CSPRNG directly — never from a wallet
-    // helper. A uniform 32-byte value can land outside the curve order
-    // (~2^-128); retrying is free, so we do.
-    _genEphemeralPk() {
-        for (var attempt = 0; attempt < 4; attempt++) {
-            var candidate = window.ethers.hexlify(crypto.getRandomValues(new Uint8Array(32)));
-            try { new window.ethers.SigningKey(candidate); return candidate; }
-            catch (e) { /* out of range — draw again */ }
-        }
-        throw new Error('Could not generate a valid ephemeral key');
-    },
-
-    // keccak256("POMBO_DM_BIND_V2|" + lowercase(recipient) + "|" + epk)
-    _bindDigestV2(recipientAddress, ephemeralPublicKey) {
-        return window.ethers.keccak256(window.ethers.toUtf8Bytes(
-            'POMBO_DM_BIND_V2|' + String(recipientAddress).toLowerCase() + '|' + ephemeralPublicKey));
-    },
-
-    // Symmetric: the sender passes (ephemeral.priv, recipient.staticPub), the
-    // recipient passes (own static priv, envelope epk). The salt differs from
-    // v1 ('pombo-dm-e2e-v1') ON PURPOSE — domain separation so the two schemes
-    // can never derive the same key from the same secret. No cache: every
-    // envelope has a fresh epk, so there is nothing to hit.
-    async _sealedKey(privateKeyHex, publicKeyHex) {
-        const sk = new window.ethers.SigningKey(privateKeyHex);
-        const sharedBytes = window.ethers.getBytes(sk.computeSharedSecret(publicKeyHex)).slice(1, 33);
-        const km = await crypto.subtle.importKey('raw', sharedBytes, { name: 'HKDF' }, false, ['deriveKey']);
-        return crypto.subtle.deriveKey(
-            { name: 'HKDF', hash: 'SHA-256',
-              salt: new TextEncoder().encode('pombo-dm-sealed-v2'),
-              info: new TextEncoder().encode('aes-256-gcm') },
-            km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-    },
-
-    // Seal a JSON message and publish it under the ephemeral key, in one call
-    // — the ephemeral private key never crosses the bridge and dies here.
-    //   { streamId, partition, recipientAddress, recipientPublicKey, message }
-    //   -> { ok, timestamp, epk }
-    async dmSealPublish(a) {
-        if (!wallet) throw new Error('no identity');
-        api._refuseAdminStream(a.streamId);
-        const ephemeralPrivateKey = api._genEphemeralPk();
-        const epk = new window.ethers.SigningKey(ephemeralPrivateKey).compressedPublicKey;
-
-        const aesKey = await api._sealedKey(ephemeralPrivateKey, String(a.recipientPublicKey));
-        const digest = api._bindDigestV2(a.recipientAddress, epk);
-        const proof = new window.ethers.SigningKey(wallet.privateKey).sign(digest).serialized;
-
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const pt = new TextEncoder().encode(JSON.stringify(Object.assign({ p: proof }, a.message)));
-        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, aesKey, pt));
-
-        const envelope = { v: 2, epk: epk, ct: u8ToB64(ct), iv: u8ToB64(iv), e: 'aes-256-gcm' };
-        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(ephemeralPrivateKey);
-        const msg = await api._publishAs(identity, a.streamId, a.partition, envelope);
-        return { ok: true, timestamp: msg.timestamp, epk: epk };
-    },
-
-    // Open sealed envelopes addressed to us. Batched for history pages — the
-    // per-item cost is one ECDH+HKDF+AES (~1ms); the bridge hop is what the
-    // batch saves. Entries that are not v2 envelopes, do not decrypt (not
-    // ours / tampered), or carry no proof come back null — per-item, so one
-    // bad row never takes the page down.
-    //
-    // The digest is recomputed with OUR OWN address: a proof bound to someone
-    // else's inbox recovers a different, meaningless address rather than
-    // "failing". The sender is only knowable AFTER this — that inversion is
-    // the whole point of sealed sender (open first, identify after).
-    //   { items: [envelope|null] } -> { results: [{ sender, message } | null] }
-    async dmOpenBatch(a) {
-        if (!wallet) throw new Error('no identity');
-        const myAddress = wallet.address;
-        const out = await Promise.all((a.items || []).map(async function (env) {
-            try {
-                if (!env || env.v !== 2 || typeof env.epk !== 'string' ||
-                    typeof env.ct !== 'string' || typeof env.iv !== 'string') return null;
-                const aesKey = await api._sealedKey(wallet.privateKey, env.epk);
-                const pt = await crypto.subtle.decrypt(
-                    { name: 'AES-GCM', iv: b64ToU8(env.iv) }, aesKey, b64ToU8(env.ct));
-                const inner = JSON.parse(new TextDecoder().decode(new Uint8Array(pt)));
-                if (!inner || typeof inner.p !== 'string') return null;
-                const digest = api._bindDigestV2(myAddress, env.epk);
-                const sender = window.ethers.recoverAddress(digest, inner.p).toLowerCase();
-                delete inner.p;
-                return { sender: sender, message: inner };
-            } catch (e) { return null; }
-        }));
-        return { results: out };
-    },
-
-    // ===== sealed sender — binary (media pieces / storage chunks) =====
-    //
-    //   wire:      [v:1=0x02][epk:33][iv:12][ct:...]
-    //   plaintext: [proof:65][payload:...]
-    //
-    // ONE EPHEMERAL KEY PER TRANSFER, not per piece: epk and proof are fixed
-    // for the transfer, so the sealer computes them once and every piece
-    // reuses them. Kotlin owns the sealer's lifetime via an opaque key (one
-    // per file+peer); the ephemeral private key never leaves this map.
-    _binarySealers: {},
-
-    //   { key, recipientAddress, recipientPublicKey } -> { epk }
-    async dmBinarySealerCreate(a) {
-        if (!wallet) throw new Error('no identity');
-        const existing = api._binarySealers[a.key];
-        if (existing) return { epk: existing.epk };
-        const ephemeralPrivateKey = api._genEphemeralPk();
-        const epk = new window.ethers.SigningKey(ephemeralPrivateKey).compressedPublicKey;
-        const aesKey = await api._sealedKey(ephemeralPrivateKey, String(a.recipientPublicKey));
-        const digest = api._bindDigestV2(a.recipientAddress, epk);
-        const proofBytes = window.ethers.getBytes(
-            new window.ethers.SigningKey(wallet.privateKey).sign(digest).serialized);
-        api._binarySealers[a.key] = {
-            epk: epk,
-            epkBytes: window.ethers.getBytes(epk),
-            aesKey: aesKey,
-            proofBytes: proofBytes,
-            identityPk: ephemeralPrivateKey
-        };
-        return { epk: epk };
-    },
-
-    async dmBinarySealerDrop(a) {
-        delete api._binarySealers[a.key];
-        return { ok: true };
-    },
-
-    // Per-transfer throwaway PUBLISHING identity for DM storage chunks. The
-    // chunk bytes stay on the v1 pair key (no epk in the row — see
-    // bridgePublishStorageChunk); only the publisher is disposable. Kotlin
-    // needs the address back: upload verification matches stored rows by
-    // timestamp AND this publisher, exactly as the web passes chunkPublisher.
-    _chunkIdentities: {},
-
-    //   { key } -> { address }
-    async dmChunkIdentityCreate(a) {
-        var pk = api._chunkIdentities[a.key];
-        if (!pk) {
-            pk = api._genEphemeralPk();
-            api._chunkIdentities[a.key] = pk;
-        }
-        return { address: new window.ethers.Wallet(pk).address.toLowerCase() };
-    },
-
-    async dmChunkIdentityDrop(a) {
-        delete api._chunkIdentities[a.key];
-        return { ok: true };
-    },
-
-    // The channel identity's on-wire address, for storage-chunk upload verify:
-    // channel chunks publish under this identity (channelEphemeral), and verify
-    // matches stored rows by (timestamp, publisherId == this). Uses the same
-    // getUserId() the publish path stamps, lowercased for the comparison.
-    async channelIdentityAddress(a) {
-        const entry = api._channelIdentity(a.streamId);
-        const identity = window.EthereumKeyPairIdentity.fromPrivateKey(entry.identityPk);
-        return { address: String(await identity.getUserId()).toLowerCase() };
-    },
-
-    async _sealBinaryWith(sealer, bytes) {
-        const plain = new Uint8Array(sealer.proofBytes.length + bytes.length);
-        plain.set(sealer.proofBytes, 0);
-        plain.set(bytes, sealer.proofBytes.length);
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const ct = new Uint8Array(await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv: iv }, sealer.aesKey, plain));
-        const out = new Uint8Array(1 + sealer.epkBytes.length + 12 + ct.length);
-        out[0] = 0x02;
-        out.set(sealer.epkBytes, 1);
-        out.set(iv, 1 + sealer.epkBytes.length);
-        out.set(ct, 1 + sealer.epkBytes.length + 12);
-        return out;
-    },
-
-    // Open a sealed binary envelope with our own static key. Returns null on
-    // anything that is not ours — including the 1-in-256 legacy v1 payload
-    // whose random IV byte happens to be 0x02, which is why detection is
-    // try-and-fall-back, never a bare byte test.
-    async _openBinary(bytes) {
-        try {
-            // 1 + 33 + 12 + 16 (tag) + 65 (proof) = 127 = shortest legal envelope
-            if (!bytes || bytes.length < 127 || bytes[0] !== 0x02) return null;
-            const epk = window.ethers.hexlify(bytes.slice(1, 34));
-            const aesKey = await api._sealedKey(wallet.privateKey, epk);
-            const plain = new Uint8Array(await crypto.subtle.decrypt(
-                { name: 'AES-GCM', iv: bytes.slice(34, 46) }, aesKey, bytes.slice(46)));
-            if (plain.length < 65) return null;
-            const digest = api._bindDigestV2(wallet.address, epk);
-            const sender = window.ethers.recoverAddress(
-                digest, window.ethers.hexlify(plain.slice(0, 65))).toLowerCase();
-            return { sender: sender, bytes: plain.slice(65) };
-        } catch (e) { return null; }
-    },
-
-    // ===== DMs (E2E) — byte-compatible with dmCrypto.js =====
-
     // ===== push notifications (wake signals) =====
     //
     // Mirror of pushProtocol.js. The proof-of-work loop runs here rather than
@@ -1456,13 +1219,6 @@ const api = {
         throw new Error('PoW timeout - could not find valid nonce');
     },
 
-    // Compressed public key of the active identity (33 bytes hex).
-    async getMyPublicKey() {
-        if (!wallet) throw new Error('no identity');
-        const sk = new window.ethers.SigningKey(wallet.privateKey);
-        return { publicKey: sk.compressedPublicKey };
-    },
-
     // Reads the peer's compressed pubkey from the `pk` field of their inbox metadata.
     async getPeerPublicKey(a) {
         if (!client) throw new Error('client not connected');
@@ -1487,29 +1243,6 @@ const api = {
         } catch (e) { return { publicKey: null }; }
     },
 
-    // Derives the shared AES-GCM key (ECDH x-coord -> HKDF-SHA256) — same as
-    // dmCrypto.deriveSharedKey. Cached per peer (web dmCrypto.js:82-88 keeps
-    // the same cache): an inbox replay used to run 100 ECDH+HKDF derivations
-    // for the same handful of peers. The page reloads on identity switch, so
-    // the cache can never mix wallets.
-    async _dmKey(peerPublicKeyHex) {
-        var cached = dmSharedKeyCache[peerPublicKeyHex];
-        if (cached) return cached;
-        const promise = (async function () {
-            const sk = new window.ethers.SigningKey(wallet.privateKey);
-            const sharedHex = sk.computeSharedSecret(peerPublicKeyHex);
-            const sharedBytes = window.ethers.getBytes(sharedHex).slice(1, 33);
-            const km = await crypto.subtle.importKey('raw', sharedBytes, { name: 'HKDF' }, false, ['deriveKey']);
-            return crypto.subtle.deriveKey(
-                { name: 'HKDF', hash: 'SHA-256',
-                  salt: new TextEncoder().encode('pombo-dm-e2e-v1'),
-                  info: new TextEncoder().encode('aes-256-gcm') },
-                km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-        })();
-        dmSharedKeyCache[peerPublicKeyHex] = promise;
-        promise.catch(function () { delete dmSharedKeyCache[peerPublicKeyHex]; });
-        return promise;
-    },
 
     // Publisher-proof recovery (web publisherProof.js recoverPublisherAccount):
     //
@@ -1552,120 +1285,35 @@ const api = {
         return { addresses: out };
     },
 
-    // v1 JSON envelopes (dmEncrypt/dmDecrypt/dmDecryptBatch) and the per-peer
-    // key registry (registerDmPeerKey) are gone: every JSON DM surface is
-    // sealed sender v2 now (dmSealPublish/dmOpenBatch), and the binary receive
-    // path opens by the epk in the envelope. _dmKey stays for the one v1
-    // survivor — DM storage chunks.
-
     // DM storage-chunk download: resend a time window from the RECEIVER's OWN
     // inbox (a DM inbox is private at the Streamr layer, so direct HTTP would
-    // return SDK ciphertext — the download reads via SDK resend only) and open
-    // each binary chunk with the pair's ECDH key. Returns the DECRYPTED packed
-    // chunk bytes (base64) — the ECDH decrypt IS the integrity check, so a
-    // foreign/tampered row simply fails to open and is skipped.
+    // return SDK ciphertext — the download reads via SDK resend only). Rows
+    // cross back SEALED — Kotlin opens them with the pair's ECDH key
+    // (SealedSenderCrypto.pairOpen), so the static key never enters this page
+    // and the failed-open skip lives with the key.
     //
     // Cost note: a window can carry many 240KB chunks, so the base64 payload
-    // that crosses back can be large. This is the only correct DM path (ECDH +
-    // SDK resend both live here); password/public downloads stay native HTTP.
-    //   { streamId, partition, fromTs, toTs, peerPublicKey, budgetMs? }
-    //   -> { rows: [{ timestamp, publisherId, data: b64(packed chunk) }] }
+    // that crosses back can be large. This is the only correct DM path (the
+    // SDK resend lives here); password/public downloads stay native HTTP.
+    //   { streamId, partition, fromTs, toTs, budgetMs? }
+    //   -> { rows: [{ timestamp, publisherId, data: b64(sealed [iv][ct]) }] }
     async resendStorageChunksDm(a) {
         if (!client) throw new Error('client not connected');
-        const key = await api._dmKey(String(a.peerPublicKey));
         const stream = await client.resend(
             { streamId: a.streamId, partition: a.partition },
             { from: { timestamp: a.fromTs }, to: { timestamp: a.toTs } }
         );
-        // _drainResend's push must stay synchronous — collect sealed rows first,
-        // decrypt after (crypto.subtle is async).
-        const sealed = [];
+        const rows = [];
         await api._drainResend(stream, function (msg) {
             const u8 = asU8(msg.content);
             if (!u8 || u8.length < 28) return; // warm-up ping / non-chunk
-            sealed.push({ ts: msg.timestamp, pub: msg.publisherId != null ? String(msg.publisherId) : null, bytes: u8 });
+            rows.push({
+                timestamp: msg.timestamp,
+                publisherId: msg.publisherId != null ? String(msg.publisherId) : null,
+                data: u8ToB64(u8)
+            });
         }, Date.now() + (a.budgetMs || 60000), { streamId: a.streamId, partition: a.partition });
-        const rows = [];
-        for (let i = 0; i < sealed.length; i++) {
-            try {
-                const s = sealed[i];
-                const pt = new Uint8Array(await crypto.subtle.decrypt(
-                    { name: 'AES-GCM', iv: s.bytes.slice(0, 12) }, key, s.bytes.slice(12)));
-                rows.push({ timestamp: s.ts, publisherId: s.pub, data: u8ToB64(pt) });
-            } catch (e) { /* foreign / tampered — skip */ }
-        }
         return { rows: rows };
-    },
-
-    // ===== Account backup (web secureStorage.exportAccountBackup) =====
-    // Same container the web writes: a Keystore V3 for the private key plus
-    // the app state scrypt-encrypted (N=131072, r=8, p=1, dkLen=32) under
-    // AES-256-GCM with a 16-byte IV. A file made here restores on the web
-    // with the same password, and vice versa.
-
-    // { privateKey, password, payload } -> { backup }
-    async exportBackup(a) {
-        const w = new window.ethers.Wallet(String(a.privateKey).trim());
-        // Keystore V3, same scrypt cost the web keystores use.
-        const keystore = JSON.parse(await w.encrypt(String(a.password)));
-
-        const salt = window.ethers.randomBytes(32);
-        const iv = window.ethers.randomBytes(16);
-        const N = 131072, r = 8, p = 1, dkLen = 32;
-        const derivedKey = await window.ethers.scrypt(
-            window.ethers.toUtf8Bytes(String(a.password)), salt, N, r, p, dkLen);
-        const cryptoKey = await crypto.subtle.importKey(
-            'raw', window.ethers.getBytes(derivedKey), { name: 'AES-GCM' }, false, ['encrypt']);
-        const plaintext = new TextEncoder().encode(JSON.stringify(a.payload));
-        const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, cryptoKey, plaintext);
-
-        return {
-            backup: {
-                format: 'pombo-account-backup',
-                version: 1,
-                exportedAt: a.payload && a.payload.exportedAt,
-                keystore: keystore,
-                encryptedData: {
-                    kdf: 'scrypt',
-                    kdfparams: { n: N, r: r, p: p, dklen: dkLen, salt: window.ethers.hexlify(salt) },
-                    cipher: 'aes-256-gcm',
-                    cipherparams: { iv: window.ethers.hexlify(iv) },
-                    ciphertext: window.ethers.hexlify(new Uint8Array(ciphertext))
-                }
-            }
-        };
-    },
-
-    // { backup, password } -> { privateKey, address, payload }
-    async importBackup(a) {
-        const backup = a.backup;
-        if (!backup || backup.format !== 'pombo-account-backup' || backup.version !== 1) {
-            throw new Error('Invalid backup format. Expected pombo-account-backup v1');
-        }
-        let w;
-        try {
-            w = await window.ethers.Wallet.fromEncryptedJson(JSON.stringify(backup.keystore), String(a.password));
-        } catch (e) {
-            throw new Error('Incorrect password or corrupted backup');
-        }
-        const enc = backup.encryptedData;
-        const derivedKey = await window.ethers.scrypt(
-            window.ethers.toUtf8Bytes(String(a.password)),
-            window.ethers.getBytes(enc.kdfparams.salt),
-            enc.kdfparams.n, enc.kdfparams.r, enc.kdfparams.p, enc.kdfparams.dklen);
-        const cryptoKey = await crypto.subtle.importKey(
-            'raw', window.ethers.getBytes(derivedKey), { name: 'AES-GCM' }, false, ['decrypt']);
-        let payload;
-        try {
-            const pt = await crypto.subtle.decrypt(
-                { name: 'AES-GCM', iv: window.ethers.getBytes(enc.cipherparams.iv) },
-                cryptoKey,
-                window.ethers.getBytes(enc.ciphertext));
-            payload = JSON.parse(new TextDecoder().decode(pt));
-        } catch (e) {
-            throw new Error('Failed to decrypt backup data');
-        }
-        return { privateKey: w.privateKey, address: w.address, payload: payload };
     },
 
     // Creates the caller's own DM inbox (message + ephemeral streams) on-chain.
@@ -2060,7 +1708,7 @@ const api = {
 
     _gateSigner() {
         if (!wallet) throw new Error('no identity');
-        return new window.ethers.Wallet(wallet.privateKey, api._gateProvider());
+        return new NativeSigner(api._gateProvider());
     },
 
     async _gateTx(gateAddress, method, args) {
@@ -2345,25 +1993,14 @@ window.bridgePublishBinary = function (id, argsB64, dataB64) {
         if (!client) throw new Error('client not connected');
         const a = JSON.parse(b64ToUtf8(argsB64));
         let bytes = b64ToU8(dataB64);
-        // Channel piece under the channel's ephemeral identity (web media.js
-        // FILE_PIECE_SIGNED): the 0x01 frame from Kotlin is rewritten as
-        //   [0x03][proof:65][fileId:36][idx:4][data]
-        // with the channel identity's proof — computed once per channel
-        // session, reused by every piece — THEN password-sealed, and
-        // published under that same identity. A wallet-published piece would
-        // undo the pseudonym for the whole transfer.
-        if (a.channelEphemeral) {
-            if (bytes.length < 1 || bytes[0] !== 0x01) throw new Error('channelEphemeral expects a 0x01 piece frame');
-            const entry = api._channelIdentity(a.streamId);
-            const proofBytes = window.ethers.getBytes(entry.proof);
-            const signed = new Uint8Array(1 + proofBytes.length + (bytes.length - 1));
-            signed[0] = 0x03;
-            signed.set(proofBytes, 1);
-            signed.set(bytes.subarray(1), 1 + proofBytes.length);
-            bytes = signed;
+        // Pre-framed piece from Kotlin (0x02 sealed DM or 0x03 channel frame
+        // with the native proof — SealedSenderCrypto/ChannelIdentities): the
+        // page only password-seals if asked (PBKDF2 stays in BoringSSL) and
+        // publishes under the given throwaway identity. No key material read.
+        if (a.identityPk) {
             if (a.password) bytes = await pwEncryptBinary(bytes, String(a.password));
-            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(entry.identityPk);
-            await api._publishAs(identity, a.streamId, a.partition, bytes);
+            const identityI = window.EthereumKeyPairIdentity.fromPrivateKey(a.identityPk);
+            await api._publishAs(identityI, a.streamId, a.partition, bytes);
             Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
             return;
         }
@@ -2378,7 +2015,7 @@ window.bridgePublishBinary = function (id, argsB64, dataB64) {
             if (!st || st.ERC_1271 == null) {
                 throw new Error('SignatureType.ERC_1271 not exposed — refresh pombo-vendor.bundle.js');
             }
-            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+            const identity = nativeIdentity;
             await api._publishAs(identity, a.streamId, a.partition, bytes, {
                 publisherId: String(a.gateAddress).toLowerCase(),
                 signatureType: st.ERC_1271
@@ -2388,7 +2025,7 @@ window.bridgePublishBinary = function (id, argsB64, dataB64) {
         }
         if (a.asAccount) {
             if (!wallet) throw new Error('no identity');
-            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+            const identity = nativeIdentity;
             await api._publishAs(identity, a.streamId, a.partition, bytes);
             Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
             return;
@@ -2397,19 +2034,6 @@ window.bridgePublishBinary = function (id, argsB64, dataB64) {
         // BoringSSL rather than Bouncy Castle. The password never leaves the
         // WebView on this path — Kotlin hands over plaintext bytes.
         if (a.password) bytes = await pwEncryptBinary(bytes, String(a.password));
-        // DM piece: sealed-sender 0x02 envelope (web dmCrypto.createBinarySealer),
-        // one ephemeral key per transfer, published UNDER that same throwaway
-        // identity — the wallet address never appears on the wire. Mutually
-        // exclusive with password by construction — a DM has no channel password.
-        else if (a.dmSealerKey) {
-            const sealer = api._binarySealers[a.dmSealerKey];
-            if (!sealer) throw new Error('unknown dm sealer: ' + a.dmSealerKey);
-            bytes = await api._sealBinaryWith(sealer, bytes);
-            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(sealer.identityPk);
-            await api._publishAs(identity, a.streamId, a.partition, bytes);
-            Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
-            return;
-        }
         await client.publish({ streamId: a.streamId, partition: a.partition }, bytes);
         Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
     }).catch(function (e) {
@@ -2441,41 +2065,14 @@ window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
         if (!client) throw new Error('client not connected');
         const a = JSON.parse(b64ToUtf8(argsB64));
         let bytes = b64ToU8(dataB64);
-        // DM chunk: sealed with the pair's ECDH key ([12B iv][ct+tag]) — the
-        // web kept storage chunks on the v1 pair-static key ON PURPOSE (no epk
-        // in the chunk row; the download derives the key from the announce's
-        // proof-recovered sender). What DID change is the publisher: chunks go
-        // out under a per-transfer throwaway identity (chunkIdentityKey), so
-        // the wallet address no longer stamps every row of a file transfer.
-        if (a.dmPeerPublicKey) {
-            const key = await api._dmKey(String(a.dmPeerPublicKey));
-            const iv = crypto.getRandomValues(new Uint8Array(12));
-            const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, bytes));
-            const sealed = new Uint8Array(12 + ct.length);
-            sealed.set(iv, 0); sealed.set(ct, 12);
-            bytes = sealed;
-        }
-        if (a.chunkIdentityKey) {
-            const pk = api._chunkIdentities[a.chunkIdentityKey];
-            if (!pk) throw new Error('unknown chunk identity: ' + a.chunkIdentityKey);
-            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(pk);
-            const msg2 = await api._publishAs(identity, a.streamId, a.partition, bytes);
+        // Pre-sealed chunk from Kotlin under a natively-minted identity (DM
+        // per-transfer key or channel pseudonym): just publish and return the
+        // network timestamp — upload verify matches rows by it.
+        if (a.identityPk) {
+            const identityI = window.EthereumKeyPairIdentity.fromPrivateKey(a.identityPk);
+            const msgI = await api._publishAs(identityI, a.streamId, a.partition, bytes);
             Native.result(id, true, utf8ToB64(JSON.stringify(
-                { ok: true, bytes: bytes.length, timestamp: msg2.timestamp })));
-            return;
-        }
-        // Channel chunk (public/password): publish under the channel's own
-        // ephemeral identity — the SAME pseudonym as the announce — so the
-        // wallet does not stamp the channel's -1 stream. The bytes stay sealed
-        // by the native per-file password key (or plaintext on a public
-        // channel); only the publisher changes. Native/readOnly channels do
-        // NOT set this and fall through to the account path below (D3).
-        if (a.channelEphemeral) {
-            const entry = api._channelIdentity(a.streamId);
-            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(entry.identityPk);
-            const msg3 = await api._publishAs(identity, a.streamId, a.partition, bytes);
-            Native.result(id, true, utf8ToB64(JSON.stringify(
-                { ok: true, bytes: bytes.length, timestamp: msg3.timestamp })));
+                { ok: true, bytes: bytes.length, timestamp: msgI.timestamp })));
             return;
         }
         // Epoch channel chunk (native/gated): already epoch-sealed in Kotlin
@@ -2488,7 +2085,7 @@ window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
             if (!st || st.ERC_1271 == null) {
                 throw new Error('SignatureType.ERC_1271 not exposed — refresh pombo-vendor.bundle.js');
             }
-            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+            const identity = nativeIdentity;
             const msg4 = await api._publishAs(identity, a.streamId, a.partition, bytes, {
                 publisherId: String(a.gateAddress).toLowerCase(),
                 signatureType: st.ERC_1271
@@ -2499,7 +2096,7 @@ window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
         }
         if (a.asAccount) {
             if (!wallet) throw new Error('no identity');
-            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+            const identity = nativeIdentity;
             const msg5 = await api._publishAs(identity, a.streamId, a.partition, bytes);
             Native.result(id, true, utf8ToB64(JSON.stringify(
                 { ok: true, bytes: bytes.length, timestamp: msg5.timestamp })));
@@ -2524,6 +2121,60 @@ window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
     });
 };
 
+// Ethers Signer that signs through the native oracle. Transactions go to
+// Native.signTransactionPayload (RLP shape check + ChainGuard window on the
+// Kotlin side); messages to Native.signMessagePayload (EIP-191 applied
+// natively). Used by _gateWallet and by the SDK's registry writes via
+// nativeIdentity.getTransactionSigner.
+class NativeSigner extends window.ethers.AbstractSigner {
+    connect(provider) { return new NativeSigner(provider); }
+    get address() { return BRIDGE_ADDRESS; }
+    async getAddress() { return BRIDGE_ADDRESS; }
+    async signTransaction(txReq) {
+        // AbstractSigner.sendTransaction hands us a Transaction INSTANCE (it
+        // already did `delete pop.from; Transaction.from(pop)`). Its fields are
+        // prototype getters, so Object.assign would copy nothing and we would
+        // sign an empty tx. Use the instance directly; only build from a plain
+        // request on the (unused) direct-call path.
+        const tx = (txReq instanceof window.ethers.Transaction)
+            ? txReq
+            : (function () { const r = Object.assign({}, txReq); delete r.from; return window.ethers.Transaction.from(r); })();
+        const sig = Native.signTransactionPayload(tx.unsignedSerialized);
+        if (!sig) throw new Error('Transaction not confirmed');
+        tx.signature = window.ethers.Signature.from(sig);
+        return tx.serialized;
+    }
+    async signMessage(message) {
+        const bytes = typeof message === 'string'
+            ? window.ethers.toUtf8Bytes(message) : new Uint8Array(message);
+        const sig = Native.signMessagePayload(u8ToB64(bytes));
+        if (!sig) throw new Error('no identity');
+        return sig;
+    }
+    async signTypedData() { throw new Error('signTypedData is not supported'); }
+}
+
+// Streamr Identity that delegates createMessageSignature to the native
+// oracle — the SDK awaits it (vendor MessageSigner:
+// `await identity.createMessageSignature`), so the sync JS→Kotlin hop just
+// resolves immediately.
+const nativeIdentity = {
+    // Mirror the SDK's KeyPairIdentity exactly: getUserId → lowercase hex
+    // string, getUserIdRaw → bytes. Swapping these makes the namespace check
+    // reject every stream ("not a valid Ethereum address" on create).
+    getUserId: async function () { return BRIDGE_ADDRESS.toLowerCase(); },
+    getUserIdRaw: async function () { return window.ethers.getBytes(BRIDGE_ADDRESS); },
+    getSignatureType: function () { return window.SignatureType.ECDSA_SECP256K1_EVM; },
+    createMessageSignature: async function (payload) {
+        const sig = Native.signMessagePayload(u8ToB64(payload));
+        if (!sig) throw new Error('native signer refused');
+        return window.ethers.getBytes(sig);
+    },
+    getTransactionSigner: async function (rpcProviderSource) {
+        return new NativeSigner(rpcProviderSource.getProvider());
+    }
+};
+
 async function boot() {
     try {
         if (!window.StreamrClient || !window.ethers) {
@@ -2531,15 +2182,21 @@ async function boot() {
             return;
         }
         // No identity: ethers-only operations (create/import wallet).
-        if (!BRIDGE_PK || BRIDGE_PK.indexOf('__') === 0) {
+        if (!BRIDGE_ADDRESS || BRIDGE_ADDRESS.indexOf('__') === 0) {
             Native.status('no-identity');
             return;
         }
-        wallet = new window.ethers.Wallet(BRIDGE_PK);
+        const stBoot = window.SignatureType;
+        if (!stBoot || stBoot.ECDSA_SECP256K1_EVM == null) {
+            Native.error('SignatureType.ECDSA_SECP256K1_EVM not exposed — refresh pombo-vendor.bundle.js');
+            return;
+        }
+        wallet = { address: BRIDGE_ADDRESS, publicKey: BRIDGE_PUBKEY };
         Native.status('connecting');
-        // Config identical to the web streamr.js init().
+        // Config identical to the web streamr.js init(), except auth: the key
+        // stays in Kotlin and the SDK signs through nativeIdentity.
         client = new window.StreamrClient({
-            auth: { privateKey: BRIDGE_PK },
+            auth: { identity: nativeIdentity },
             // Without this the SDK publishes node telemetry every minute to
             // streamr.eth/metrics/nodes/firehose/*, signed with the REAL
             // account (auth.privateKey does not count as auth.ethereum, so the

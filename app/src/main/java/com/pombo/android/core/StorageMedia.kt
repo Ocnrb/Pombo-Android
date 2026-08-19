@@ -63,6 +63,8 @@ class StorageMedia(
     private val scope: CoroutineScope,
     /** Staging dir for compressed uploads. Must be under filesDir, never cacheDir. */
     private val transferDir: () -> File,
+    /** DM chunk sealing and channel pseudonyms are native — the key stays in Kotlin. */
+    private val myPrivateKey: () -> String?,
     private val transport: Transport
 ) {
     private companion object {
@@ -251,8 +253,19 @@ class StorageMedia(
     }
 
     // ---- warm-up ----
+    /** Per-transfer DM chunk publishing identities — disposable, in memory only. */
+    private val chunkIdentities = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** The channel pseudonym shared with the announce path (ChannelIdentities). */
+    private fun channelEntry(streamId: String): ChannelIdentities.Entry {
+        val pk = myPrivateKey() ?: throw IllegalStateException("No identity")
+        return ChannelIdentities.entryFor(
+            streamId, EthereumSigner.checksumAddress(EthereumSigner.address(pk)), pk
+        )
+    }
+
     private suspend fun warmUpPartitions(
-        sid: String, firstPartition: Int, channelEphemeral: Boolean,
+        sid: String, firstPartition: Int, identityPk: String?,
         gateAddress: String? = null, asAccount: Boolean = false,
         onStatus: (String) -> Unit
     ) {
@@ -268,7 +281,7 @@ class StorageMedia(
                     try {
                         bridge.publishStorageChunk(
                             sid, firstPartition + k, ping,
-                            channelEphemeral = channelEphemeral,
+                            identityPk = identityPk,
                             gateAddress = gateAddress, asAccount = asAccount
                         )
                     }
@@ -491,12 +504,24 @@ class StorageMedia(
             //               verify expects the gate address.
             //   native/ro → the account; verifyPublisher stays null and verify
             //               falls back to our wallet (D3).
-            val chunkIdentityKey = if (isDm) "chunks|$messageStreamId|$tid" else null
+            // Publishing identities are minted natively now; the pair key that
+            // seals DM chunk bytes is derived once per transfer.
+            val chunkIdentityPk = if (isDm) chunkIdentities.computeIfAbsent("chunks|$messageStreamId|$tid") {
+                SealedSenderCrypto.generateEphemeralKey()
+            } else null
+            val dmChunkKey = if (isDm) {
+                val myPk = myPrivateKey() ?: throw IllegalStateException("No identity")
+                SealedSenderCrypto.pairKey(myPk, dmPeerPublicKey!!)
+                    ?: throw IllegalStateException("Invalid peer public key for DM storage transfer")
+            } else null
+            val publishIdentityPk = when {
+                chunkIdentityPk != null -> chunkIdentityPk
+                channelEphemeral -> channelEntry(messageStreamId).identityPk
+                else -> null
+            }
             val verifyPublisher = when {
-                chunkIdentityKey != null ->
-                    bridge.call("dmChunkIdentityCreate", JSONObject().put("key", chunkIdentityKey)).getString("address")
-                channelEphemeral ->
-                    bridge.call("channelIdentityAddress", JSONObject().put("streamId", messageStreamId)).getString("address")
+                chunkIdentityPk != null -> EthereumSigner.address(chunkIdentityPk)
+                channelEphemeral -> channelEntry(messageStreamId).publisherId.lowercase()
                 gateAddress != null -> gateAddress.lowercase()
                 else -> null
             }
@@ -505,7 +530,7 @@ class StorageMedia(
             // the SDK's group-key AES and break the HTTP hex reader.
             val asAccount = epochKey != null && gateAddress == null
 
-            warmUpPartitions(messageStreamId, firstPart, channelEphemeral, gateAddress, asAccount) { up.phase = it; emit(up) }
+            warmUpPartitions(messageStreamId, firstPart, publishIdentityPk, gateAddress, asAccount) { up.phase = it; emit(up) }
 
             val firstChunkTs = wall()
             val uploadStart = perf()
@@ -568,12 +593,13 @@ class StorageMedia(
                 if (wait > 0) delay(wait.toLong())
             }
             suspend fun publishOne(i: Int): Int {
-                val pay = buildPayload(i)
+                var pay = buildPayload(i)
+                // DM chunk rows stay on the v1 pair key, sealed natively now.
+                if (dmChunkKey != null) pay = SealedSenderCrypto.pairSeal(pay, dmChunkKey)
                 awaitSendSlot()
                 val ts = publishChunkWithRetry(
                     messageStreamId, chunkPartition(i), pay,
-                    if (isDm) dmPeerPublicKey else null, chunkIdentityKey, channelEphemeral,
-                    gateAddress, asAccount
+                    publishIdentityPk, gateAddress, asAccount
                 )
                 chunkTs[i] = ts
                 chunkTsHist.getOrPut(i) { ArrayList() }.add(ts)
@@ -860,10 +886,8 @@ class StorageMedia(
             try { slicer?.close() } catch (e: Exception) { /* closed */ }
             stagingFile?.let { runCatching { it.delete() } }
             // The per-transfer throwaway publisher dies with the transfer —
-            // in memory only, and not even for the rest of the session.
-            if (isDm) runCatching {
-                bridge.call("dmChunkIdentityDrop", JSONObject().put("key", "chunks|$messageStreamId|$tid"))
-            }
+            // native, in memory only, and not even for the rest of the session.
+            if (isDm) chunkIdentities.remove("chunks|$messageStreamId|$tid")
         }
     }
 
@@ -1135,12 +1159,17 @@ class StorageMedia(
      * response is large. [onRow] gets the already-opened packed chunk as content.
      */
     private suspend fun fetchWindowsResendDm(inboxStreamId: String, windows: List<Win>, onRow: (StorageHttp.Row) -> Unit, peerPublicKey: String) {
+        // Rows cross the bridge SEALED; the pair key opens them here — the
+        // ECDH decrypt IS the integrity check, so a foreign/tampered row
+        // simply fails to open and is skipped.
+        val myPk = myPrivateKey() ?: return
+        val pairKey = SealedSenderCrypto.pairKey(myPk, peerPublicKey) ?: return
         for (w in windows) {
             try {
                 val res = bridge.call(
                     "resendStorageChunksDm",
                     JSONObject().put("streamId", inboxStreamId).put("partition", w.partition)
-                        .put("fromTs", w.from).put("toTs", w.to).put("peerPublicKey", peerPublicKey),
+                        .put("fromTs", w.from).put("toTs", w.to),
                     timeoutMs = 180_000
                 )
                 val rows = res.optJSONArray("rows") ?: continue
@@ -1148,7 +1177,8 @@ class StorageMedia(
                     val r = rows.optJSONObject(i) ?: continue
                     val b64 = r.optString("data")
                     if (b64.isEmpty()) continue
-                    val bytes = try { Base64.decode(b64, Base64.NO_WRAP) } catch (e: Exception) { continue }
+                    val sealed = try { Base64.decode(b64, Base64.NO_WRAP) } catch (e: Exception) { continue }
+                    val bytes = SealedSenderCrypto.pairOpen(sealed, pairKey) ?: continue
                     val pub = if (r.isNull("publisherId")) null else r.optString("publisherId")
                     onRow(StorageHttp.Row(bytes, r.optLong("timestamp"), pub))
                 }
@@ -1158,10 +1188,10 @@ class StorageMedia(
         }
     }
 
-    private suspend fun publishChunkWithRetry(sid: String, partition: Int, payload: ByteArray, dmPeerPublicKey: String? = null, chunkIdentityKey: String? = null, channelEphemeral: Boolean = false, gateAddress: String? = null, asAccount: Boolean = false, attempts: Int = 3): Long {
+    private suspend fun publishChunkWithRetry(sid: String, partition: Int, payload: ByteArray, identityPk: String? = null, gateAddress: String? = null, asAccount: Boolean = false, attempts: Int = 3): Long {
         var last: Exception? = null
         for (a in 0 until attempts) {
-            try { return bridge.publishStorageChunk(sid, partition, payload, dmPeerPublicKey, chunkIdentityKey, channelEphemeral, gateAddress, asAccount) }
+            try { return bridge.publishStorageChunk(sid, partition, payload, identityPk, gateAddress, asAccount) }
             catch (e: Exception) { last = e; delay(500L * (a + 1)) }
         }
         throw last ?: IllegalStateException("publish failed")

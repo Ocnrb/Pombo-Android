@@ -111,6 +111,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         store = channelStore,
         scope = viewModelScope,
         myAddress = { store.address },
+        myPrivateKey = { store.privateKey },
         myUsername = { store.username },
         imageStore = imageStore,
         previewStore = previewStore,
@@ -440,6 +441,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         store = syncStore,
         blobStore = blobStore,
         myAddress = { store.address },
+        myPrivateKey = { store.privateKey },
         isGuest = { _isGuest.value },
         exportLocal = { exportSyncState() },
         importMerged = { importSyncState(it) },
@@ -1619,17 +1621,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                 .put("data", exportSyncState())
                 .put("imageBlobs", blobs)
 
-            // Two scrypt runs (keystore + data) at N=131072 in WebView JS —
-            // slow by design, hence the long timeout.
-            val res = bridge.call(
-                "exportBackup",
-                JSONObject().put("privateKey", pk).put("password", password).put("payload", payload),
-                timeoutMs = 300_000
-            )
-            val json = res.getJSONObject("backup").toString(2)
-            withContext(Dispatchers.IO) {
+            // Native (AccountBackup): the key and the multi-MB payload never
+            // cross the bridge. Two scrypt runs at N=131072 — slow by design.
+            withContext(Dispatchers.Default) {
                 getApplication<Application>().contentResolver.openOutputStream(uri, "wt")?.use {
-                    it.write(json.toByteArray(Charsets.UTF_8))
+                    com.pombo.android.core.AccountBackup.export(it, pk, password, payload)
                 } ?: throw IllegalStateException("Could not open the selected file")
             }
         }
@@ -1637,28 +1633,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
 
     /**
      * Restores a `pombo-account-backup` file (made here or on the web):
-     * decrypts via the bridge, adopts the wallet, then feeds the state through
-     * the same import path a sync pull uses and refills the image ledger.
+     * decrypts natively (AccountBackup — no bridge, so it also works in guest
+     * mode), adopts the wallet, then feeds the state through the same import
+     * path a sync pull uses and refills the image ledger.
      */
     fun importBackupFrom(uri: android.net.Uri, password: String) = viewModelScope.launch {
         runWithToast("Restoring backup… this can take a minute", "Backup restored", "Restore failed") {
-            val text = withContext(Dispatchers.IO) {
-                getApplication<Application>().contentResolver.openInputStream(uri)?.use {
-                    it.readBytes().toString(Charsets.UTF_8)
-                }
-            } ?: throw IllegalStateException("Could not read the selected file")
-
-            val res = bridge.call(
-                "importBackup",
-                JSONObject().put("backup", JSONObject(text)).put("password", password),
-                timeoutMs = 300_000
-            )
-            val payload = res.getJSONObject("payload")
+            val res = withContext(Dispatchers.Default) {
+                com.pombo.android.core.AccountBackup.import(
+                    {
+                        getApplication<Application>().contentResolver.openInputStream(uri)
+                            ?: throw IllegalStateException("Could not read the selected file")
+                    },
+                    password
+                )
+            }
+            val payload = res.payload
 
             // Adopt first so every scoped store points at the restored account
             // before any of its data lands.
-            adoptWallet(res.getString("privateKey"), res.getString("address"))
+            adoptWallet(res.privateKey, res.address)
             payload.optJSONObject("data")?.let { importSyncState(it) }
+            // Unlike a sync pull, a restore has no corresponding payload on
+            // the storage node yet — push it, or every other device (and this
+            // one, on its next pull) keeps converging on the pre-backup state.
+            sync.scheduleAutoPush()
 
             payload.optJSONArray("imageBlobs")?.let { arr ->
                 for (i in 0 until arr.length()) {
@@ -2422,7 +2421,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         ) {
         _inboxHealth.value = InboxHealth.Repairing("Starting...")
         try {
-            val pk = bridge.call("getMyPublicKey").getString("publicKey")
+            val pk = com.pombo.android.core.EthereumSigner.compressedPublicKey(
+                store.privateKey ?: throw IllegalStateException("No identity")
+            )
             _inboxHealth.value = InboxHealth.Repairing("Fixing inbox — this may require gas")
             val res = bridge.call(
                 "repairDmInbox",

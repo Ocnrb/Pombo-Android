@@ -174,12 +174,30 @@ fun MainShell(vm: AppViewModel) {
     // Web walletFlows: "Create New Account" opens the avatar/name wizard, not
     // an instant wallet.
     var showAccountSetup by remember { mutableStateOf(false) }
+    // Restore-from-backup, reachable before any account exists (guest mode) —
+    // the same picker + password flow Settings uses.
+    var restoreUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    val restoreLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) restoreUri = uri }
     if (showConnect) ConnectAccountDialog(
         onCreate = { showConnect = false; showAccountSetup = true },
         // Web: import opens its own modal, it does not leave the current view.
         onImport = { showConnect = false; showImportKey = true },
+        onRestore = { showConnect = false; restoreLauncher.launch(arrayOf("application/json", "*/*")) },
         onDismiss = { showConnect = false }
     )
+    restoreUri?.let { uri ->
+        BackupPasswordDialog(
+            title = "Restore Account Backup",
+            hint = "Enter the password this backup was created with.",
+            confirmLabel = "Restore",
+            onDismiss = { restoreUri = null }
+        ) { pwd ->
+            restoreUri = null
+            vm.importBackupFrom(uri, pwd)
+        }
+    }
     if (showAccountSetup) CreateAccountWizard(vm, onDismiss = { showAccountSetup = false })
     if (showImportKey) ImportKeyDialog(
         onDismiss = { showImportKey = false },

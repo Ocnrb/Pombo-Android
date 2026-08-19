@@ -107,6 +107,7 @@ class ChannelManager(
     private val store: ChannelStore,
     private val scope: CoroutineScope,
     private val myAddress: () -> String?,
+    private val myPrivateKey: () -> String?,
     private val myUsername: () -> String?,
     /** Persistent caches so cold starts paint before the network answers. */
     private val imageStore: com.pombo.android.core.ChannelImageStore,
@@ -327,23 +328,24 @@ class ChannelManager(
                     // fileId is already inside the piece frame
                     // [0x01][fileId:36][idx:4][data], so the sealer is keyed
                     // by (fileId, destination stream) without widening the
-                    // Transport interface. The bridge holds the sealer and
-                    // publishes under its throwaway identity.
+                    // Transport interface. Seal is native — the account key
+                    // signs the binding proof in Kotlin; the bridge only
+                    // publishes under the sealer's throwaway identity.
                     val peerAddr = ephemeralStreamId.substringBefore('/').lowercase()
                     val pk = dmMediaPeerKey(ephemeralStreamId)
                         ?: throw IllegalStateException("Peer public key unavailable for DM media")
+                    val myPk = myPrivateKey()
+                        ?: throw IllegalStateException("No identity")
                     val fileId = if (bytes.size >= 37) String(bytes, 1, 36, Charsets.UTF_8) else ""
-                    val sealerKey = "$fileId|$ephemeralStreamId"
-                    bridge.call("dmBinarySealerCreate", JSONObject()
-                        .put("key", sealerKey)
-                        .put("recipientAddress", peerAddr)
-                        .put("recipientPublicKey", pk))
+                    val sealer = dmBinarySealers.computeIfAbsent("$fileId|$ephemeralStreamId") {
+                        com.pombo.android.core.SealedSenderCrypto.binarySealer(myPk, peerAddr, pk)
+                    }
                     bridge.publishBinary(
                         ephemeralStreamId,
                         StreamConstants.EPH_MEDIA_DATA,
-                        bytes,
+                        com.pombo.android.core.SealedSenderCrypto.sealBinary(sealer, bytes),
                         password = null,
-                        dmSealerKey = sealerKey
+                        identityPk = sealer.ephemeralPrivateKeyHex
                     )
                     return
                 }
@@ -373,17 +375,38 @@ class ChannelManager(
                     return
                 }
                 // Channel pieces carry the inline proof (0x03) and publish
-                // under the channel identity.
+                // under the channel identity — frame and proof built natively:
+                //   [0x03][proof:65][fileId:36][idx:4][data]
+                require(bytes.isNotEmpty() && bytes[0].toInt() == 0x01) {
+                    "channel piece expects a 0x01 frame"
+                }
+                val entry = channelIdentity(ephemeralStreamId)
+                val proofBytes = com.pombo.android.core.SealedSenderCrypto.hexToBytes(entry.proof)
+                val framed = ByteArray(1 + proofBytes.size + bytes.size - 1)
+                framed[0] = 0x03
+                System.arraycopy(proofBytes, 0, framed, 1, proofBytes.size)
+                System.arraycopy(bytes, 1, framed, 1 + proofBytes.size, bytes.size - 1)
                 bridge.publishBinary(
                     ephemeralStreamId,
                     StreamConstants.EPH_MEDIA_DATA,
-                    bytes,
+                    framed,
                     password,
-                    channelEphemeral = true
+                    identityPk = entry.identityPk
                 )
             }
         }
     )
+
+    /** One sealed-sender binary sealer per (file, destination stream) — see the DM piece path above. */
+    private val dmBinarySealers =
+        java.util.concurrent.ConcurrentHashMap<String, com.pombo.android.core.SealedSenderCrypto.BinarySealer>()
+
+    /** Natively-minted channel pseudonym for a stream — proof signed in Kotlin. */
+    private fun channelIdentity(streamId: String): com.pombo.android.core.ChannelIdentities.Entry {
+        val addr = myAddress() ?: throw IllegalStateException("No identity")
+        val pk = myPrivateKey() ?: throw IllegalStateException("No identity")
+        return com.pombo.android.core.ChannelIdentities.entryFor(streamId, addr, pk)
+    }
 
     /**
      * On-chain storage-endpoint resolution for the Persistent File Sharing
@@ -417,6 +440,7 @@ class ChannelManager(
         endpoints = storageEndpoints,
         scope = scope,
         transferDir = { transferDir },
+        myPrivateKey = myPrivateKey,
         transport = object : com.pombo.android.core.StorageMedia.Transport {
             override suspend fun publishAnnounce(
                 messageStreamId: String, announce: JSONObject, password: String?, isDm: Boolean
@@ -2818,7 +2842,9 @@ class ChannelManager(
         onProgress: () -> Unit = {}
     ) {
         val me = myAddress()?.lowercase() ?: throw IllegalStateException("No identity")
-        val pk = bridge.call("getMyPublicKey").getString("publicKey")
+        val pk = com.pombo.android.core.EthereumSigner.compressedPublicKey(
+            myPrivateKey() ?: throw IllegalStateException("No identity")
+        )
         val messageStreamId = "$me/Pombo-DM-1"
         val ephemeralStreamId = "$me/Pombo-DM-2"
         // Same metadata the web writes (streamr.js: dm-inbox marker + pubkey).
@@ -2865,6 +2891,62 @@ class ChannelManager(
     private val dmReceived = HashMap<String, MutableList<UiMessage>>()
 
     /**
+     * Native sealed-sender open (SealedSenderCrypto, vector-locked) — the key
+     * stays in Kotlin. One result per item: {sender, message} or NULL for
+     * anything that is not a v2 envelope or does not open (not ours).
+     */
+    private suspend fun openSealedBatch(items: JSONArray): JSONArray? {
+        val myPk = myPrivateKey() ?: return null
+        val me = myAddress() ?: return null
+        return withContext(Dispatchers.Default) {
+            val out = JSONArray()
+            for (i in 0 until items.length()) {
+                val opened = items.optJSONObject(i)?.let {
+                    com.pombo.android.core.SealedSenderCrypto.open(it, myPk, me)
+                }
+                out.put(
+                    opened?.let { JSONObject().put("sender", it.first).put("message", it.second) }
+                        ?: JSONObject.NULL
+                )
+            }
+            out
+        }
+    }
+
+    /** Single-envelope form of [openSealedBatch]. */
+    private suspend fun openSealedOne(envelope: JSONObject): JSONObject? {
+        val myPk = myPrivateKey() ?: return null
+        val me = myAddress() ?: return null
+        return withContext(Dispatchers.Default) {
+            com.pombo.android.core.SealedSenderCrypto.open(envelope, myPk, me)
+                ?.let { JSONObject().put("sender", it.first).put("message", it.second) }
+        }
+    }
+
+    /**
+     * Sealed-sender v2 publish: the envelope is sealed natively (the identity
+     * key never enters the WebView) and goes out under the throwaway key via
+     * the bridge's publishAs — which is also the message's publishing identity,
+     * so that key crosses the bridge by design.
+     */
+    private suspend fun dmSealPublish(
+        streamId: String,
+        partition: Int,
+        recipientAddress: String,
+        recipientPublicKey: String,
+        message: JSONObject,
+        timeoutMs: Long = 45_000
+    ): JSONObject {
+        val myPk = myPrivateKey() ?: throw IllegalStateException("No identity")
+        val (envelope, ephemeralPk) = withContext(Dispatchers.Default) {
+            com.pombo.android.core.SealedSenderCrypto.seal(message, myPk, recipientAddress, recipientPublicKey)
+        }
+        return bridge.call("publishAs", JSONObject()
+            .put("streamId", streamId).put("partition", partition)
+            .put("content", envelope).put("privateKey", ephemeralPk), timeoutMs)
+    }
+
+    /**
      * Routes one inbox message to its conversation (web: routeInboxMessage).
      *
      * Runs for history and live traffic alike, which is what makes a DM from
@@ -2898,11 +2980,7 @@ class ChannelManager(
             // v2 sealed envelope: ECDH with OUR static key + the cleartext
             // epk; the true sender comes from ecrecover of the proof inside,
             // rebuilt against OUR address. What does not open is not ours.
-            val opened = try {
-                bridge.call("dmOpenBatch", JSONObject()
-                    .put("items", JSONArray().put(envelope)))
-                    .optJSONArray("results")?.takeIf { !it.isNull(0) }?.optJSONObject(0)
-            } catch (e: Exception) { null } ?: return
+            val opened = openSealedOne(envelope) ?: return
             sender = opened.optString("sender").lowercase().ifEmpty { return }
             data = opened.optJSONObject("message") ?: return
         } else if (envelope.optString("e") == "aes-256-gcm") {
@@ -3040,10 +3118,7 @@ class ChannelManager(
                     else JSONObject.NULL
                 )
             }
-            val opened = try {
-                bridge.call("dmOpenBatch", JSONObject().put("items", items), 60_000)
-                    .optJSONArray("results")
-            } catch (e: Exception) { null }
+            val opened = openSealedBatch(items)
             val tDecrypt = System.currentTimeMillis()
 
             for (i in 0 until n) {
@@ -3320,12 +3395,14 @@ class ChannelManager(
         // Sealed sender v2 under a throwaway publisher (web notifications.js):
         // the inner `from` field survives for display, but the receiver treats
         // the proof-recovered sender as the authoritative identity.
-        bridge.call("dmSealPublish", JSONObject()
-            .put("streamId", "${recipient.lowercase()}/Pombo-DM-1")
-            .put("partition", StreamConstants.P_NOTIFICATIONS)
-            .put("recipientAddress", recipient.lowercase())
-            .put("recipientPublicKey", pk)
-            .put("message", invite), 60_000)
+        dmSealPublish(
+            "${recipient.lowercase()}/Pombo-DM-1",
+            StreamConstants.P_NOTIFICATIONS,
+            recipient.lowercase(),
+            pk,
+            invite,
+            60_000
+        )
     }
 
     /** Invites that arrived on my inbox P3 and are still unanswered. */
@@ -3376,10 +3453,7 @@ class ChannelManager(
             // gone (P6) — nothing to open any more.
             return
         }
-        val opened = try {
-            bridge.call("dmOpenBatch", JSONObject().put("items", JSONArray().put(envelope)))
-                .optJSONArray("results")?.takeIf { !it.isNull(0) }?.optJSONObject(0)
-        } catch (e: Exception) { null }
+        val opened = openSealedOne(envelope)
         if (opened == null) {
             android.util.Log.d("PomboInvites", "drop invite: envelope did not open (not for us)")
             return
@@ -3548,10 +3622,7 @@ class ChannelManager(
                     else JSONObject.NULL
                 )
             }
-            val openedAll = try {
-                bridge.call("dmOpenBatch", JSONObject().put("items", items), 60_000)
-                    .optJSONArray("results")
-            } catch (e: Exception) { null }
+            val openedAll = openSealedBatch(items)
 
             if (!stillCurrent(generationAtStart)) return DmPage(0, false, false)
 
@@ -3896,11 +3967,7 @@ class ChannelManager(
             // Open FIRST — the publisher is a throwaway key, so every check
             // (own echo, blocked, left) can only run on the sender the proof
             // recovers to (web routeInboxControl does the same).
-            val opened = try {
-                bridge.call("dmOpenBatch", JSONObject()
-                    .put("items", JSONArray().put(envelope)))
-                    .optJSONArray("results")?.takeIf { !it.isNull(0) }?.optJSONObject(0)
-            } catch (e: Exception) { null } ?: return@launch
+            val opened = openSealedOne(envelope) ?: return@launch
             val sender = opened.optString("sender").lowercase().ifEmpty { return@launch }
             if (sender == myAddress()?.lowercase()) return@launch   // my own echo
             if (isBlockedPeer(sender)) return@launch
@@ -4498,6 +4565,7 @@ class ChannelManager(
                 media.activeEphemeralStreams().containsKey(eph)
             } ?: false
             if (!transfersActive) {
+                com.pombo.android.core.ChannelIdentities.drop(messageStreamId)
                 runCatching { bridge.call("dropChannelIdentity", JSONObject().put("streamId", messageStreamId)) }
             }
             // Native: drop the channel's epoch keys (runtime + persisted)
@@ -5199,21 +5267,18 @@ class ChannelManager(
         payload: JSONObject,
         password: String?,
         /**
-         * Recipient address for a DM. The payload is sealed-sender v2 in the
-         * bridge (dmSealPublish): ECDH against a per-message ephemeral key,
-         * the identity proof INSIDE the ciphertext, and the publish goes out
-         * under that same throwaway key — the wallet address never touches
-         * the wire. The ephemeral private key never crosses the bridge.
+         * Recipient address for a DM. The payload is sealed-sender v2, sealed
+         * natively ([dmSealPublish]): ECDH against a per-message ephemeral
+         * key, the identity proof INSIDE the ciphertext, and the publish goes
+         * out under that same throwaway key — the wallet address never
+         * touches the wire.
          */
         dmPeer: String? = null
     ): Long {
         if (dmPeer != null) {
             val pk = peerPubKey(dmPeer)
                 ?: throw IllegalStateException("DM publish: peer public key unavailable for $dmPeer")
-            val res = bridge.call("dmSealPublish", JSONObject()
-                .put("streamId", streamId).put("partition", partition)
-                .put("recipientAddress", dmPeer).put("recipientPublicKey", pk)
-                .put("message", payload))
+            val res = dmSealPublish(streamId, partition, dmPeer, pk, payload)
             return res.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
         }
         val content: Any = when {
@@ -5336,8 +5401,15 @@ class ChannelManager(
             val res = bridge.call(method, args)
             return res.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
         }
+        val entry = channelIdentity(streamId)
         val args = JSONObject()
             .put("streamId", streamId).put("partition", partition).put("content", payload)
+            .put(
+                "identity", JSONObject()
+                    .put("identityPk", entry.identityPk)
+                    .put("publisherId", entry.publisherId)
+                    .put("proof", entry.proof)
+            )
         password?.let { args.put("password", it) }
         val res = bridge.call("publishAsChannel", args)
         return res.optLong("timestamp", 0L).takeIf { it > 0 } ?: System.currentTimeMillis()
@@ -5515,11 +5587,7 @@ class ChannelManager(
             // media controller, which expects the true account as sender.
             if (content is JSONObject && content.optInt("v") == 2 && content.has("epk")) {
                 scope.launch {
-                    val opened = try {
-                        bridge.call("dmOpenBatch", JSONObject()
-                            .put("items", JSONArray().put(content)))
-                            .optJSONArray("results")?.takeIf { !it.isNull(0) }?.optJSONObject(0)
-                    } catch (e: Exception) { null } ?: return@launch
+                    val opened = openSealedOne(content) ?: return@launch
                     val sender = opened.optString("sender").lowercase().ifEmpty { return@launch }
                     if (isBlockedPeer(sender)) return@launch
                     val plain = opened.optJSONObject("message") ?: return@launch
@@ -5619,8 +5687,23 @@ class ChannelManager(
             }
             return
         }
-        // `account` is the proof-recovered sender the bridge stamps when it
-        // opens a sealed DM piece (0x02).
+        // Sealed DM piece (0x02) on my own inbox, opened natively — the bridge
+        // delivers the wire bytes untouched. What does not open is not ours
+        // and is dropped, which also covers the 1-in-256 legacy v1 payload
+        // whose random IV byte happens to be 0x02.
+        val me = myAddress()?.lowercase()
+        if (me != null && data.isNotEmpty() && data[0].toInt() == 0x02 &&
+            streamId.lowercase() == "$me/pombo-dm-2"
+        ) {
+            val myPk = myPrivateKey() ?: return
+            scope.launch {
+                val opened = withContext(Dispatchers.Default) {
+                    com.pombo.android.core.SealedSenderCrypto.openBinary(data, myPk, me)
+                } ?: return@launch
+                media.onBinary(streamId, opened.second, opened.first)
+            }
+            return
+        }
         val identity = meta.optString("account").lowercase().ifEmpty { null }
             ?: meta.optString("publisherId").lowercase().ifEmpty { null }
         // Channel piece with inline proof (0x03, web FILE_PIECE_SIGNED):

@@ -149,11 +149,11 @@ class PomboBridge(
                 }
             }
             // JS console -> logcat; without this, errors inside the WebView are
-            // invisible. Two guards (M-I3): release forwards WARNING+ only
-            // (web logger.js is ERROR-only in production — a full DEBUG gate
-            // would blind the release builds we actually test with), and the
-            // injected private key is redacted from every line in every build,
-            // because a JS error on this page can echo __BRIDGE_PK__ material.
+            // invisible. Release forwards WARNING+ only (web logger.js is
+            // ERROR-only in production — a full DEBUG gate would blind the
+            // release builds we actually test with). No key redaction: the
+            // private key never enters this page (Phase C), so the console
+            // cannot echo it.
             val debuggable = (appContext.applicationInfo.flags and
                 android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
             webChromeClient = object : WebChromeClient() {
@@ -163,13 +163,7 @@ class PomboBridge(
                         level != ConsoleMessage.MessageLevel.WARNING &&
                         level != ConsoleMessage.MessageLevel.ERROR
                     ) return true
-                    var text = msg.message()
-                    if (privateKey.isNotEmpty()) {
-                        text = text
-                            .replace(privateKey, "«pk»", ignoreCase = true)
-                            .replace(privateKey.removePrefix("0x"), "«pk»", ignoreCase = true)
-                    }
-                    Log.d("PomboBridgeJS", "[$level] $text (${msg.sourceId()}:${msg.lineNumber()})")
+                    Log.d("PomboBridgeJS", "[$level] ${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
                     return true
                 }
             }
@@ -179,8 +173,22 @@ class PomboBridge(
         webView.loadDataWithBaseURL(BASE_URL, pageHtml(), "text/html", "utf-8", null)
     }
 
+    // The key never enters the page (docs/private_key_in_webview.md, Phase C):
+    // the page gets the account address + compressed public key and delegates
+    // every signature to the Native oracle endpoints below.
     private fun pageHtml() = bridgeHtml
-        .replace("__BRIDGE_PK__", privateKey)
+        .replace(
+            "__BRIDGE_ADDR__",
+            if (privateKey.isEmpty()) ""
+            else com.pombo.android.core.EthereumSigner.checksumAddress(
+                com.pombo.android.core.EthereumSigner.address(privateKey)
+            )
+        )
+        .replace(
+            "__BRIDGE_PUB__",
+            if (privateKey.isEmpty()) ""
+            else com.pombo.android.core.EthereumSigner.compressedPublicKey(privateKey)
+        )
         .replace("__BRIDGE_RPCS__", org.json.JSONArray(rpcUrls).toString())
 
     /** Reborn JS world (new Streamr client) — used when switching identity
@@ -215,8 +223,11 @@ class PomboBridge(
         // transaction may only run inside an approval the user gave with their
         // fingerprint. Callers normally open that window in the ViewModel
         // (ChainGuard.approve + holding); anything that reaches here without
-        // one has to ask for itself, and cannot be authorised at all from a
-        // headless context (FCM, sync) where there is no activity to prompt on.
+        // one has to ask for itself — and the window must stay OPEN for the
+        // whole JS run, because the transaction signature now comes back
+        // through the native oracle (signTransactionPayload), which checks
+        // isApproved() again. Headless contexts (FCM, sync) still cannot
+        // authorise at all: there is no activity to prompt on.
         if (method in com.pombo.android.ui.ChainGuard.CHAIN_METHODS &&
             !com.pombo.android.ui.ChainGuard.isApproved()
         ) {
@@ -225,8 +236,12 @@ class PomboBridge(
                 "Pombo is about to submit a \"$method\" transaction."
             )
             if (!ok) throw BridgeException("Transaction not confirmed")
+            return com.pombo.android.ui.ChainGuard.holding { dispatch(method, args, timeoutMs) }
         }
+        return dispatch(method, args, timeoutMs)
+    }
 
+    private suspend fun dispatch(method: String, args: JSONObject, timeoutMs: Long): JSONObject {
         // Wait for the page instead of firing into a half-loaded WebView, where
         // the call would vanish and only surface as a timeout much later.
         withTimeout(timeoutMs) { pageReadyFlow.first { it } }
@@ -266,16 +281,12 @@ class PomboBridge(
         data: ByteArray,
         password: String? = null,
         /**
-         * DM piece: key of a bridge-held sealed-sender binary sealer (one per
-         * transfer, created via dmBinarySealerCreate). The bridge seals the
-         * 0x02 envelope AND publishes under the sealer's throwaway identity.
+         * Publish under this throwaway identity. The frame arrives finished —
+         * 0x02 sealed natively (SealedSenderCrypto) or 0x03 with the native
+         * channel proof — so the page only password-seals (PBKDF2 stays in
+         * BoringSSL) and publishes; no key material is read bridge-side.
          */
-        dmSealerKey: String? = null,
-        /**
-         * Channel piece: the bridge rewrites the 0x01 frame as 0x03 with the
-         * channel identity's inline proof and publishes under that identity.
-         */
-        channelEphemeral: Boolean = false,
+        identityPk: String? = null,
         /**
          * Epoch piece on a GATED channel: publish as the gate clone
          * (ERC-1271) — the bytes arrive already epoch-sealed (0x04).
@@ -296,8 +307,7 @@ class PomboBridge(
         pending[id] = deferred
         val args = JSONObject().put("streamId", streamId).put("partition", partition)
         if (password != null) args.put("password", password)
-        if (dmSealerKey != null) args.put("dmSealerKey", dmSealerKey)
-        if (channelEphemeral) args.put("channelEphemeral", true)
+        if (identityPk != null) args.put("identityPk", identityPk)
         if (gateAddress != null) args.put("gateAddress", gateAddress)
         if (asAccount) args.put("asAccount", true)
         val argsB64 = Base64.encodeToString(args.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
@@ -320,8 +330,8 @@ class PomboBridge(
      *
      * The chunk is already sealed (or plaintext) — storage crypto is native
      * (one PBKDF2 per FILE via [com.pombo.android.core.PomboCrypto], then
-     * per-chunk AES-GCM), unlike the mesh per-piece path that seals in the
-     * bridge. So nothing here touches password/ECDH; the bytes cross as-is.
+     * per-chunk AES-GCM; DM chunks pair-sealed via SealedSenderCrypto). So
+     * nothing here touches password/ECDH; the bytes cross as-is.
      *
      * Kept off [call] for the same reason as [publishBinary]: that path would
      * base64 the whole args JSON, double-encoding the payload.
@@ -332,20 +342,14 @@ class PomboBridge(
         streamId: String,
         partition: Int,
         data: ByteArray,
-        /** DM chunk: sealed in the bridge with the pair's ECDH key ([iv][ct]). */
-        dmPeerPublicKey: String? = null,
         /**
-         * DM chunk: key of a bridge-held per-transfer throwaway identity
-         * (dmChunkIdentityCreate). The chunk bytes stay on the pair key; only
-         * the PUBLISHER is disposable, and upload verify matches its address.
+         * Publish under this throwaway identity — the per-transfer DM chunk
+         * key or the channel pseudonym, both minted natively. DM chunk bytes
+         * arrive already pair-sealed (SealedSenderCrypto.pairSeal); only the
+         * publisher is decided here. Native/readOnly channels leave this null
+         * and publish under the account.
          */
-        chunkIdentityKey: String? = null,
-        /**
-         * Channel chunk (public/password): publish under the channel's own
-         * ephemeral identity, the same pseudonym as the announce. Native/
-         * readOnly channels leave this false and publish under the account.
-         */
-        channelEphemeral: Boolean = false,
+        identityPk: String? = null,
         /** Gated channel chunk: publish as the gate clone (ERC-1271). */
         gateAddress: String? = null,
         /**
@@ -362,9 +366,7 @@ class PomboBridge(
         val deferred = CompletableDeferred<JSONObject>()
         pending[id] = deferred
         val args = JSONObject().put("streamId", streamId).put("partition", partition)
-        if (dmPeerPublicKey != null) args.put("dmPeerPublicKey", dmPeerPublicKey)
-        if (chunkIdentityKey != null) args.put("chunkIdentityKey", chunkIdentityKey)
-        if (channelEphemeral) args.put("channelEphemeral", true)
+        if (identityPk != null) args.put("identityPk", identityPk)
         if (gateAddress != null) args.put("gateAddress", gateAddress)
         if (asAccount) args.put("asAccount", true)
         val argsB64 = Base64.encodeToString(args.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
@@ -388,6 +390,49 @@ class PomboBridge(
     }
 
     private inner class JsApi {
+        /**
+         * Streamr/personal-message signature over the payload. The EIP-191
+         * magic is applied HERE, so this endpoint can never yield a valid
+         * transaction signature no matter what a compromised renderer feeds
+         * it (the "no opaque digests" oracle rule). Synchronous on purpose:
+         * ~1–2 ms of ECDSA on the JavaBridge thread beats a correlation
+         * round-trip per publish. Empty string = no identity / bad input.
+         */
+        @JavascriptInterface
+        fun signMessagePayload(payloadB64: String): String {
+            val pk = privateKey
+            if (pk.isEmpty()) return ""
+            return try {
+                com.pombo.android.core.EthereumSigner.toHex(
+                    com.pombo.android.core.EthereumSigner.signMessage(
+                        Base64.decode(payloadB64, Base64.NO_WRAP), pk
+                    )
+                )
+            } catch (e: Exception) { "" }
+        }
+
+        /**
+         * Polygon transaction signature. This is a JS→Kotlin entry the
+         * [call] method gate never sees, so the spend gate repeats here:
+         * the bytes must parse as a transaction envelope AND the call must
+         * arrive inside a ChainGuard approval window. Empty string = refused.
+         */
+        @JavascriptInterface
+        fun signTransactionPayload(unsignedHex: String): String {
+            val pk = privateKey
+            if (pk.isEmpty()) return ""
+            return try {
+                val bytes = com.pombo.android.core.SealedSenderCrypto.hexToBytes(unsignedHex)
+                if (!com.pombo.android.core.Rlp.isTransactionEnvelope(bytes)) return ""
+                if (!com.pombo.android.ui.ChainGuard.isApproved()) return ""
+                com.pombo.android.core.EthereumSigner.toHex(
+                    com.pombo.android.core.EthereumSigner.signDigest(
+                        com.pombo.android.core.SealedSenderCrypto.keccak256(bytes), pk
+                    )
+                )
+            } catch (e: Exception) { "" }
+        }
+
         @JavascriptInterface
         fun status(s: String) { main.post { listener.onBridgeStatus(s) } }
 
