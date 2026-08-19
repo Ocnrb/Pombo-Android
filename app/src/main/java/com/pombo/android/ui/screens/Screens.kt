@@ -334,13 +334,16 @@ internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
             else -> false
         }
     } catch (e: Exception) { false }
-    val subscribed = info.mode == GateModes.PAID && info.paidUntil * 1000L > System.currentTimeMillis()
+    val paidMsLeft = info.paidUntil * 1000L - System.currentTimeMillis()
+    val subscribed = info.mode == GateModes.PAID && paidMsLeft > 0
     val days = info.durationSeconds / 86_400.0
     val daysLabel = if (days == days.toLong().toDouble()) days.toLong().toString() else "%.1f".format(days)
 
     // WPOL-priced gates read POL everywhere the user sees a cost — gatePay
-    // auto-wraps, plain POL is literally what they spend
-    val paySymbol = if (info.tokenSymbol == "WPOL") "POL" else info.tokenSymbol
+    // auto-wraps, plain POL is literally what they spend. By token ADDRESS:
+    // any ERC-20 can call itself "WPOL".
+    val paySymbol = if (info.token.lowercase() == com.pombo.android.ChannelManager.WRAPPED_NATIVE)
+        "POL" else info.tokenSymbol
     val requirement = when (info.mode) {
         GateModes.TOKEN -> "Hold at least ${fmt(info.minBalance, info.tokenDecimals)} ${info.tokenSymbol}."
         GateModes.NFT -> "Hold a ${info.tokenSymbol} NFT."
@@ -358,7 +361,9 @@ internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
         GateModes.PAID ->
             if (subscribed) "Subscribed until " + java.text.SimpleDateFormat(
                 "yyyy-MM-dd HH:mm", java.util.Locale.getDefault()
-            ).format(java.util.Date(info.paidUntil * 1000L))
+            ).format(java.util.Date(info.paidUntil * 1000L)) +
+                " (${com.pombo.android.core.GateFormat.formatRemaining(paidMsLeft)} left)"
+            else if (info.paidUntil > 0) "Subscription expired"
             else "No active subscription"
         else -> null
     }
@@ -375,7 +380,8 @@ internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
                 .padding(20.dp)
         ) {
             Text(
-                entry.channelName?.let { "Join $it" } ?: "Join Gated Channel",
+                if (entry.renewal) entry.channelName?.let { "Renew $it" } ?: "Renew Subscription"
+                else entry.channelName?.let { "Join $it" } ?: "Join Gated Channel",
                 color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium
             )
 
@@ -391,7 +397,9 @@ internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
                 Text(it, color = Color.White.copy(alpha = 0.80f), fontSize = 14.sp, lineHeight = 20.sp)
             }
 
-            if (info.mode == GateModes.PAID && !subscribed && info.tokenSymbol == "WPOL") {
+            if (info.mode == GateModes.PAID && (!subscribed || entry.renewal) &&
+                info.token.lowercase() == com.pombo.android.ChannelManager.WRAPPED_NATIVE
+            ) {
                 Spacer(Modifier.height(8.dp))
                 Text(
                     "Plain POL works — it is wrapped automatically when you pay.",
@@ -430,6 +438,11 @@ internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
                 ) { Text("Check Again", color = Color.White.copy(alpha = 0.70f), fontSize = 13.sp, fontWeight = FontWeight.Medium) }
 
                 val primary: Pair<String, () -> Unit>? = when {
+                    // Renewal: pay is always the action — the contract extends
+                    // from the current end, so paying early never loses days
+                    entry.renewal && info.mode == GateModes.PAID ->
+                        (if (subscribed) "Renew ${fmt(info.price, info.tokenDecimals)} $paySymbol"
+                        else "Pay ${fmt(info.price, info.tokenDecimals)} $paySymbol") to { vm.gateEntryPay(); Unit }
                     info.mode == GateModes.PAID && !subscribed ->
                         "Pay ${fmt(info.price, info.tokenDecimals)} $paySymbol" to { vm.gateEntryPay(); Unit }
                     subscribed || holds -> "Enter" to { vm.gateEntryEnter(); Unit }
@@ -2488,6 +2501,7 @@ fun ChatScreen(vm: AppViewModel) {
     val loadingHistory by vm.loadingHistory.collectAsState()
     val loadingInitial by vm.initialLoad.collectAsState()
     val waitingForKeys by vm.waitingForKeys.collectAsState()
+    val paidStatus by vm.paidStatus.collectAsState()
 
     // NATIVE reverse-layout chat (deliberate divergence from the web's
     // top-down DOM): the LazyColumn runs with reverseLayout, so index 0 is the
@@ -2819,6 +2833,52 @@ fun ChatScreen(vm: AppViewModel) {
         // between the header and the message body.
         Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.04f)))
 
+        // Paid-subscription strip (web .subscription-banner): static above the
+        // messages — it states the channel's access state, so it must not
+        // float over content or scroll away. Amber warning is dismissible per
+        // viewing session; the expired strip is not.
+        var subWarnDismissed by remember(ch.messageStreamId) { mutableStateOf(false) }
+        paidStatus?.let { ps ->
+            val msLeft = ps.paidUntil * 1000L - System.currentTimeMillis()
+            val expired = msLeft <= 0 && !ps.accessNow
+            val warning = msLeft in 1 until com.pombo.android.core.GateFormat.WARNING_MS
+            if (expired || (warning && !subWarnDismissed)) {
+                val tint = if (expired) Color(0xFFF87171) else Color(0xFFFBBF24)
+                Row(
+                    Modifier.fillMaxWidth()
+                        .background(tint.copy(alpha = 0.08f))
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        if (expired) "Subscription expired — new messages stay locked until you renew"
+                        else "Subscription ends in ${com.pombo.android.core.GateFormat.formatRemaining(msLeft)}",
+                        color = tint, fontSize = 13.sp, lineHeight = 16.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        Modifier
+                            .background(PomboColors.Accent.copy(alpha = 0.20f), RoundedCornerShape(10.dp))
+                            .border(1.dp, PomboColors.Accent.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                            .clickableNoRipple { vm.renewSubscription() }
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                    ) {
+                        Text("Renew", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    if (!expired) {
+                        Spacer(Modifier.width(8.dp))
+                        Icon(
+                            Icons.Filled.Close, contentDescription = "Dismiss subscription warning",
+                            tint = Color.White.copy(alpha = 0.35f),
+                            modifier = Modifier.size(16.dp).clickableNoRipple { subWarnDismissed = true }
+                        )
+                    }
+                }
+                Box(Modifier.fillMaxWidth().height(1.dp).background(tint.copy(alpha = 0.15f)))
+            }
+        }
+
         Box(Modifier.weight(1f).fillMaxWidth()) {
             // Web renderMessages: while any loading signal is still live the
             // area shows a centred spinner; only once everything is quiescent
@@ -2830,7 +2890,35 @@ fun ChatScreen(vm: AppViewModel) {
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
                 ) {
-                    if (terminalEmpty && waitingForKeys) {
+                    // A lapsed subscription and "admin offline" are identical
+                    // at the key layer (refusals are silent) — the chain-read
+                    // paid status decides which empty state this is.
+                    val subExpired = paidStatus?.let {
+                        it.paidUntil * 1000L <= System.currentTimeMillis() && !it.accessNow
+                    } == true
+                    if (terminalEmpty && waitingForKeys && subExpired) {
+                        Text(
+                            "Your subscription has expired",
+                            color = Color.White.copy(alpha = 0.40f), fontSize = 14.sp
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Messages stay locked until you renew — renewing extends from the current end",
+                            color = Color.White.copy(alpha = 0.25f), fontSize = 12.sp,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 32.dp)
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Box(
+                            Modifier
+                                .background(PomboColors.Accent.copy(alpha = 0.20f), RoundedCornerShape(12.dp))
+                                .border(1.dp, PomboColors.Accent.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                                .clickableNoRipple { vm.renewSubscription() }
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
+                        ) {
+                            Text("Renew subscription", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    } else if (terminalEmpty && waitingForKeys) {
                         CircularProgressIndicator(
                             color = Color.White.copy(alpha = 0.30f),
                             strokeWidth = 2.dp, modifier = Modifier.size(24.dp)
@@ -3147,9 +3235,18 @@ fun ChatScreen(vm: AppViewModel) {
         // send here fails at the network layer with nothing shown to the user.
         // The web disables the field and swaps the placeholder
         // (PreviewModeUI.js:390-392); we only ever rendered a label.
-        val canPost = !ch.readOnly || ch.createdBy?.equals(myAddr, ignoreCase = true) == true
+        // Expired subscription cuts the composer too: the transport would
+        // still accept the publish (sticky membership), but honest receivers
+        // drop it at ingest — writing into that void is a trap, not a feature.
+        val subExpired = paidStatus?.let {
+            it.paidUntil * 1000L <= System.currentTimeMillis() && !it.accessNow
+        } == true
+        val canPost = (!ch.readOnly || ch.createdBy?.equals(myAddr, ignoreCase = true) == true) &&
+            !subExpired
         ChatComposer(
             canPost = canPost,
+            disabledPlaceholder = if (subExpired) "Subscription expired — renew to write"
+                else "This channel is read-only",
             onTyping = { vm.notifyTyping() },
             onPickImage = { vm.sendImage(it) },
             onPickVideo = { vm.sendVideo(it) },
@@ -3254,6 +3351,7 @@ private fun TypingIndicator(name: String) {
 @Composable
 private fun ChatComposer(
     canPost: Boolean,
+    disabledPlaceholder: String = "This channel is read-only",
     onTyping: () -> Unit,
     onPickImage: (android.net.Uri) -> Unit,
     onPickVideo: (android.net.Uri) -> Unit,
@@ -3451,7 +3549,7 @@ private fun ChatComposer(
                 ) {
                     if (input.text.isEmpty()) {
                         Text(
-                            if (canPost) "Message…" else "This channel is read-only",
+                            if (canPost) "Message…" else disabledPlaceholder,
                             color = PomboColors.TextDim, fontSize = 16.sp
                         )
                     }
@@ -4024,6 +4122,25 @@ private fun ChannelDetailsMain(
         Text(accessText, color = accessTint, fontSize = 14.sp)
     }
 
+    // PAID member view: the subscription clock lives here, under the access
+    // line — the chat header stays clean (N-F). paidUntil 0 = moderator on a
+    // paid gate (never pays), no clock.
+    val detailsPaidStatus by vm.paidStatus.collectAsState()
+    detailsPaidStatus?.takeIf { it.paidUntil > 0 }?.let { ps ->
+        val msLeft = ps.paidUntil * 1000L - System.currentTimeMillis()
+        Spacer(Modifier.height(4.dp))
+        Text(
+            if (msLeft > 0) "${com.pombo.android.core.GateFormat.formatRemaining(msLeft)} left"
+            else "Subscription expired",
+            color = when {
+                msLeft <= 0 -> Color(0xFFF87171).copy(alpha = 0.80f)
+                msLeft < com.pombo.android.core.GateFormat.WARNING_MS -> Color(0xFFFBBF24)
+                else -> Color.White.copy(alpha = 0.40f)
+            },
+            fontSize = 12.sp
+        )
+    }
+
     // STORAGE flows inline under a separator on mobile. (Notifications is the
     // pill at the top of this panel now, matching the web, not a row here.)
     Spacer(Modifier.height(24.dp))
@@ -4126,7 +4243,7 @@ private fun ChannelMembersPanel(vm: AppViewModel, channel: Channel, canModerate:
     val myAddress by vm.address.collectAsState()
     val ensNames by vm.ensNames.collectAsState()
     val ensAvatars by vm.ensAvatars.collectAsState()
-    var members by remember { mutableStateOf<List<String>?>(null) }
+    var members by remember { mutableStateOf<List<com.pombo.android.ChannelManager.MemberRow>?>(null) }
     var permissions by remember { mutableStateOf<List<com.pombo.android.core.GraphApi.StreamPermission>>(emptyList()) }
     var reloadKey by remember { mutableStateOf(0) }
     var newMember by remember { mutableStateOf("") }
@@ -4167,7 +4284,8 @@ private fun ChannelMembersPanel(vm: AppViewModel, channel: Channel, canModerate:
             "No members found",
             color = Color.White.copy(alpha = 0.30f), fontSize = 13.sp
         )
-        else -> members!!.forEach { addr ->
+        else -> members!!.forEach { row ->
+            val addr = row.address
             val lower = addr.lowercase()
             val isCreator = lower == creatorAddr
             val isMe = myAddress?.lowercase() == lower
@@ -4207,6 +4325,20 @@ private fun ChannelMembersPanel(vm: AppViewModel, channel: Channel, canModerate:
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
                         if (isCreator) MemberBadge("Owner", Color(0xFFEAB308))
                         else if (canGrant) MemberBadge("Admin", Color(0xFFA855F7))
+                        // Paid gates: each subscriber's own clock (N-F). Rows
+                        // passed the access filter, so the date is normally
+                        // in the future.
+                        if (row.paidUntil > 0 && !isCreator) {
+                            val expired = row.paidUntil * 1000L <= System.currentTimeMillis()
+                            Text(
+                                (if (expired) "expired " else "until ") + java.text.SimpleDateFormat(
+                                    "d MMM yyyy", java.util.Locale.getDefault()
+                                ).format(java.util.Date(row.paidUntil * 1000L)),
+                                color = if (expired) Color(0xFFF87171).copy(alpha = 0.80f)
+                                    else Color.White.copy(alpha = 0.40f),
+                                fontSize = 11.sp, modifier = Modifier.padding(start = 4.dp)
+                            )
+                        }
                         if (isMe) Text("(you)", color = Color.White.copy(alpha = 0.60f), fontSize = 11.sp, modifier = Modifier.padding(start = 4.dp))
                     }
                 }

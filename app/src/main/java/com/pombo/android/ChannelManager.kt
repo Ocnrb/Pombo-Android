@@ -245,6 +245,12 @@ class ChannelManager(
                 ?: return@launch
             Log.i(TAG, "epochKeys: refreshing history after key adoption")
             loadHistory(channel, switchGeneration)
+            // The -3 artifacts fetched at open were epoch-sealed and
+            // unreadable until this key arrived — pins/moderation and a
+            // hidden channel's image need their own re-pull (the admin
+            // poller would take up to a full tick to converge).
+            runCatching { loadAdminState(channel, switchGeneration) }
+            runCatching { loadChannelImage(channel) }
         }
     }
 
@@ -502,6 +508,64 @@ class ChannelManager(
     /** Epoch channel open without a usable current key — the UI's "waiting
      *  for channel keys" state, cleared on adoption. */
     val waitingForKeys: StateFlow<Boolean> = _waitingForKeys.asStateFlow()
+
+    /**
+     * The CURRENT user's standing on the CURRENT channel's PAID gate (N-F).
+     * Null = not a paid gate, gate owner, or unresolved. `accessNow` false
+     * with an elapsed `paidUntil` is the "subscription expired" state — the
+     * key layer cannot signal it (refusals are silent), only the chain can.
+     */
+    data class PaidStatus(
+        /** Subscription end, unix seconds (0 = never paid). */
+        val paidUntil: Long,
+        /** checkAccess for us — true without a live subscription = moderator. */
+        val accessNow: Boolean
+    )
+
+    private val _paidStatus = MutableStateFlow<PaidStatus?>(null)
+    val paidStatus: StateFlow<PaidStatus?> = _paidStatus.asStateFlow()
+
+    private suspend fun resolvePaidStatus(channel: Channel): PaidStatus? {
+        val gate = channel.takeIf { it.type == "gated" }?.gateAddress ?: return null
+        return try {
+            val info = bridge.call("gateInfo", JSONObject().put("gate", gate))
+            if (info.optInt("mode", GATE_MODE_NONE) != GATE_MODE_PAID) return null
+            val me = myAddress() ?: return null
+            if (info.optString("owner").equals(me, ignoreCase = true)) return null
+            val until = bridge.call("gatePaidUntil", JSONObject()
+                .put("gate", gate).put("user", me))
+                .optString("paidUntil", "0").toLongOrNull() ?: 0L
+            val accessNow = until * 1000 > System.currentTimeMillis() ||
+                bridge.call("gateCheckAccess", JSONObject()
+                    .put("gate", gate).put("user", me)).optBoolean("access", false)
+            PaidStatus(until, accessNow)
+        } catch (e: Exception) {
+            Log.w(TAG, "paid status read failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Re-read the paid standing for the current channel (after a renewal). */
+    suspend fun refreshPaidStatus() {
+        val channel = _current.value ?: run { _paidStatus.value = null; return }
+        val status = resolvePaidStatus(channel)
+        if (_current.value?.messageStreamId == channel.messageStreamId) {
+            _paidStatus.value = status
+        }
+    }
+
+    /**
+     * One immediate KEY_REQUEST for the current channel — the renewal flow's
+     * key refresh: requests sent while expired were refused silently, so the
+     * backoff would otherwise sit on a 60s interval after the payment.
+     */
+    suspend fun requestChannelKeysNow() {
+        val channel = _current.value ?: return
+        if (!isEpochChannel(channel) || channel.keysStreamId.isEmpty()) return
+        runCatching {
+            epochKeys.retryRequestIfWaiting(channel.messageStreamId, channel.keysStreamId)
+        }
+    }
 
     private val _hasMoreHistory = MutableStateFlow(false)
     val hasMoreHistory: StateFlow<Boolean> = _hasMoreHistory.asStateFlow()
@@ -923,16 +987,10 @@ class ChannelManager(
                 .put("streamId", channel.adminStreamId)
                 .put("partition", StreamConstants.ADMIN_CHANNEL_IMAGE)
                 .put("content", content)
-            // Gated: the clone holds the only grant on -3 — the account key
-            // signs, the clone is the on-wire publisher (ERC-1271); receivers
-            // enforce admin authority on the recovered signer.
-            val method = if (channel.type == "gated") {
-                val gate = channel.gateAddress ?: throw IllegalStateException(
-                    "Gate address unknown for ${channel.messageStreamId} — cannot publish the channel image")
-                args.put("gateAddress", gate)
-                "publishAsGate"
-            } else "publishAsAccount"
-            bridge.call(method, args, 60_000)
+            // -3 publishes as the ACCOUNT on gated too — the owner is its
+            // only writer and the transport enforces that (new gated -3s
+            // grant the clone subscribe-only).
+            bridge.call("publishAsAccount", args, 60_000)
         } else {
             bridge.call("publish", JSONObject()
                 .put("streamId", channel.adminStreamId)
@@ -1043,33 +1101,40 @@ class ChannelManager(
      * CURRENT state comes from the contract; `access` is the mode-aware
      * membership signal (allowlist only means Closed).
      */
-    suspend fun channelMembers(): List<String> {
+    /** Members-panel row: address plus the PAID subscription end (0 = n/a). */
+    data class MemberRow(val address: String, val paidUntil: Long = 0L)
+
+    suspend fun channelMembers(): List<MemberRow> {
         val channel = _current.value ?: return emptyList()
         if (channel.type == "gated") {
-            val gate = channel.gateAddress ?: return channel.members
+            val gate = channel.gateAddress ?: return channel.members.map { MemberRow(it) }
             val candidates = (channel.members + epochKeys.seenRequesters(channel.messageStreamId))
                 .map { it.lowercase() }.distinct()
             return try {
                 val res = bridge.call("gateMembers", JSONObject()
                     .put("gate", gate)
                     .put("candidates", JSONArray(candidates)), 60_000)
-                val arr = res.optJSONArray("members") ?: return channel.members
-                val out = mutableListOf<String>()
+                val arr = res.optJSONArray("members")
+                    ?: return channel.members.map { MemberRow(it) }
+                val out = mutableListOf<MemberRow>()
                 for (i in 0 until arr.length()) {
                     val m = arr.optJSONObject(i) ?: continue
                     if (!m.optBoolean("isOwner") && !m.optBoolean("moderator")
                         && !m.optBoolean("access")) continue   // banned/ex-members
-                    m.optString("address").ifEmpty { null }?.let { out.add(it) }
+                    m.optString("address").ifEmpty { null }?.let {
+                        out.add(MemberRow(it, m.optLong("paidUntil", 0L)))
+                    }
                 }
                 out
             } catch (e: Exception) {
                 Log.w(TAG, "gateMembers failed, using local cache: ${e.message}")
-                channel.members
+                channel.members.map { MemberRow(it) }
             }
         }
         val owner = channelOwner(channel)
         val members = com.pombo.android.core.GraphApi.streamMembers(channel.messageStreamId)
-        return (listOfNotNull(owner) + members.filter { !it.equals(owner, ignoreCase = true) }).distinct()
+        return (listOfNotNull(owner) + members.filter { !it.equals(owner, ignoreCase = true) })
+            .distinct().map { MemberRow(it) }
     }
 
     /**
@@ -1689,21 +1754,27 @@ class ChannelManager(
                 // ONE grantee for every stream: the gate clone (N-C, Q7).
                 // Members prove access through the contract (ERC-1271), so
                 // membership changes are gate transactions, not stream txs.
-                // -3 note: the clone necessarily holds publish there too —
-                // owner-only authority moved to ingest (gatedAuthor).
+                // -3 is the exception: the clone is SUBSCRIBE-only there —
+                // PUBLISH stays the owner's (creator keeps registry perms),
+                // so the transport enforces owner-only admin writes exactly
+                // like native channels. The owner publishes -3 as the
+                // ACCOUNT; their address is the streamId prefix already.
                 val clonePerms = JSONArray().put(JSONObject()
                     .put("userId", gateAddress)
                     .put("permissions", JSONArray(listOf("subscribe", "publish"))))
+                val cloneSubOnly = JSONObject()
+                    .put("userId", gateAddress)
+                    .put("permissions", JSONArray(listOf("subscribe")))
                 // Visible gated channels are storefronts: -3 gains public
                 // SUBSCRIBE so non-members (Explore) can read the channel
                 // image. P0 (ADMIN_STATE) stays an epoch envelope — the
                 // public only ever sees ciphertext. Hidden channels keep the
                 // clone as the sole grantee.
                 val adminPerms = if (visible) JSONArray().apply {
-                    put(clonePerms.getJSONObject(0))
+                    put(cloneSubOnly)
                     put(JSONObject().put("public", true)
                         .put("permissions", JSONArray(listOf("subscribe"))))
-                } else clonePerms
+                } else JSONArray().put(cloneSubOnly)
                 setPermissionsRetry(messageStreamId, clonePerms); onProgress()
                 setPermissionsRetry(ephemeralStreamId, clonePerms); onProgress()
                 setPermissionsRetry(adminStreamId, adminPerms); onProgress()
@@ -4073,6 +4144,15 @@ class ChannelManager(
                 // "Online/Offline" flips in their header.
                 startPresence(channel)
             } else if (!channel.writeOnly) {
+                // Paid standing resolves alongside history — the expiry strip
+                // and the expired empty-state depend on it, and the chain read
+                // must never hold up the open.
+                if (channel.type == "gated") {
+                    launch {
+                        val status = resolvePaidStatus(channel)
+                        if (stillCurrent(generation)) _paidStatus.value = status
+                    }
+                }
                 // History: content + overrides
                 // Image refresh runs alongside history instead of after it —
                 // the cached one is already on screen.
@@ -4235,6 +4315,10 @@ class ChannelManager(
             synchronized(this) { pendingOverrides.clear(); deletedIds.clear() }
             _hasMoreHistory.value = false
             _loadingHistory.value = false
+            // Both are per-channel verdicts — carrying them across a switch
+            // shows the previous room's key/subscription state on this one.
+            _waitingForKeys.value = false
+            _paidStatus.value = null
             channelImageRev = 0
             synchronized(online) { online.clear(); onlineNames.clear() }
             clearTyping()   // whoever was typing was typing in the OTHER room
@@ -5190,9 +5274,11 @@ class ChannelManager(
         // is exactly the per-publisher, publisher-must-be-online dependency
         // the epoch protocol replaces. Native publishes AS THE ACCOUNT (grant
         // per member); gated publishes AS THE GATE CLONE with the account
-        // signing (ERC-1271; the clone holds the only grant, -3 included).
-        // Fail-closed: no epoch key means NO publish, never a plaintext or
-        // SDK-keyed fallback.
+        // signing (ERC-1271) — EXCEPT the admin stream, which publishes as
+        // the ACCOUNT on every channel kind: the owner is its only writer and
+        // the transport enforces that (new gated -3s grant the clone
+        // subscribe-only). Fail-closed: no epoch key means NO publish, never
+        // a plaintext or SDK-keyed fallback.
         if (isEpochChannel(channel)) {
             channel!!
             val keysId = channel.keysStreamId.ifEmpty {
@@ -5216,7 +5302,7 @@ class ChannelManager(
             }
             val args = JSONObject()
                 .put("streamId", streamId).put("partition", partition).put("content", envelope)
-            val method = if (channel.type == "gated") {
+            val method = if (channel.type == "gated" && !isAdminStream) {
                 val gate = channel.gateAddress ?: throw IllegalStateException(
                     "Gate address unknown for ${channel.messageStreamId} (repair pending) — cannot publish")
                 args.put("gateAddress", gate)
@@ -5276,9 +5362,32 @@ class ChannelManager(
      * the namespace admin (this check replaces the transport's owner-only
      * enforcement). D10c applies: never fall back to the transport publisher.
      */
+    /**
+     * Live-content verdict for a gated author: false ONLY when the chain
+     * positively says no (bridge cache, 10 min per author). RPC failure
+     * allows — hiding legitimate traffic on an outage is worse than showing
+     * an expired member's messages for a while.
+     */
+    private suspend fun liveGateAccessAllows(channel: Channel, author: String): Boolean {
+        val gate = channel.gateAddress ?: return true
+        return try {
+            val res = bridge.call("gateCheckAccess", JSONObject()
+                .put("gate", gate).put("user", author))
+            res.optBoolean("access", false) || res.optBoolean("failed", false)
+        } catch (e: Exception) { true }
+    }
+
     private fun gatedAuthor(channel: Channel, streamId: String, meta: JSONObject): String? {
         val gate = channel.gateAddress ?: return null
         val publisher = meta.optString("publisherId").lowercase()
+        if (streamId.endsWith(StreamConstants.SUFFIX_ADMIN)) {
+            // -3 as the ACCOUNT: the owner publishes the admin stream under
+            // their own address — the transport validated the plain EVM
+            // signature, and the namespace prefix IS the authority. The
+            // clone-published path below stays for pre-switch history.
+            val admin = channel.messageStreamId.substringBefore('/').lowercase()
+            if (publisher == admin) return publisher
+        }
         if (publisher != gate) return null
         val signer = meta.optString("signer").lowercase().ifEmpty { null } ?: run {
             Log.w(TAG, "gated: unrecoverable envelope on $streamId — dropping")
@@ -5632,7 +5741,16 @@ class ChannelManager(
         // Gated: the transport is the clone for everyone — the author is the
         // envelope signer, resolved by gatedAuthor (drop on failure; D10c).
         val author = if (channel.type == "gated") {
-            gatedAuthor(channel, streamId, meta) ?: return
+            val signer = gatedAuthor(channel, streamId, meta) ?: return
+            // Live cut for lapsed access (N-F): sticky membership keeps an
+            // expired subscriber's messages transport-valid until the next
+            // rotation (§7.11) — honest clients drop them at ingest instead.
+            // Fail-OPEN: an unreachable chain renders the message; the
+            // fail-closed side stays in the key layer. Resends are exempt —
+            // without storedAt (Q11) a resent message's write-time cannot
+            // be judged.
+            if (!historical && !liveGateAccessAllows(channel, signer)) return
+            signer
         } else meta.optString("publisherId")
         val account = attachAccount(data, author)
 

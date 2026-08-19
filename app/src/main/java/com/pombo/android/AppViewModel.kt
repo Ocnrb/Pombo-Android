@@ -808,7 +808,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         }
     }
 
-    suspend fun channelMembers(): List<String> = manager.channelMembers()
+    suspend fun channelMembers(): List<ChannelManager.MemberRow> = manager.channelMembers()
 
     /** On-chain permission matrix for the Members panel's Stream Permissions. */
     suspend fun streamPermissions(): List<com.pombo.android.core.GraphApi.StreamPermission> =
@@ -1951,6 +1951,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     data class GateEntry(
         val info: ChannelManager.GateEntryInfo,
         val channelName: String?,
+        /** Renewing from inside the channel: pay is always offered, no "Enter". */
+        val renewal: Boolean = false,
         val retry: suspend () -> Unit
     )
 
@@ -1959,9 +1961,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
 
     fun dismissGateEntry() { _gateEntry.value = null }
 
-    private suspend fun openGateEntry(gateAddress: String, channelName: String?, retry: suspend () -> Unit) {
+    private suspend fun openGateEntry(
+        gateAddress: String, channelName: String?,
+        renewal: Boolean = false, retry: suspend () -> Unit
+    ) {
         try {
-            _gateEntry.value = GateEntry(manager.gateEntryInfo(gateAddress), channelName, retry)
+            _gateEntry.value = GateEntry(manager.gateEntryInfo(gateAddress), channelName, renewal, retry)
         } catch (e: Exception) {
             toast(
                 "Could not read the gate contract: ${com.pombo.android.core.ChainErrors.friendly(e)}",
@@ -1974,7 +1979,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     fun gateEntryRecheck() = viewModelScope.launch {
         val entry = _gateEntry.value ?: return@launch
         manager.gateInvalidateAccess(entry.info.gateAddress)
-        openGateEntry(entry.info.gateAddress, entry.channelName, entry.retry)
+        openGateEntry(entry.info.gateAddress, entry.channelName, entry.renewal, entry.retry)
+    }
+
+    /** The current user's PAID standing on the open channel (null = not paid-gated). */
+    val paidStatus get() = manager.paidStatus
+
+    /**
+     * Renew (or restore) the subscription from inside the open channel — the
+     * entry screen in renewal mode. After payment the retry re-reads the
+     * standing and fires one immediate KEY_REQUEST: requests sent while
+     * expired were refused silently, so waiting out the backoff would leave
+     * the channel locked for up to a minute after paying.
+     */
+    fun renewSubscription() = viewModelScope.launch {
+        val channel = manager.current.value ?: return@launch
+        val gate = channel.gateAddress ?: return@launch
+        openGateEntry(gate, channel.name, renewal = true) {
+            manager.gateInvalidateAccess(gate)
+            manager.refreshPaidStatus()
+            manager.requestChannelKeysNow()
+        }
     }
 
     /** Enter: the deny that opened this screen is cached fail-closed 10 min —
