@@ -2261,6 +2261,12 @@ const api = {
     // first — USDT-style tokens revert on non-zero → non-zero). Three txs
     // worst case, one when balance and allowance already cover it.
     async gatePay(a) {
+        // Each on-chain step is announced to Kotlin so the loading toast can
+        // narrate the flow (web parity: gateManager.pay's onStep) — worst
+        // case three transactions with the user staring at one spinner.
+        const progress = function (step) {
+            try { Native.progress('gatePay', step); } catch (e) { /* shell without the hook */ }
+        };
         const info = await api.gateInfo(a);
         const price = BigInt(info.price);
         const signer = api._gateSigner();
@@ -2273,6 +2279,7 @@ const api = {
                 const shortfall = price - balance;
                 const native = await signer.provider.getBalance(signer.address);
                 if (native <= shortfall) throw new Error('Not enough POL to cover the subscription price');
+                progress('wrap');
                 const wrapper = new window.ethers.Contract(info.token, api._WRAPPED_NATIVE_ABI, signer);
                 const wrapTx = await wrapper.deposit({ value: shortfall });
                 await wrapTx.wait();
@@ -2282,6 +2289,7 @@ const api = {
 
         const allowance = await token.allowance(signer.address, a.gate);
         if (allowance < price) {
+            progress('approve');
             if (allowance > 0n) {
                 const resetTx = await token.approve(a.gate, 0n);
                 await resetTx.wait();
@@ -2291,6 +2299,7 @@ const api = {
             approved = true;
         }
 
+        progress('pay');
         const result = await api._gateTx(a.gate, 'pay', []);
         result.wrapped = wrapped;
         result.approved = approved;

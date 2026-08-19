@@ -1086,6 +1086,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         _toasts.value = _toasts.value.filterNot { it.id == id }
     }
 
+    /** Swap a live toast's message (web: showLoadingToast re-issued per step). */
+    fun updateToast(id: Long, message: String) {
+        _toasts.value = _toasts.value.map { if (it.id == id) it.copy(message = message) else it }
+    }
+
     private val _newMnemonic = MutableStateFlow<String?>(null)
     val newMnemonic: StateFlow<String?> = _newMnemonic.asStateFlow()
 
@@ -1959,6 +1964,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     private val _gateEntry = MutableStateFlow<GateEntry?>(null)
     val gateEntry: StateFlow<GateEntry?> = _gateEntry.asStateFlow()
 
+    /** The live pay toast, while gatePay runs — its message follows the
+     *  bridge's step announcements (wrap → approve → pay). */
+    @Volatile private var payToastId: Long? = null
+
+    override fun onBridgeProgress(op: String, step: String) {
+        if (op != "gatePay") return
+        val id = payToastId ?: return
+        updateToast(id, when (step) {
+            "wrap" -> "Wrapping POL…"
+            "approve" -> "Approving token…"
+            else -> "Paying subscription…"
+        })
+    }
+
     fun dismissGateEntry() { _gateEntry.value = null }
 
     private suspend fun openGateEntry(
@@ -2017,8 +2036,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
             "Pay subscription",
             "Pays one subscription period to this channel's gate (may wrap POL and approve the token first)."
         ) {
-            val ok = runWithToast("Paying subscription…", null, "Payment failed") {
-                manager.gatePay(entry.info.gateAddress)
+            val ok = try {
+                runWithToast(
+                    "Paying subscription…", null, "Payment failed",
+                    onToastId = { payToastId = it }
+                ) {
+                    manager.gatePay(entry.info.gateAddress)
+                }
+            } finally {
+                payToastId = null
             }
             if (ok) {
                 _gateEntry.value = null
@@ -2775,9 +2801,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         loading: String,
         success: String?,
         failure: String,
+        /** Hands the loading toast's id to flows that update it mid-run. */
+        onToastId: ((Long) -> Unit)? = null,
         block: suspend () -> Unit
     ): Boolean {
         val id = toast(loading, com.pombo.android.ui.ToastKind.LOADING, Long.MAX_VALUE)
+        onToastId?.invoke(id)
         _busy.value = true
         return try {
             block()

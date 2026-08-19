@@ -57,6 +57,8 @@ class PomboBridge(
          * to implement it.
          */
         fun onBridgeBinary(streamId: String, partition: Int, data: ByteArray, metaJson: String) {}
+        /** Step announcements from multi-transaction bridge flows (gatePay). */
+        fun onBridgeProgress(op: String, step: String) {}
         fun onBridgeError(message: String)
     }
 
@@ -409,6 +411,9 @@ class PomboBridge(
             val meta = try { String(Base64.decode(metaB64, Base64.NO_WRAP), Charsets.UTF_8) } catch (e: Exception) { "{}" }
             listener.onBridgeBinary(streamId, partition, data, meta)
         }
+
+        @JavascriptInterface
+        fun progress(op: String, step: String) { main.post { listener.onBridgeProgress(op, step) } }
 
         @JavascriptInterface
         fun error(msg: String) { main.post { listener.onBridgeError(msg) } }

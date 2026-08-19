@@ -344,28 +344,39 @@ internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
     // any ERC-20 can call itself "WPOL".
     val paySymbol = if (info.token.lowercase() == com.pombo.android.ChannelManager.WRAPPED_NATIVE)
         "POL" else info.tokenSymbol
-    val requirement = when (info.mode) {
-        GateModes.TOKEN -> "Hold at least ${fmt(info.minBalance, info.tokenDecimals)} ${info.tokenSymbol}."
-        GateModes.NFT -> "Hold a ${info.tokenSymbol} NFT."
-        GateModes.PAID -> "${fmt(info.price, info.tokenDecimals)} $paySymbol for $daysLabel days. " +
-            "Renewing extends from the current end."
-        else -> "This is a closed channel — members are added by the owner. " +
-            "Ask the owner to add your address, then check again."
-    }
-    val status = when (info.mode) {
-        GateModes.TOKEN -> "Your balance: ${fmt(info.balance, info.tokenDecimals)} ${info.tokenSymbol}" +
-            if (holds) " — access granted" else ""
-        GateModes.NFT ->
-            if (holds) "You hold ${info.balance} — access granted"
-            else "You hold none — acquire one to enter"
-        GateModes.PAID ->
-            if (subscribed) "Subscribed until " + java.text.SimpleDateFormat(
-                "yyyy-MM-dd HH:mm", java.util.Locale.getDefault()
-            ).format(java.util.Date(info.paidUntil * 1000L)) +
-                " (${com.pombo.android.core.GateFormat.formatRemaining(paidMsLeft)} left)"
-            else if (info.paidUntil > 0) "Subscription expired"
-            else "No active subscription"
+    // Access stack — the Explore cards' anatomy (verb / value / qualifier)
+    val stack: Triple<String, String, String>? = when (info.mode) {
+        GateModes.TOKEN -> Triple("Hold", "${fmt(info.minBalance, info.tokenDecimals)} ${info.tokenSymbol}", "in your wallet")
+        GateModes.NFT -> Triple("Hold", "${info.tokenSymbol} NFT", "in your wallet")
+        GateModes.PAID -> Triple(
+            "Subscribe", "${fmt(info.price, info.tokenDecimals)} $paySymbol",
+            "per $daysLabel " + if (daysLabel == "1") "day" else "days"
+        )
         else -> null
+    }
+    // One status line, state-coloured: green = access granted, red = blocked
+    val okTone = Color(0xFF34D399).copy(alpha = 0.90f)
+    val badTone = Color(0xFFF87171).copy(alpha = 0.80f)
+    val dimTone = Color.White.copy(alpha = 0.50f)
+    val status: Pair<String, Color>? = when (info.mode) {
+        GateModes.TOKEN -> {
+            val bal = "Balance: ${fmt(info.balance, info.tokenDecimals)} ${info.tokenSymbol}"
+            if (holds) "$bal · access granted" to okTone else bal to badTone
+        }
+        GateModes.NFT ->
+            if (holds) "You hold ${info.balance} · access granted" to okTone
+            else "You hold none" to badTone
+        GateModes.PAID ->
+            if (subscribed) {
+                val until = java.text.SimpleDateFormat("dd/MM/yy, HH:mm", java.util.Locale.getDefault())
+                    .format(java.util.Date(info.paidUntil * 1000L))
+                "Active until $until · ${com.pombo.android.core.GateFormat.formatRemaining(paidMsLeft)} left" to okTone
+            } else if (info.paidUntil > 0) "Subscription expired" to badTone
+            else "No active subscription" to dimTone
+        else -> null
+    }
+    val notes = buildList {
+        if (entry.renewal && info.mode == GateModes.PAID) add("Renewing extends from the current end.")
     }
 
     androidx.activity.compose.BackHandler(onBack = vm::dismissGateEntry)
@@ -377,47 +388,86 @@ internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
             Modifier.padding(24.dp).fillMaxWidth()
                 .background(Color(0xFF111113), RoundedCornerShape(16.dp))
                 .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(16.dp))
-                .padding(20.dp)
+                .padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
                 if (entry.renewal) entry.channelName?.let { "Renew $it" } ?: "Renew Subscription"
                 else entry.channelName?.let { "Join $it" } ?: "Join Gated Channel",
-                color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium
+                color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
 
-            Spacer(Modifier.height(14.dp))
-            Text("REQUIREMENT", color = Color.White.copy(alpha = 0.30f), fontSize = 10.sp, letterSpacing = 0.8.sp)
-            Spacer(Modifier.height(4.dp))
-            Text(requirement, color = Color.White.copy(alpha = 0.80f), fontSize = 14.sp, lineHeight = 20.sp)
-
-            status?.let {
-                Spacer(Modifier.height(12.dp))
-                Text("YOUR STATUS", color = Color.White.copy(alpha = 0.30f), fontSize = 10.sp, letterSpacing = 0.8.sp)
+            Spacer(Modifier.height(20.dp))
+            if (stack != null) {
+                val (verb, value, qualifier) = stack
+                Text(
+                    verb.uppercase(),
+                    color = if (info.mode == GateModes.PAID) Color(0xFFF6851B).copy(alpha = 0.70f)
+                    else Color.White.copy(alpha = 0.40f),
+                    fontSize = 10.sp, letterSpacing = 2.sp
+                )
                 Spacer(Modifier.height(4.dp))
-                Text(it, color = Color.White.copy(alpha = 0.80f), fontSize = 14.sp, lineHeight = 20.sp)
+                Text(value, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                Spacer(Modifier.height(4.dp))
+                Text(qualifier, color = Color.White.copy(alpha = 0.40f), fontSize = 12.sp)
+            } else {
+                Text(
+                    "This is a closed channel — members are added by the owner. " +
+                        "Ask the owner to add your address, then check again.",
+                    color = Color.White.copy(alpha = 0.70f), fontSize = 14.sp, lineHeight = 20.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
             }
 
-            if (info.mode == GateModes.PAID && (!subscribed || entry.renewal) &&
-                info.token.lowercase() == com.pombo.android.ChannelManager.WRAPPED_NATIVE
-            ) {
-                Spacer(Modifier.height(8.dp))
+            status?.let { (text, tone) ->
+                Spacer(Modifier.height(16.dp))
+                Text(text, color = tone, fontSize = 14.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            }
+
+            if (notes.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
                 Text(
-                    "Plain POL works — it is wrapped automatically when you pay.",
-                    color = Color.White.copy(alpha = 0.30f), fontSize = 12.sp
+                    notes.joinToString(" "),
+                    color = Color.White.copy(alpha = 0.30f), fontSize = 12.sp, lineHeight = 16.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
                 )
             }
 
             if ((info.mode == GateModes.TOKEN || info.mode == GateModes.NFT) && holds) {
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "Register membership on-chain (1 tx) — keeps your messages valid even after you sell the asset.",
+                    "Register membership on-chain (1 tx)",
                     color = Color.White.copy(alpha = 0.40f), fontSize = 12.sp,
                     textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline,
                     modifier = Modifier.clickableNoRipple { vm.gateEntryJoin() }
                 )
             }
 
-            Spacer(Modifier.height(18.dp))
+            Spacer(Modifier.height(24.dp))
+            val primary: Pair<String, () -> Unit>? = when {
+                // Renewal: pay is always the action — the contract extends
+                // from the current end, so paying early never loses days
+                entry.renewal && info.mode == GateModes.PAID ->
+                    (if (subscribed) "Renew — ${fmt(info.price, info.tokenDecimals)} $paySymbol"
+                    else "Pay ${fmt(info.price, info.tokenDecimals)} $paySymbol") to { vm.gateEntryPay(); Unit }
+                info.mode == GateModes.PAID && !subscribed ->
+                    "Pay ${fmt(info.price, info.tokenDecimals)} $paySymbol" to { vm.gateEntryPay(); Unit }
+                subscribed || holds -> "Enter Channel" to { vm.gateEntryEnter(); Unit }
+                else -> null
+            }
+            primary?.let { (label, action) ->
+                Box(
+                    Modifier.fillMaxWidth()
+                        .background(Color.White, RoundedCornerShape(12.dp))
+                        .clickableNoRipple(action)
+                        .padding(vertical = 11.dp),
+                    contentAlignment = Alignment.Center
+                ) { Text(label, color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1) }
+                Spacer(Modifier.height(8.dp))
+            }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box(
                     Modifier.weight(1f)
@@ -436,27 +486,6 @@ internal fun GateEntryDialog(vm: AppViewModel, entry: AppViewModel.GateEntry) {
                         .padding(vertical = 10.dp),
                     contentAlignment = Alignment.Center
                 ) { Text("Check Again", color = Color.White.copy(alpha = 0.70f), fontSize = 13.sp, fontWeight = FontWeight.Medium) }
-
-                val primary: Pair<String, () -> Unit>? = when {
-                    // Renewal: pay is always the action — the contract extends
-                    // from the current end, so paying early never loses days
-                    entry.renewal && info.mode == GateModes.PAID ->
-                        (if (subscribed) "Renew ${fmt(info.price, info.tokenDecimals)} $paySymbol"
-                        else "Pay ${fmt(info.price, info.tokenDecimals)} $paySymbol") to { vm.gateEntryPay(); Unit }
-                    info.mode == GateModes.PAID && !subscribed ->
-                        "Pay ${fmt(info.price, info.tokenDecimals)} $paySymbol" to { vm.gateEntryPay(); Unit }
-                    subscribed || holds -> "Enter" to { vm.gateEntryEnter(); Unit }
-                    else -> null
-                }
-                primary?.let { (label, action) ->
-                    Box(
-                        Modifier.weight(1f)
-                            .background(Color.White, RoundedCornerShape(12.dp))
-                            .clickableNoRipple(action)
-                            .padding(vertical = 10.dp),
-                        contentAlignment = Alignment.Center
-                    ) { Text(label, color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1) }
-                }
             }
         }
     }
@@ -5522,11 +5551,19 @@ private fun MessageGroup(
     // scrolling away with the group's start. Compose has no sticky-within-item,
     // so it is computed: how far the group's bottom is past the visible bottom,
     // clamped so the avatar never rises above the group's own top.
-    val overhangPx = with(LocalDensity.current) { 12.dp.toPx() }
     val avatarPx = with(LocalDensity.current) { 36.dp.toPx() }
     val stickyInsetPx = with(LocalDensity.current) { 12.dp.toPx() }
     /** Must match the group Row's bottom padding, which reserves the overhang. */
     val bottomReservePx = with(LocalDensity.current) { 14.dp.toPx() }
+    // The 12dp overhang is drawn against a bubble's frame. When the group
+    // CLOSES with bare content (jumbo emoji, image, file card) the group's
+    // bottom edge is the footer (timestamp) hanging under the content — the
+    // avatar rises past it and aligns with the CONTENT's bottom instead
+    // (web: the :has() rule on the rail's margin-bottom).
+    val last = group.items.last()
+    val lastBare = last.isImage || last.file != null || last.storageFile != null ||
+        (emojiOnlyKind(last.text) != null)
+    val overhangPx = with(LocalDensity.current) { if (lastBare) (-18).dp.toPx() else 12.dp.toPx() }
 
     /**
      * `.message-group-avatar-rail { position: sticky; bottom: 0 }`.
