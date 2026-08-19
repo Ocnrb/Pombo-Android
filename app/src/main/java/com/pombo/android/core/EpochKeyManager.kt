@@ -830,6 +830,70 @@ class EpochKeyManager(
         }
     }
 
+    /** The current epoch key with its kid — for sealers that capture one key
+     *  per transfer (storage chunks), like a message captures one at send. */
+    data class CurrentKey(val kid: String, val keyHex: String)
+
+    /** The current key, or null while waiting for one (caller fails closed). */
+    suspend fun currentKey(messageStreamId: String): CurrentKey? {
+        return mutex.withLock {
+            val s = state[messageStreamId] ?: return null
+            if (s.currentEpoch == 0) return null
+            val announce = s.announces[s.currentEpoch] ?: return null
+            if (!s.epochs.containsKey(announce.keyId)) return null
+            CurrentKey(announce.keyId, s.epochs[announce.keyId]!!.keyHex)
+        }
+    }
+
+    /**
+     * Seal a binary frame (media piece) with the CURRENT epoch key, or null
+     * while waiting for one — the caller fails closed, exactly like
+     * [encryptCurrent] for JSON payloads.
+     */
+    suspend fun sealBinaryCurrent(messageStreamId: String, bytes: ByteArray): ByteArray? {
+        return mutex.withLock {
+            val s = state[messageStreamId] ?: return null
+            if (s.currentEpoch == 0) return null
+            val announce = s.announces[s.currentEpoch] ?: return null
+            val entry = s.epochs[announce.keyId] ?: return null
+            EpochKeyCrypto.sealBinaryWithEpochKey(bytes, entry.keyHex, announce.keyId)
+        }
+    }
+
+    /**
+     * Open an epoch binary envelope (0x04) — same policy as [tryDecrypt]:
+     * unknown kid → rate-limited refresh + null; gated freshness violation →
+     * null without a refresh (stale-key spam, not a missing key).
+     */
+    suspend fun tryOpenBinary(
+        messageStreamId: String, keysStreamId: String, bytes: ByteArray,
+        gated: Boolean = false, live: Boolean = true, timestamp: Long = 0L
+    ): ByteArray? {
+        val parsed = EpochKeyCrypto.parseBinaryEpochEnvelope(bytes) ?: return null
+        val lookup = mutex.withLock {
+            val s = state[messageStreamId]
+            val entry = s?.epochs?.get(parsed.kid)
+            if (entry == null) null else {
+                val fresh = !gated || kidIsFreshLocked(s, parsed.kid, entry.epoch, live, timestamp)
+                Pair(entry.keyHex, fresh)
+            }
+        }
+        if (lookup == null) {
+            noteMissingKid(messageStreamId, keysStreamId)
+            return null
+        }
+        if (!lookup.second) {
+            Log.w(TAG, "kid freshness violation (kid ${parsed.kid}, live=$live) — dropping")
+            return null
+        }
+        return try {
+            EpochKeyCrypto.decryptBinaryWithEpochKey(parsed, lookup.first)
+        } catch (e: Exception) {
+            Log.w(TAG, "epoch binary envelope failed to open (kid ${parsed.kid}): ${e.message}")
+            null
+        }
+    }
+
     /** The kid-freshness rule (caller holds the lock). True = acceptable. */
     private fun kidIsFreshLocked(
         s: ChannelState, kid: String, kidEpoch: Int, live: Boolean, timestamp: Long

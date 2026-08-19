@@ -36,7 +36,14 @@ class MediaController(
     private val myAddress: () -> String?,
     /** Where partial downloads live. Must be under filesDir, never cacheDir. */
     private val transferDir: () -> File,
-    private val transport: Transport
+    private val transport: Transport,
+    /**
+     * Gate clone address when the stream belongs to a GATED channel, else
+     * null. Media subscribes need it: access is proved via the gate's
+     * ERC-1271 (no per-member grant exists), and the bridge must recover the
+     * envelope signer so piece authorship survives the shared clone publisher.
+     */
+    private val gateAddressFor: (String) -> String? = { null }
 ) {
 
     private companion object {
@@ -422,6 +429,11 @@ class MediaController(
         try {
             val args = JSONObject().put("streamId", streamId).put("partition", partition)
             if (password != null) args.put("password", password)
+            // Gated: prove access via the gate contract and recover the
+            // envelope signer — piece authorship on a shared clone publisher.
+            gateAddressFor(streamId)?.let {
+                args.put("erc1271Contract", it).put("recoverSigner", true)
+            }
             bridge.call("subscribe", args)
         } catch (e: Exception) {
             Log.w(TAG, "subscribe $streamId#$partition failed: ${e.message}")

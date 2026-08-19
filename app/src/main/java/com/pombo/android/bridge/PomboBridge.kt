@@ -274,6 +274,17 @@ class PomboBridge(
          * channel identity's inline proof and publishes under that identity.
          */
         channelEphemeral: Boolean = false,
+        /**
+         * Epoch piece on a GATED channel: publish as the gate clone
+         * (ERC-1271) — the bytes arrive already epoch-sealed (0x04).
+         */
+        gateAddress: String? = null,
+        /**
+         * Epoch piece on a NATIVE channel: publish as the account with
+         * encryptionType NONE (client.publish on a members-only stream would
+         * re-wrap the sealed bytes in the SDK's group-key AES).
+         */
+        asAccount: Boolean = false,
         timeoutMs: Long = 45_000
     ) {
         withTimeout(timeoutMs) { pageReadyFlow.first { it } }
@@ -285,6 +296,8 @@ class PomboBridge(
         if (password != null) args.put("password", password)
         if (dmSealerKey != null) args.put("dmSealerKey", dmSealerKey)
         if (channelEphemeral) args.put("channelEphemeral", true)
+        if (gateAddress != null) args.put("gateAddress", gateAddress)
+        if (asAccount) args.put("asAccount", true)
         val argsB64 = Base64.encodeToString(args.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val dataB64 = Base64.encodeToString(data, Base64.NO_WRAP)
         inFlightBytes.addAndGet(data.size.toLong())
@@ -331,6 +344,14 @@ class PomboBridge(
          * readOnly channels leave this false and publish under the account.
          */
         channelEphemeral: Boolean = false,
+        /** Gated channel chunk: publish as the gate clone (ERC-1271). */
+        gateAddress: String? = null,
+        /**
+         * Native epoch chunk: publish as the account with encryptionType NONE
+         * (client.publish on a members-only stream would re-wrap the sealed
+         * bytes in the SDK's group-key AES and break the HTTP hex reader).
+         */
+        asAccount: Boolean = false,
         timeoutMs: Long = 45_000
     ): Long {
         withTimeout(timeoutMs) { pageReadyFlow.first { it } }
@@ -342,6 +363,8 @@ class PomboBridge(
         if (dmPeerPublicKey != null) args.put("dmPeerPublicKey", dmPeerPublicKey)
         if (chunkIdentityKey != null) args.put("chunkIdentityKey", chunkIdentityKey)
         if (channelEphemeral) args.put("channelEphemeral", true)
+        if (gateAddress != null) args.put("gateAddress", gateAddress)
+        if (asAccount) args.put("asAccount", true)
         val argsB64 = Base64.encodeToString(args.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         val dataB64 = Base64.encodeToString(data, Base64.NO_WRAP)
         inFlightBytes.addAndGet(data.size.toLong())

@@ -149,6 +149,72 @@ object EpochKeyCrypto {
             data.optString("ct").isNotEmpty() &&
             data.optString("iv").isNotEmpty()
 
+    /**
+     * Leading byte of an epoch-sealed binary envelope (MEDIA_DATA frames and
+     * storage chunks). The partitions' other frames claim 0x01/0x03 (media)
+     * and 0x02 (sealed sender) — never reuse any of them.
+     */
+    const val BINARY_EPOCH_VERSION: Byte = 0x04
+
+    /** Parsed epoch binary envelope: the kid in the clear, iv and ct raw. */
+    data class BinaryEnvelope(val kid: String, val iv: ByteArray, val ct: ByteArray)
+
+    /**
+     * Seal a binary frame with an epoch key — byte-exact mirror of the web's
+     * sealBinaryWithEpochKey. Frame:
+     *   [1B version=0x04] [1B kidLen] [kidLen B kid UTF-8] [12B iv] [ct]
+     */
+    fun sealBinaryWithEpochKey(bytes: ByteArray, epochKeyHex: String, kid: String): ByteArray {
+        val kidBytes = kid.toByteArray(Charsets.UTF_8)
+        require(kidBytes.isNotEmpty() && kidBytes.size <= 255) {
+            "Epoch kid does not fit the binary envelope: $kid"
+        }
+        val iv = ByteArray(12).also { random.nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.ENCRYPT_MODE,
+            SecretKeySpec(SealedSenderCrypto.hexToBytes(epochKeyHex), "AES"),
+            GCMParameterSpec(128, iv)
+        )
+        val ct = cipher.doFinal(bytes)
+
+        val out = ByteArray(2 + kidBytes.size + 12 + ct.size)
+        out[0] = BINARY_EPOCH_VERSION
+        out[1] = kidBytes.size.toByte()
+        System.arraycopy(kidBytes, 0, out, 2, kidBytes.size)
+        System.arraycopy(iv, 0, out, 2 + kidBytes.size, 12)
+        System.arraycopy(ct, 0, out, 2 + kidBytes.size + 12, ct.size)
+        return out
+    }
+
+    /** true when a raw payload is an epoch-sealed binary envelope. */
+    fun isBinaryEpochEnvelope(bytes: ByteArray?): Boolean =
+        bytes != null && bytes.isNotEmpty() && bytes[0] == BINARY_EPOCH_VERSION
+
+    /** Split an epoch binary envelope into its parts, or null if malformed. */
+    fun parseBinaryEpochEnvelope(bytes: ByteArray): BinaryEnvelope? {
+        if (!isBinaryEpochEnvelope(bytes) || bytes.size < 2) return null
+        val kidLen = bytes[1].toInt() and 0xFF
+        // Minimum ct is the bare 16-byte GCM tag (empty plaintext)
+        if (kidLen == 0 || bytes.size < 2 + kidLen + 12 + 16) return null
+        return BinaryEnvelope(
+            kid = String(bytes, 2, kidLen, Charsets.UTF_8),
+            iv = bytes.copyOfRange(2 + kidLen, 2 + kidLen + 12),
+            ct = bytes.copyOfRange(2 + kidLen + 12, bytes.size)
+        )
+    }
+
+    /** Open a parsed epoch binary envelope. @throws on a wrong key (GCM tag). */
+    fun decryptBinaryWithEpochKey(parsed: BinaryEnvelope, epochKeyHex: String): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(SealedSenderCrypto.hexToBytes(epochKeyHex), "AES"),
+            GCMParameterSpec(128, parsed.iv)
+        )
+        return cipher.doFinal(parsed.ct)
+    }
+
     private fun sha256(data: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(data)
 

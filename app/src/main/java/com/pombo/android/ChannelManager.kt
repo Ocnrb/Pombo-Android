@@ -265,6 +265,9 @@ class ChannelManager(
         scope = scope,
         myAddress = myAddress,
         transferDir = { transferDir },
+        gateAddressFor = { streamId ->
+            channelByStream(streamId)?.takeIf { it.type == "gated" }?.gateAddress
+        },
         transport = object : com.pombo.android.core.MediaController.Transport {
             /**
              * Signals seal in the BRIDGE rather than through [publishContent].
@@ -344,17 +347,39 @@ class ChannelManager(
                     )
                     return
                 }
+                // Epoch channels (native/gated): the piece is sealed with the
+                // epoch key in Kotlin (0x04 envelope), no inline proof —
+                // authorship comes from the same place as the channel's
+                // messages (transport account on native, envelope signer on
+                // gated). Fail closed while waiting for a key: a plaintext or
+                // ephemeral-key fallback would leak or be rejected.
+                val channel = channelByStream(ephemeralStreamId)
+                if (isEpochChannel(channel)) {
+                    val sealed = epochKeys.sealBinaryCurrent(channel!!.messageStreamId, bytes)
+                        ?: throw IllegalStateException(
+                            "No epoch key for ${channel.messageStreamId} — cannot send media")
+                    val gate = if (channel.type == "gated") {
+                        channel.gateAddress ?: throw IllegalStateException(
+                            "Gate address unknown for ${channel.messageStreamId} — cannot publish")
+                    } else null
+                    bridge.publishBinary(
+                        ephemeralStreamId,
+                        StreamConstants.EPH_MEDIA_DATA,
+                        sealed,
+                        password = null,
+                        gateAddress = gate,
+                        asAccount = gate == null
+                    )
+                    return
+                }
                 // Channel pieces carry the inline proof (0x03) and publish
-                // under the channel identity — native channels stay on the
-                // account (their grants are on-chain per member; the piece
-                // stays a legacy 0x01 frame there).
-                val ephemeral = !isEpochChannel(channelByStream(ephemeralStreamId))
+                // under the channel identity.
                 bridge.publishBinary(
                     ephemeralStreamId,
                     StreamConstants.EPH_MEDIA_DATA,
                     bytes,
                     password,
-                    channelEphemeral = ephemeral
+                    channelEphemeral = true
                 )
             }
         }
@@ -5504,20 +5529,28 @@ class ChannelManager(
             }
             // v1 envelopes (pre-migration) no longer open — P6.
             if (content is JSONObject && content.optString("e") == "aes-256-gcm") return
-            // Native channel signals arrive as epoch envelopes (N-A): open
-            // with the channel's epoch key first — unknown kid skips, not
-            // errors; the signal re-fires on the sender's next retry.
+            // Epoch channel signals arrive as epoch envelopes: open with the
+            // channel's epoch key first — unknown kid skips, not errors; the
+            // signal re-fires on the sender's next retry.
             if (content is JSONObject && com.pombo.android.core.EpochKeyCrypto.isEpochEnvelope(content)) {
                 val ch = channelByStream(streamId)
                 if (ch != null && isEpochChannel(ch)) {
+                    // Gated: the on-wire publisher is the CLONE — the seeder/
+                    // leecher identity the media controller needs is the
+                    // envelope signer, never the transport publisher.
+                    val author = if (ch.type == "gated") {
+                        gatedAuthor(ch, streamId, meta) ?: return
+                    } else publisher
                     scope.launch {
                         val keysId = ch.keysStreamId.ifEmpty {
                             StreamConstants.deriveKeysId(ch.messageStreamId)
                         }
-                        val plain = epochKeys.tryDecrypt(ch.messageStreamId, keysId, content)
-                            ?: return@launch
-                        val acct = attachAccount(plain, publisher) ?: publisher
-                        media.onSignal(streamId, plain, acct)
+                        val plain = epochKeys.tryDecrypt(
+                            ch.messageStreamId, keysId, content,
+                            gated = ch.type == "gated", live = true,
+                            timestamp = meta.optLong("timestamp", 0L)
+                        ) ?: return@launch
+                        media.onSignal(streamId, plain, author)
                     }
                 }
                 return
@@ -5565,6 +5598,27 @@ class ChannelManager(
         if (partition != StreamConstants.EPH_MEDIA_DATA) return
         if (!StreamConstants.isEphemeralStream(streamId)) return
         val meta = try { JSONObject(metaRaw) } catch (e: Exception) { JSONObject() }
+        // Epoch channel piece (0x04): open with the epoch key, then hand the
+        // plaintext 0x01 frame down the unchanged store/assembly path. The
+        // sender is resolved the way the channel's messages resolve theirs —
+        // transport account on native, envelope signer on gated — an unknown
+        // kid notes itself (rate-limited KEY_REQUEST) and the piece is
+        // dropped; the leecher's timeout re-requests it once the key lands.
+        if (com.pombo.android.core.EpochKeyCrypto.isBinaryEpochEnvelope(data)) {
+            val channel = channelByStream(streamId)?.takeIf { isEpochChannel(it) } ?: return
+            scope.launch {
+                val gated = channel.type == "gated"
+                val author = if (gated) gatedAuthor(channel, streamId, meta) ?: return@launch
+                    else meta.optString("publisherId").lowercase().ifEmpty { null }
+                val opened = epochKeys.tryOpenBinary(
+                    channel.messageStreamId, channel.keysStreamId, data,
+                    gated = gated, live = true,
+                    timestamp = meta.optLong("timestamp", 0L)
+                ) ?: return@launch
+                media.onBinary(streamId, opened, author)
+            }
+            return
+        }
         // `account` is the proof-recovered sender the bridge stamps when it
         // opens a sealed DM piece (0x02).
         val identity = meta.optString("account").lowercase().ifEmpty { null }
@@ -5961,6 +6015,18 @@ class ChannelManager(
         storageTransferChannel[tid] = StorageTransferInfo(source.fileName, channelDisplayName(channel), channel.messageStreamId, bubble)
         mergeMessages(listOf(bubble))
         try {
+            // Epoch channels (native/gated): capture the CURRENT key for the
+            // whole transfer and fail closed without one — a plaintext chunk
+            // on a stored partition would be harvestable forever.
+            val epochKey = if (!isDm && isEpochChannel(channel)) {
+                epochKeys.currentKey(channel.messageStreamId)
+                    ?: throw IllegalStateException(
+                        "No epoch key for ${channel.messageStreamId} — cannot store media")
+            } else null
+            val gate = if (!isDm && channel.type == "gated") {
+                channel.gateAddress ?: throw IllegalStateException(
+                    "Gate address unknown for ${channel.messageStreamId} — cannot publish")
+            } else null
             val result = storageMedia.sendFile(
                 messageStreamId = channel.messageStreamId,
                 source = source,
@@ -5971,6 +6037,8 @@ class ChannelManager(
                 // ephemeral identity (same as the announce); native/readOnly
                 // keep the account (D3), same rule as publishChannel.
                 channelEphemeral = !isDm && !isEpochChannel(channel) && !channel.readOnly,
+                epochKey = epochKey,
+                gateAddress = gate,
                 messageId = id,
                 transferId = tid
             )
@@ -6015,6 +6083,24 @@ class ChannelManager(
                     storageMedia.downloadFile(
                         channel.messageStreamId, meta, msg.timestamp, channel.password,
                         isDm = true, dmInboxStreamId = "$me/Pombo-DM-1", peerPublicKey = peerPk
+                    )
+                } else if (isEpochChannel(channel)) {
+                    // Epoch chunks (0x04) resolve their kid per row; history
+                    // freshness (gated) judges old kids by the row's transport
+                    // timestamp. runBlocking is acceptable here: the opener
+                    // runs on the HTTP parser's IO thread, which already
+                    // blocks on the row handler as backpressure.
+                    val gated = channel.type == "gated"
+                    storageMedia.downloadFile(
+                        channel.messageStreamId, meta, msg.timestamp, password = null,
+                        epochOpener = { bytes, ts ->
+                            kotlinx.coroutines.runBlocking {
+                                epochKeys.tryOpenBinary(
+                                    channel.messageStreamId, channel.keysStreamId, bytes,
+                                    gated = gated, live = false, timestamp = ts
+                                )
+                            }
+                        }
                     )
                 } else {
                     storageMedia.downloadFile(channel.messageStreamId, meta, msg.timestamp, channel.password)

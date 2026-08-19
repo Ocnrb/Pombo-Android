@@ -2358,6 +2358,32 @@ window.bridgePublishBinary = function (id, argsB64, dataB64) {
             Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
             return;
         }
+        // Epoch channel piece (native/gated): the bytes arrive already sealed
+        // with the epoch key in Kotlin (0x04). Native rides the ACCOUNT (its
+        // grant is per member); gated the CLONE (ERC-1271) — an ephemeral key
+        // holds no grant on either, and client.publish would re-wrap a
+        // members-only stream in the SDK's group-key AES.
+        if (a.gateAddress) {
+            if (!wallet) throw new Error('no identity');
+            const st = window.SignatureType;
+            if (!st || st.ERC_1271 == null) {
+                throw new Error('SignatureType.ERC_1271 not exposed — refresh pombo-vendor.bundle.js');
+            }
+            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+            await api._publishAs(identity, a.streamId, a.partition, bytes, {
+                publisherId: String(a.gateAddress).toLowerCase(),
+                signatureType: st.ERC_1271
+            });
+            Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
+            return;
+        }
+        if (a.asAccount) {
+            if (!wallet) throw new Error('no identity');
+            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+            await api._publishAs(identity, a.streamId, a.partition, bytes);
+            Native.result(id, true, utf8ToB64(JSON.stringify({ ok: true, bytes: bytes.length })));
+            return;
+        }
         // Encrypted here for the same reason it is decrypted here: PBKDF2 in
         // BoringSSL rather than Bouncy Castle. The password never leaves the
         // WebView on this path — Kotlin hands over plaintext bytes.
@@ -2441,6 +2467,33 @@ window.bridgePublishStorageChunk = function (id, argsB64, dataB64) {
             const msg3 = await api._publishAs(identity, a.streamId, a.partition, bytes);
             Native.result(id, true, utf8ToB64(JSON.stringify(
                 { ok: true, bytes: bytes.length, timestamp: msg3.timestamp })));
+            return;
+        }
+        // Epoch channel chunk (native/gated): already epoch-sealed in Kotlin
+        // (0x04). publishAs sends encryptionType NONE — client.publish on a
+        // members-only stream would re-wrap it in the SDK's group-key AES and
+        // break the HTTP hex reader. Gated rides the clone (ERC-1271).
+        if (a.gateAddress) {
+            if (!wallet) throw new Error('no identity');
+            const st = window.SignatureType;
+            if (!st || st.ERC_1271 == null) {
+                throw new Error('SignatureType.ERC_1271 not exposed — refresh pombo-vendor.bundle.js');
+            }
+            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+            const msg4 = await api._publishAs(identity, a.streamId, a.partition, bytes, {
+                publisherId: String(a.gateAddress).toLowerCase(),
+                signatureType: st.ERC_1271
+            });
+            Native.result(id, true, utf8ToB64(JSON.stringify(
+                { ok: true, bytes: bytes.length, timestamp: msg4.timestamp })));
+            return;
+        }
+        if (a.asAccount) {
+            if (!wallet) throw new Error('no identity');
+            const identity = window.EthereumKeyPairIdentity.fromPrivateKey(wallet.privateKey);
+            const msg5 = await api._publishAs(identity, a.streamId, a.partition, bytes);
+            Native.result(id, true, utf8ToB64(JSON.stringify(
+                { ok: true, bytes: bytes.length, timestamp: msg5.timestamp })));
             return;
         }
         const msg = await client.publish(

@@ -101,4 +101,53 @@ class EpochKeyCryptoTest {
         assertFalse(EpochKeyCrypto.isEpochEnvelope(JSONObject().put("type", "text")))
         assertFalse(EpochKeyCrypto.isEpochEnvelope(JSONObject().put("e", "aes-256-gcm").put("ct", "x").put("iv", "y")))
     }
+
+    // ---- Binary envelope (0x04, MEDIA_DATA frames and storage chunks) ----
+
+    /** Sealed by the web's sealBinaryWithEpochKey with [epochKey] and [keyId]. */
+    private val webSealedBinary = java.util.Base64.getDecoder().decode(
+        "BAgzLmFiYzEyM5NAbRHzYjvd9oywAgICL5NA6blY8sNRd4pMk5IHnvn+LyOi5vvoNAxMiJol3YvezYNNd0hejQ==")
+
+    @Test
+    fun `opens a web-sealed binary envelope`() {
+        assertTrue(EpochKeyCrypto.isBinaryEpochEnvelope(webSealedBinary))
+        val parsed = EpochKeyCrypto.parseBinaryEpochEnvelope(webSealedBinary)!!
+        assertEquals(keyId, parsed.kid)
+        val plain = EpochKeyCrypto.decryptBinaryWithEpochKey(parsed, epochKey)
+        assertEquals("olá peça binária época", String(plain, Charsets.UTF_8))
+    }
+
+    @Test
+    fun `android binary seal round-trips and a wrong key fails`() {
+        val key = EpochKeyCrypto.generateEpochKey()
+        val frame = ByteArray(1024) { (it % 251).toByte() }
+        val sealed = EpochKeyCrypto.sealBinaryWithEpochKey(frame, key, "1.aaaa")
+        assertEquals(0x04, sealed[0].toInt())
+        val parsed = EpochKeyCrypto.parseBinaryEpochEnvelope(sealed)!!
+        assertEquals("1.aaaa", parsed.kid)
+        assertTrue(frame.contentEquals(EpochKeyCrypto.decryptBinaryWithEpochKey(parsed, key)))
+
+        val other = EpochKeyCrypto.generateEpochKey()
+        try {
+            EpochKeyCrypto.decryptBinaryWithEpochKey(parsed, other)
+            throw AssertionError("decrypt with the wrong key must fail")
+        } catch (e: Exception) { /* expected: GCM tag failure */ }
+    }
+
+    @Test
+    fun `binary envelope detection leaves the other frame types untouched`() {
+        // 0x01/0x03 media frames and 0x02 sealed-sender envelopes must never
+        // be mistaken for an epoch envelope.
+        for (lead in byteArrayOf(0x01, 0x02, 0x03)) {
+            assertFalse(EpochKeyCrypto.isBinaryEpochEnvelope(byteArrayOf(lead, 0, 0)))
+        }
+    }
+
+    @Test
+    fun `malformed binary envelopes parse to null`() {
+        assertEquals(null, EpochKeyCrypto.parseBinaryEpochEnvelope(byteArrayOf(0x04)))
+        assertEquals(null, EpochKeyCrypto.parseBinaryEpochEnvelope(byteArrayOf(0x04, 0)))
+        // kidLen pointing past the end of a truncated frame
+        assertEquals(null, EpochKeyCrypto.parseBinaryEpochEnvelope(byteArrayOf(0x04, 200.toByte(), 1, 2, 3)))
+    }
 }

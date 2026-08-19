@@ -211,11 +211,23 @@ class StorageMedia(
 
     private class Sealer(val seal: (ByteArray) -> ByteArray, val encSalt: String?, val overhead: Int)
 
-    private fun makeSealer(password: String?, isDm: Boolean): Sealer {
+    private fun makeSealer(
+        password: String?, isDm: Boolean, epochKey: EpochKeyManager.CurrentKey? = null
+    ): Sealer {
         // DM chunks seal with the pair's ECDH key IN THE BRIDGE (native crypto has
         // no ECDH), so the seal here is identity — but the [iv][ct] the bridge adds
         // still costs SEAL_OVERHEAD out of the chunk budget, and there is no salt.
         if (isDm) return Sealer({ it }, null, StorageWire.SEAL_OVERHEAD)
+        // Epoch channels (native/gated): ONE key per transfer, captured by the
+        // caller — a rotation mid-upload does not re-key chunks already out,
+        // exactly as it does not re-key a sent message.
+        if (epochKey != null) return Sealer(
+            seal = { EpochKeyCrypto.sealBinaryWithEpochKey(it, epochKey.keyHex, epochKey.kid) },
+            encSalt = null,
+            // [1B version][1B kidLen][kid][12B iv][16B tag] + headroom for a
+            // longer kid if a rotation lands mid-transfer
+            overhead = 30 + epochKey.kid.toByteArray(Charsets.UTF_8).size + 8
+        )
         if (password.isNullOrEmpty()) return Sealer({ it }, null, 0)
         val salt = PomboCrypto.generateSalt()
         val key: SecretKeySpec = PomboCrypto.deriveKeyWithSalt(password, salt) // one PBKDF2, cached per file
@@ -240,7 +252,9 @@ class StorageMedia(
 
     // ---- warm-up ----
     private suspend fun warmUpPartitions(
-        sid: String, firstPartition: Int, channelEphemeral: Boolean, onStatus: (String) -> Unit
+        sid: String, firstPartition: Int, channelEphemeral: Boolean,
+        gateAddress: String? = null, asAccount: Boolean = false,
+        onStatus: (String) -> Unit
     ) {
         if (warmedUp.contains(sid)) return
         warmUpJobs[sid]?.let { it.join(); return }
@@ -251,7 +265,13 @@ class StorageMedia(
                 for (k in 0 until CHUNK_PARTS) launch {
                     // Pings ride the same publisher as the chunks, or the wallet
                     // would appear on the channel's -1 stream just from warm-up.
-                    try { bridge.publishStorageChunk(sid, firstPartition + k, ping, channelEphemeral = channelEphemeral) }
+                    try {
+                        bridge.publishStorageChunk(
+                            sid, firstPartition + k, ping,
+                            channelEphemeral = channelEphemeral,
+                            gateAddress = gateAddress, asAccount = asAccount
+                        )
+                    }
                     catch (e: Exception) { Log.w(TAG, "storage warm-up P${firstPartition + k} failed: ${e.message}") }
                 }
             }
@@ -354,6 +374,12 @@ class StorageMedia(
         /** public/password channel: publish chunks + warm-up under the
          *  channel's ephemeral identity (native/readOnly stay on the account). */
         channelEphemeral: Boolean = false,
+        /** Epoch channel (native/gated): the CURRENT key, captured by the
+         *  caller — chunks seal with it for the whole transfer. */
+        epochKey: EpochKeyManager.CurrentKey? = null,
+        /** Gated channel: the clone address — chunks and warm-up pings publish
+         *  through it (ERC-1271), and verify matches rows against it. */
+        gateAddress: String? = null,
         messageId: String? = null, transferId: String? = null
     ): SendResult {
         if (source.size <= 0L) throw IllegalStateException("File is empty")
@@ -374,7 +400,7 @@ class StorageMedia(
             Log.w(TAG, "No storage HTTP endpoints — verify degraded")
         } else Log.i(TAG, "Storage upload verify endpoints (${bases.size}): ${bases.joinToString()}")
 
-        val sealer = makeSealer(password, isDm)
+        val sealer = makeSealer(password, isDm, epochKey)
         val tid = transferId ?: Protocol.generateMessageId()
         val msgId = messageId ?: Protocol.generateMessageId()
         val maxB = StorageMediaConfig.CHUNK_KB * 1024
@@ -461,6 +487,8 @@ class StorageMedia(
             //               disposable), address from dmChunkIdentityCreate.
             //   public/pw → the channel's own ephemeral identity, the same
             //               pseudonym as the announce.
+            //   gated     → the clone (ERC-1271, inside the bridge publish);
+            //               verify expects the gate address.
             //   native/ro → the account; verifyPublisher stays null and verify
             //               falls back to our wallet (D3).
             val chunkIdentityKey = if (isDm) "chunks|$messageStreamId|$tid" else null
@@ -469,10 +497,15 @@ class StorageMedia(
                     bridge.call("dmChunkIdentityCreate", JSONObject().put("key", chunkIdentityKey)).getString("address")
                 channelEphemeral ->
                     bridge.call("channelIdentityAddress", JSONObject().put("streamId", messageStreamId)).getString("address")
+                gateAddress != null -> gateAddress.lowercase()
                 else -> null
             }
+            // Epoch chunks must ride publishAs (encryptionType NONE): a bare
+            // client.publish on a members-only stream would re-wrap them in
+            // the SDK's group-key AES and break the HTTP hex reader.
+            val asAccount = epochKey != null && gateAddress == null
 
-            warmUpPartitions(messageStreamId, firstPart, channelEphemeral) { up.phase = it; emit(up) }
+            warmUpPartitions(messageStreamId, firstPart, channelEphemeral, gateAddress, asAccount) { up.phase = it; emit(up) }
 
             val firstChunkTs = wall()
             val uploadStart = perf()
@@ -539,7 +572,8 @@ class StorageMedia(
                 awaitSendSlot()
                 val ts = publishChunkWithRetry(
                     messageStreamId, chunkPartition(i), pay,
-                    if (isDm) dmPeerPublicKey else null, chunkIdentityKey, channelEphemeral
+                    if (isDm) dmPeerPublicKey else null, chunkIdentityKey, channelEphemeral,
+                    gateAddress, asAccount
                 )
                 chunkTs[i] = ts
                 chunkTsHist.getOrPut(i) { ArrayList() }.add(ts)
@@ -880,7 +914,14 @@ class StorageMedia(
         /** DM: the RECEIVER's own inbox message stream (chunks live there, not on the channel's peer-inbox id). */
         dmInboxStreamId: String? = null,
         /** DM: the SENDER's public key, to open the ECDH-sealed chunks (in the bridge). */
-        peerPublicKey: String? = null
+        peerPublicKey: String? = null,
+        /**
+         * Epoch channel (native/gated): opens a 0x04 chunk given its transport
+         * timestamp (the gated kid-freshness rule judges old kids against the
+         * announce in force at that moment). Null result = cannot open (missing
+         * key already noted) — the chunk is skipped and retries re-read it.
+         */
+        epochOpener: ((ByteArray, Long) -> ByteArray?)? = null
     ) {
         val tid = meta.transferId
         if (isDownloading(tid)) { Log.w(TAG, "storage download already running: $tid"); return }
@@ -906,12 +947,18 @@ class StorageMedia(
         }
 
         // Opener: DM chunks arrive already ECDH-decrypted from the bridge (identity
-        // here); password channels -> per-file key (one PBKDF2); public -> identity.
-        val opener: (ByteArray) -> ByteArray = if (!isDm && !password.isNullOrEmpty() && !meta.encSalt.isNullOrEmpty()) {
-            val salt = Base64.decode(meta.encSalt, Base64.NO_WRAP)
-            val key = PomboCrypto.deriveKeyWithSalt(password, salt)
-            ({ c -> PomboCrypto.decryptBinaryWithKey(c, key) })
-        } else ({ c -> c })
+        // here); epoch channels -> the caller's kid-resolving opener; password
+        // channels -> per-file key (one PBKDF2); public -> identity.
+        val opener: (ByteArray, Long) -> ByteArray = when {
+            !isDm && epochOpener != null ->
+                ({ c, ts -> epochOpener(c, ts) ?: throw IllegalStateException("epoch chunk did not open") })
+            !isDm && !password.isNullOrEmpty() && !meta.encSalt.isNullOrEmpty() -> {
+                val salt = Base64.decode(meta.encSalt, Base64.NO_WRAP)
+                val key = PomboCrypto.deriveKeyWithSalt(password, salt)
+                ({ c, _ -> PomboCrypto.decryptBinaryWithKey(c, key) })
+            }
+            else -> ({ c, _ -> c })
+        }
 
         val isCompressed = meta.compression != "none" && meta.compression.isNotEmpty()
         val staging = withContext(Dispatchers.IO) {
@@ -942,7 +989,7 @@ class StorageMedia(
         // so it doubles as read-side backpressure — the HTTP parser blocks on it.
         val onRow: (StorageHttp.Row) -> Unit = onRow@{ row ->
             val c = row.content ?: return@onRow
-            val opened = try { opener(c) } catch (e: Exception) { return@onRow }   // warm-up ping / foreign / tampered
+            val opened = try { opener(c, row.timestamp) } catch (e: Exception) { return@onRow }   // warm-up ping / foreign / tampered / key not held yet
             val u = StorageWire.unpackChunkPayload(opened) ?: return@onRow
             if (u.transferId != tid || u.chunkIndex >= total) return@onRow
             if (staging.hasChunk(u.chunkIndex)) return@onRow
@@ -1111,10 +1158,10 @@ class StorageMedia(
         }
     }
 
-    private suspend fun publishChunkWithRetry(sid: String, partition: Int, payload: ByteArray, dmPeerPublicKey: String? = null, chunkIdentityKey: String? = null, channelEphemeral: Boolean = false, attempts: Int = 3): Long {
+    private suspend fun publishChunkWithRetry(sid: String, partition: Int, payload: ByteArray, dmPeerPublicKey: String? = null, chunkIdentityKey: String? = null, channelEphemeral: Boolean = false, gateAddress: String? = null, asAccount: Boolean = false, attempts: Int = 3): Long {
         var last: Exception? = null
         for (a in 0 until attempts) {
-            try { return bridge.publishStorageChunk(sid, partition, payload, dmPeerPublicKey, chunkIdentityKey, channelEphemeral) }
+            try { return bridge.publishStorageChunk(sid, partition, payload, dmPeerPublicKey, chunkIdentityKey, channelEphemeral, gateAddress, asAccount) }
             catch (e: Exception) { last = e; delay(500L * (a + 1)) }
         }
         throw last ?: IllegalStateException("publish failed")
