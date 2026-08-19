@@ -2032,6 +2032,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
 
     fun gateEntryPay() = viewModelScope.launch {
         val entry = _gateEntry.value ?: return@launch
+        // Renewal: the dialog's job ends at the tap — the toast narrates the
+        // payment from here. (First-time pay keeps the dialog up: on failure
+        // it is the retry context.)
+        if (entry.renewal) _gateEntry.value = null
         chainAction(
             "Pay subscription",
             "Pays one subscription period to this channel's gate (may wrap POL and approve the token first)."
