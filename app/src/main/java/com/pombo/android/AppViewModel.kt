@@ -110,9 +110,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         bridge = bridge,
         store = channelStore,
         scope = viewModelScope,
-        myAddress = { store.address },
-        myPrivateKey = { store.privateKey },
-        myUsername = { store.username },
+        // Live identity, not the persisted account: a guest session runs on a
+        // throwaway wallet while store.* keeps pointing at the last real
+        // account (by design, so leaving guest mode restores it). Reading
+        // store.* here published every guest message under the real
+        // account's address/name/key — _address/_username/bridge.privateKey
+        // are the fields both startGuestSession and switchWallet keep live.
+        myAddress = { _address.value },
+        myPrivateKey = { bridge.privateKey.ifEmpty { null } },
+        myUsername = { _username.value },
         imageStore = imageStore,
         previewStore = previewStore,
         ensStore = ensStore,
@@ -1154,7 +1160,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         contactsStore.memoryOnly = guest
         settingsStore.scopeAddress = address
         syncStore.scopeAddress = address
+        epochKeyStore.scopeAddress = address
+        epochKeyStore.memoryOnly = guest
         manager.reloadChannels()
+        // Same-process cache, keyed only by messageStreamId — reloading the
+        // store above does nothing for a channel already opened this
+        // session; without this the new identity would keep reading the
+        // previous account's already-decrypted epoch state from memory.
+        manager.resetEpochRuntimeState()
         // Guests keep nothing, so their invite list starts (and stays) empty.
         if (guest) inviteStore.scopeAddress = null
         manager.reloadInvites()

@@ -475,6 +475,12 @@ class ChannelManager(
         _channels.value = store.load().distinctBy { it.messageStreamId }
         _channelOrder.value = store.loadOrder()
     }
+
+    /** Forgets in-memory epoch-key state for every channel (persisted keys
+     *  are untouched by [EpochKeyStore]'s own scoping) — call on an account
+     *  switch so a different identity does not inherit already-decrypted
+     *  state cached in this process. */
+    fun resetEpochRuntimeState() { scope.launch { epochKeys.resetRuntimeState() } }
     val channels: StateFlow<List<Channel>> = _channels.asStateFlow()
 
     /** User's manual channel order (messageStreamIds); the list UI sorts by it. */

@@ -208,6 +208,19 @@ class EpochKeyManager(
     }
 
     /**
+     * Drops in-memory state for every channel, leaving persisted keys alone.
+     * Call on an account switch (including entering/leaving guest): [store]
+     * now scopes what gets read from disk, but this map is a same-process
+     * cache keyed only by messageStreamId — without this, re-opening a
+     * channel under the new identity would keep serving the previous
+     * account's already-decrypted epoch state instead of reloading it scoped.
+     */
+    suspend fun resetRuntimeState() = mutex.withLock {
+        state.values.forEach { it.rotationJob?.cancel() }
+        state.clear()
+    }
+
+    /**
      * Bring a native channel's key state up to date: pull announces from -4
      * storage, bootstrap/re-announce as admin, or request missing keys as a
      * member. Call on channel open, before the -1 history pull.
