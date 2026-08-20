@@ -142,6 +142,9 @@ class PushRelayClient(
 
     fun isSubscribed(streamId: String) = registry.isSubscribed(streamId)
 
+    /** Session cache — the relay key only changes with a relay migration. */
+    @Volatile private var relayPk: String? = null
+
     private suspend fun publishRegistration(tag: String) {
         val payload = JSONObject()
             .put("type", "registration")
@@ -151,15 +154,21 @@ class PushRelayClient(
             .put("subscription", JSONObject().put("fcmToken", token()).toString())
             .put("timestamp", System.currentTimeMillis())
 
-        // Ephemeral publisher, fresh key per publish: the relay keys on
-        // (tag, token) and never reads publisherId, so publishing the
-        // registration under the account would only pin "this wallet uses
-        // Pombo" onto the public /push stream for nothing. `publishAs` with no
-        // privateKey generates a throwaway key in the bridge.
-        bridge.call("publishAs", JSONObject()
+        // Sealed to the relay's static key (§9.1 #3): the FCM token never
+        // crosses the observable stream in the clear, and the sealing
+        // ephemeral doubles as the transport publisher — the wire still
+        // names no account. FAIL-CLOSED: no plaintext fallback, or a hostile
+        // Graph endpoint could strip the key and downgrade every
+        // registration; refreshRegistrationsIfDue retries on the next
+        // connect. The pin against RELAY_ADDRESS runs in the bridge.
+        val pk = relayPk
+            ?: com.pombo.android.core.GraphApi.pushRelayKey(pushStreamId)?.also { relayPk = it }
+            ?: throw IllegalStateException("Push stream metadata carries no relay key")
+        bridge.call("pushSealAndPublish", JSONObject()
             .put("streamId", pushStreamId)
-            .put("partition", 0)
-            .put("content", payload), 30_000)
+            .put("content", payload)
+            .put("pk", pk)
+            .put("relayAddress", RELAY_ADDRESS), 30_000)
     }
 
     /**
@@ -198,5 +207,8 @@ class PushRelayClient(
     private companion object {
         /** Web config.js push.reRegistrationIntervalMs. */
         const val REREGISTER_INTERVAL_MS = 6 * 60 * 60 * 1000L
+        /** Web CONFIG.push.relays[0].address — the pin target for the relay
+         *  key read from the push stream's metadata (§9.1 #2 mirror). */
+        const val RELAY_ADDRESS = "0x905309e8b4d22a02b08459f42a203c7265abd3ad"
     }
 }

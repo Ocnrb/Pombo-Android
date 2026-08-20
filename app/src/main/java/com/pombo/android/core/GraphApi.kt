@@ -177,6 +177,22 @@ object GraphApi {
         return toChannelInfo(streamId, meta, stream.optLong("createdAt"), stream.optLong("updatedAt"))
     }
 
+    /**
+     * The push relay's static public key from the push stream's metadata
+     * (`pk`, written by the stream owner). The CALLER pins it against the
+     * configured relay address — this only fetches.
+     */
+    suspend fun pushRelayKey(pushStreamId: String): String? {
+        val gql = """
+            query PushRelayKey {
+                stream(id: "$pushStreamId") { id metadata }
+            }
+        """.trimIndent()
+        val stream = query("push_relay_key:$pushStreamId", gql)?.optJSONObject("stream") ?: return null
+        val meta = pomboMeta(stream.optString("metadata")) ?: return null
+        return meta.optString("pk").ifEmpty { null }
+    }
+
     /** Drops cached queries so a permission change is visible immediately. */
     fun clearCache() = cache.clear()
 
