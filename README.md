@@ -2,10 +2,13 @@
 
 # Pombo Android
 
-Native Android client (Kotlin + Jetpack Compose) for **Pombo**, a decentralized
-P2P chat app built on the [Streamr](https://streamr.network) network. It's a
-port of the Pombo web app, mirroring its wire protocol so native clients and
-the web app can talk to each other on the same channels and DMs.
+Android client for **Pombo**, a decentralized P2P chat app built on the
+[Streamr](https://streamr.network) network — a native Kotlin/Jetpack Compose
+UI with an embedded JavaScript transport bridge. Networking runs the official
+Streamr JS SDK in a headless WebView; UI, state, storage, symmetric crypto
+and notifications are native Kotlin. It's a port of the Pombo web app,
+mirroring its wire protocol so both clients talk to each other on the same
+channels and DMs.
 
 ## Architecture
 
