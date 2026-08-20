@@ -144,4 +144,55 @@ class SyncMergeTest {
         assertTrue(merged.isNull("username"))
         assertTrue(merged.isNull("graphApiKey"))
     }
+
+    @Test
+    fun `epoch keys union with base winning per entry and currentEpoch never regressing`() {
+        val merged = SyncMerge.mergeState(
+            j(
+                """{"channels":[{"messageStreamId":"ch-1","joinedAt":1000}],
+                    "epochKeys":{"ch-1":{"epochs":{"kid2":{"keyHex":"0xlocal","epoch":2}},
+                    "announces":{"2":{"keyId":"kid2"}},"currentEpoch":2}},"sliceTs":{}}"""
+            ),
+            j(
+                """{"channels":[{"messageStreamId":"ch-1","joinedAt":1000}],
+                    "epochKeys":{"ch-1":{"epochs":{"kid1":{"keyHex":"0xold","epoch":1},
+                    "kid2":{"keyHex":"0xremote","epoch":2}},
+                    "announces":{"1":{"keyId":"kid1"}},"currentEpoch":1}},"sliceTs":{}}"""
+            )
+        )
+        val entry = merged.getJSONObject("epochKeys").getJSONObject("ch-1")
+        assertEquals("0xold", entry.getJSONObject("epochs").getJSONObject("kid1").getString("keyHex"))
+        assertEquals("0xlocal", entry.getJSONObject("epochs").getJSONObject("kid2").getString("keyHex"))
+        assertEquals("kid1", entry.getJSONObject("announces").getJSONObject("1").getString("keyId"))
+        assertEquals(2, entry.getInt("currentEpoch"))
+    }
+
+    @Test
+    fun `epoch keys survive a payload from a client without the slice`() {
+        val merged = SyncMerge.mergeState(
+            j(
+                """{"channels":[{"messageStreamId":"ch-1","joinedAt":1000}],
+                    "epochKeys":{"ch-1":{"epochs":{"kid1":{"keyHex":"0xaa"}},"currentEpoch":1}},"sliceTs":{}}"""
+            ),
+            j("""{"channels":[{"messageStreamId":"ch-1","joinedAt":1000}],"sliceTs":{}}""")
+        )
+        assertEquals(
+            "0xaa",
+            merged.getJSONObject("epochKeys").getJSONObject("ch-1")
+                .getJSONObject("epochs").getJSONObject("kid1").getString("keyHex")
+        )
+    }
+
+    @Test
+    fun `epoch keys retire with the channel a tombstone removed`() {
+        val merged = SyncMerge.mergeState(
+            j(
+                """{"channels":[{"messageStreamId":"ch-1","joinedAt":1000}],
+                    "epochKeys":{"ch-1":{"epochs":{"kid1":{"keyHex":"0xaa"}},"currentEpoch":1}},"sliceTs":{}}"""
+            ),
+            j("""{"channels":[],"channelsLeftAt":{"ch-1":2000},"sliceTs":{}}""")
+        )
+        assertEquals(0, merged.getJSONArray("channels").length())
+        assertTrue(!merged.getJSONObject("epochKeys").has("ch-1"))
+    }
 }

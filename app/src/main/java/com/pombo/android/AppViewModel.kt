@@ -487,6 +487,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
             base.put("ensCache", ens)
         }
 
+        // Epoch keys ride the sync so a second device reads native/gated
+        // history without a KEY_REQUEST round-trip — and gets epochs the
+        // network can no longer serve (paid gates, announces past retention).
+        // Local wins per stream: the store is union-seeded by every pull.
+        run {
+            val keys = base.optJSONObject("epochKeys") ?: JSONObject()
+            val local = exportEpochKeys()
+            local.keys().forEach { keys.put(it, local.get(it)) }
+            base.put("epochKeys", keys)
+        }
+
         // Web schema: keyed by lowercase address, value carries the full
         // contact record (identity.js drops entries without an `address`).
         val contacts = JSONObject()
@@ -587,6 +598,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
             }
             channelStore.saveLeftAt(combined)
         }
+        merged.optJSONObject("epochKeys")?.let { importEpochKeys(it) }
         merged.optJSONObject("ensCache")?.let { slice ->
             if (ensStore.importSyncSlice(slice)) viewModelScope.launch { ensStore.persistNow() }
         }
@@ -1593,20 +1605,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
      * same password. The web reuses the account's keystore password; this app
      * has no password, so the user chooses one at export time.
      */
-    fun exportBackupTo(uri: android.net.Uri, password: String) = viewModelScope.launch {
+    fun exportBackupTo(
+        uri: android.net.Uri,
+        password: String,
+        includeSentDmMedia: Boolean = true
+    ) = viewModelScope.launch {
         runWithToast("Creating backup… this can take a minute", "Backup exported", "Backup failed") {
             val pk = store.privateKey ?: throw IllegalStateException("No account")
             val address = store.address ?: throw IllegalStateException("No account")
 
+            // Backup policy: only state with no other durable copy. Received
+            // messages and media re-fetch from the storage nodes within
+            // retention; the ENS cache re-resolves; slice timestamps describe
+            // the sync merge, not the account. Epoch keys DO enter (via
+            // exportSyncState): paid gates never re-distribute past epochs
+            // (D14), and an announce older than the -4 retention can no
+            // longer anchor a re-adopted key.
+            val data = exportSyncState().apply {
+                remove("ensCache")
+                remove("sliceTs")
+            }
+
+            // Sent-message media is the only irreplaceable media: an outgoing
+            // DM lands in the PEER's inbox (owner-only reads) and a write-only
+            // stream cannot be resent. Everything else in the blob ledger is a
+            // warm cache of what the streams still serve.
             val blobs = org.json.JSONArray()
-            blobStore.allRecords().forEach { rec ->
-                blobStore.load(rec.imageId)?.let { dataUrl ->
-                    blobs.put(
-                        JSONObject()
-                            .put("imageId", rec.imageId)
-                            .put("streamId", rec.streamId)
-                            .put("data", dataUrl)
-                    )
+            if (includeSentDmMedia) {
+                val sentImageIds = mutableSetOf<String>()
+                data.optJSONObject("sentMessages")?.let { sm ->
+                    sm.keys().forEach { streamId ->
+                        val arr = sm.optJSONArray(streamId) ?: return@forEach
+                        for (i in 0 until arr.length()) {
+                            val m = arr.optJSONObject(i) ?: continue
+                            if (m.optString("type") == "image") {
+                                m.optString("imageId").ifEmpty { null }?.let { sentImageIds.add(it) }
+                            }
+                        }
+                    }
+                }
+                blobStore.allRecords().forEach { rec ->
+                    if (rec.imageId !in sentImageIds) return@forEach
+                    blobStore.load(rec.imageId)?.let { dataUrl ->
+                        blobs.put(
+                            JSONObject()
+                                .put("imageId", rec.imageId)
+                                .put("streamId", rec.streamId)
+                                .put("data", dataUrl)
+                        )
+                    }
                 }
             }
             val payload = JSONObject()
@@ -1618,7 +1665,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                         .format(java.util.Date())
                 )
                 .put("address", address)
-                .put("data", exportSyncState())
+                .put("data", data)
                 .put("imageBlobs", blobs)
 
             // Native (AccountBackup): the key and the multi-MB payload never
@@ -1671,6 +1718,47 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Epoch keys for every channel running the keys-stream protocol, in the
+     * web's persisted shape ({ epochs, announces?, currentEpoch } per stream).
+     */
+    private fun exportEpochKeys(): JSONObject {
+        val out = JSONObject()
+        manager.channels.value.forEach { ch ->
+            epochKeyStore.load(ch.messageStreamId)?.let { out.put(ch.messageStreamId, it) }
+        }
+        return out
+    }
+
+    /**
+     * Union-merge per channel, local wins: a live session may hold epochs the
+     * backup predates, and a channel key adopted once must never regress.
+     */
+    private fun importEpochKeys(slice: JSONObject) {
+        slice.keys().forEach { streamId ->
+            val incoming = slice.optJSONObject(streamId) ?: return@forEach
+            val local = epochKeyStore.load(streamId)
+            if (local == null) {
+                epochKeyStore.save(streamId, incoming)
+                return@forEach
+            }
+            val localEpochs = local.optJSONObject("epochs")
+                ?: JSONObject().also { local.put("epochs", it) }
+            incoming.optJSONObject("epochs")?.let { inc ->
+                inc.keys().forEach { kid -> if (!localEpochs.has(kid)) localEpochs.put(kid, inc.get(kid)) }
+            }
+            val localAnnounces = local.optJSONObject("announces")
+                ?: JSONObject().also { local.put("announces", it) }
+            incoming.optJSONObject("announces")?.let { inc ->
+                inc.keys().forEach { e -> if (!localAnnounces.has(e)) localAnnounces.put(e, inc.get(e)) }
+            }
+            if (incoming.optInt("currentEpoch") > local.optInt("currentEpoch")) {
+                local.put("currentEpoch", incoming.optInt("currentEpoch"))
+            }
+            epochKeyStore.save(streamId, local)
         }
     }
 

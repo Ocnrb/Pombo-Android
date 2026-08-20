@@ -42,6 +42,19 @@ object SyncMerge {
         out.put("channels", channels)
         out.put("channelsLeftAt", leftAt)
 
+        val survivingIds = HashSet<String>()
+        for (i in 0 until channels.length()) {
+            channels.optJSONObject(i)?.optStringOrNull("messageStreamId")?.let { survivingIds.add(it) }
+        }
+        out.put(
+            "epochKeys",
+            mergeEpochKeys(
+                base?.optJSONObject("epochKeys"),
+                incoming?.optJSONObject("epochKeys"),
+                survivingIds
+            )
+        )
+
         out.put(
             "sentMessages",
             mergeSentMessages(base?.optJSONObject("sentMessages"), incoming?.optJSONObject("sentMessages"))
@@ -135,6 +148,46 @@ object SyncMerge {
     private fun joinTs(channel: JSONObject): Long {
         val joined = channel.optLong("joinedAt", 0L)
         return if (joined > 0L) joined else channel.optLong("createdAt", 0L)
+    }
+
+    /**
+     * Union-merge of the epoch-key slice (web mergeEpochKeys). Entries are
+     * content-addressed (keyId → immutable key, epoch → immutable announce),
+     * so union is exact: base wins per entry — an adopted key must never
+     * regress — and currentEpoch only moves forward. Channels the channel
+     * merge dropped retire their keys with them.
+     */
+    private fun mergeEpochKeys(
+        base: JSONObject?,
+        incoming: JSONObject?,
+        keepIds: Set<String>
+    ): JSONObject {
+        val result = JSONObject()
+        val streamIds = LinkedHashSet<String>()
+        base?.keys()?.forEach { streamIds.add(it) }
+        incoming?.keys()?.forEach { streamIds.add(it) }
+
+        streamIds.forEach { streamId ->
+            if (streamId !in keepIds) return@forEach
+            val b = base?.optJSONObject(streamId)
+            val i = incoming?.optJSONObject(streamId)
+            if (b == null || i == null) {
+                (b ?: i)?.let { result.put(streamId, it) }
+                return@forEach
+            }
+            val entry = JSONObject()
+            val epochs = JSONObject()
+            i.optJSONObject("epochs")?.let { src -> src.keys().forEach { epochs.put(it, src.get(it)) } }
+            b.optJSONObject("epochs")?.let { src -> src.keys().forEach { epochs.put(it, src.get(it)) } }
+            entry.put("epochs", epochs)
+            val announces = JSONObject()
+            i.optJSONObject("announces")?.let { src -> src.keys().forEach { announces.put(it, src.get(it)) } }
+            b.optJSONObject("announces")?.let { src -> src.keys().forEach { announces.put(it, src.get(it)) } }
+            entry.put("announces", announces)
+            entry.put("currentEpoch", maxOf(b.optInt("currentEpoch"), i.optInt("currentEpoch")))
+            result.put(streamId, entry)
+        }
+        return result
     }
 
     /** Exposed so the export can union the local DM slice with the sync base. */

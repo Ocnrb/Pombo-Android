@@ -32,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircleOutline
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Lock
@@ -193,7 +194,7 @@ fun MainShell(vm: AppViewModel) {
             hint = "Enter the password this backup was created with.",
             confirmLabel = "Restore",
             onDismiss = { restoreUri = null }
-        ) { pwd ->
+        ) { pwd, _ ->
             restoreUri = null
             vm.importBackupFrom(uri, pwd)
         }
@@ -1217,10 +1218,12 @@ private fun AccountPanel(vm: AppViewModel) {
     val ensName = address?.let { ensNames[it.lowercase()] }
     var editing by remember(username, ensName) { mutableStateOf(ensName ?: username ?: "") }
 
-    // Export: ask for a password, then pick where to save. The password rides
-    // in state between the two steps because SAF answers via callback.
+    // Export: ask for a password, then pick where to save. The password (and
+    // the media choice) ride in state between the two steps because SAF
+    // answers via callback.
     var askExportPassword by remember { mutableStateOf(false) }
     var exportPassword by remember { mutableStateOf<String?>(null) }
+    var exportIncludeMedia by remember { mutableStateOf(true) }
     var importUri by remember { mutableStateOf<android.net.Uri?>(null) }
 
     val exportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
@@ -1228,7 +1231,7 @@ private fun AccountPanel(vm: AppViewModel) {
     ) { uri ->
         val pwd = exportPassword
         exportPassword = null
-        if (uri != null && pwd != null) vm.exportBackupTo(uri, pwd)
+        if (uri != null && pwd != null) vm.exportBackupTo(uri, pwd, exportIncludeMedia)
     }
     val importLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
@@ -1239,10 +1242,13 @@ private fun AccountPanel(vm: AppViewModel) {
         hint = "Choose a password to protect the backup (min 8 characters). You will need it to restore, on Android or on the web.",
         confirmLabel = "Export",
         minLength = 8,
+        toggleLabel = "Include sent DM media",
+        confirmPassword = true,
         onDismiss = { askExportPassword = false }
-    ) { pwd ->
+    ) { pwd, includeMedia ->
         askExportPassword = false
         exportPassword = pwd
+        exportIncludeMedia = includeMedia
         val stamp = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
             .format(java.util.Date())
         exportLauncher.launch("pombo-account-backup-$stamp.json")
@@ -1253,7 +1259,7 @@ private fun AccountPanel(vm: AppViewModel) {
             hint = "Enter the password this backup was created with.",
             confirmLabel = "Restore",
             onDismiss = { importUri = null }
-        ) { pwd ->
+        ) { pwd, _ ->
             importUri = null
             vm.importBackupFrom(uri, pwd)
         }
@@ -1487,11 +1493,15 @@ private fun BackupPasswordDialog(
     hint: String,
     confirmLabel: String,
     minLength: Int = 1,
+    toggleLabel: String? = null,
+    confirmPassword: Boolean = false,
     onDismiss: () -> Unit,
-    onSubmit: (String) -> Unit
+    onSubmit: (password: String, toggled: Boolean) -> Unit
 ) {
     var password by remember { mutableStateOf("") }
-    val valid = password.length >= minLength
+    var confirm by remember { mutableStateOf("") }
+    var toggled by remember { mutableStateOf(true) }
+    val valid = password.length >= minLength && (!confirmPassword || confirm == password)
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         Column(
             Modifier
@@ -1516,6 +1526,49 @@ private fun BackupPasswordDialog(
                 textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = PomboColors.Text),
                 colors = pomboFieldColors(), modifier = Modifier.fillMaxWidth()
             )
+            if (confirmPassword) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = confirm, onValueChange = { confirm = it },
+                    placeholder = { Text("Confirm password", color = Color.White.copy(alpha = 0.25f), fontSize = 14.sp) },
+                    singleLine = true, shape = RoundedCornerShape(12.dp),
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = PomboColors.Text),
+                    colors = pomboFieldColors(), modifier = Modifier.fillMaxWidth()
+                )
+                if (confirm.isNotEmpty() && confirm != password) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Passwords don't match",
+                        color = Color(0xFFE57373), fontSize = 12.sp
+                    )
+                }
+            }
+            toggleLabel?.let { label ->
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.clickableNoRipple { toggled = !toggled }
+                ) {
+                    Box(
+                        Modifier
+                            .size(18.dp)
+                            .background(
+                                if (toggled) Color.White else Color.White.copy(alpha = 0.08f),
+                                RoundedCornerShape(5.dp)
+                            )
+                            .border(1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(5.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (toggled) Icon(
+                            Icons.Filled.Check, contentDescription = null,
+                            tint = Color.Black, modifier = Modifier.size(13.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Text(label, color = Color.White.copy(alpha = 0.60f), fontSize = 13.sp)
+                }
+            }
             Spacer(Modifier.height(20.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box(
@@ -1532,7 +1585,7 @@ private fun BackupPasswordDialog(
                             if (valid) Color.White else Color.White.copy(alpha = 0.10f),
                             RoundedCornerShape(12.dp)
                         )
-                        .clickableNoRipple { if (valid) onSubmit(password) }
+                        .clickableNoRipple { if (valid) onSubmit(password, toggled) }
                         .padding(vertical = 10.dp),
                     contentAlignment = Alignment.Center
                 ) {
