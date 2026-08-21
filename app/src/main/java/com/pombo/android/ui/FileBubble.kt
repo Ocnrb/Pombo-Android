@@ -16,12 +16,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -41,6 +43,8 @@ interface FileTransfers {
     fun progressFor(fileId: String): MediaController.Progress?
     fun uploadsFor(fileId: String): MediaController.UploadStats?
     fun isSeeding(fileId: String): Boolean
+    /** True once [onSave] has already run for this fileId (auto-save). */
+    fun isSaved(fileId: String): Boolean
     fun onDownload(messageId: String)
     fun onSave(fileId: String, fileName: String)
 }
@@ -53,6 +57,8 @@ interface StorageTransfers {
     fun downloadFor(transferId: String): StorageMedia.DownloadProgress?
     /** True once the downloaded file is on disk, ready to save. */
     fun completedFor(transferId: String): Boolean
+    /** True once [onSave] has already run for this transferId (auto-save). */
+    fun isSaved(transferId: String): Boolean
     fun onDownload(messageId: String)
     fun onSave(transferId: String, fileName: String)
 }
@@ -157,9 +163,15 @@ fun FileBubbleContent(
     val upload = transfers?.uploadsFor(file.fileId)
     val downloading = progress != null && !progress.done && progress.failure == null
     val localFile = progress?.done == true || transfers?.isSeeding(file.fileId) == true
+    val saved = transfers?.isSaved(file.fileId) == true
     val canDownload = file.pieceHashes.size == file.pieceCount && file.pieceCount > 0
     val pct = if (downloading && progress != null && progress.total > 0)
         (progress.received.toFloat() / progress.total).coerceIn(0f, 1f) else 0f
+
+    // Saving is automatic once the bytes are here.
+    LaunchedEffect(localFile, saved) {
+        if (localFile && !saved) transfers?.onSave(file.fileId, file.fileName)
+    }
 
     val totalSize = formatBytes(file.fileSize)
     val detail = when {
@@ -172,6 +184,8 @@ fun FileBubbleContent(
     }
 
     val action: (@Composable () -> Unit)? = when {
+        // Saved is a pure status indicator — nothing to tap, nothing left to do.
+        saved -> ({ FileCardAction(Icons.Filled.Check, GREEN.copy(alpha = 0.7f), 0.06f, null) })
         localFile -> ({ FileCardAction(Icons.Filled.Save, GREEN.copy(alpha = 0.7f), 0.06f) { transfers?.onSave(file.fileId, file.fileName) } })
         downloading -> ({ FileCardAction(Icons.Filled.ArrowDownward, Color.White.copy(alpha = 0.25f), 0.04f, null) })
         canDownload -> ({ FileCardAction(Icons.Filled.ArrowDownward, Color.White.copy(alpha = 0.6f), 0.06f) { transfers?.onDownload(messageId) } })
@@ -236,12 +250,18 @@ fun StorageFileBubbleContent(
     val up = transfers?.uploadFor(file.transferId)
     val dl = transfers?.downloadFor(file.transferId)
     val completed = transfers?.completedFor(file.transferId) == true
+    val saved = transfers?.isSaved(file.transferId) == true
 
     val uploading = up != null && up.stage != "done" && up.error == null
     val downloading = dl?.status == "downloading"
     val active = uploading || downloading
     val ready = completed
     val totalSize = formatBytes(file.originalSize)
+
+    // Saving is automatic once the bytes are here.
+    LaunchedEffect(ready, saved) {
+        if (ready && !saved) transfers?.onSave(file.transferId, file.fileName)
+    }
 
     // Two-line stats (mirror formatStorageUpload/DownloadDetail).
     val upErr = up?.error
@@ -262,6 +282,8 @@ fun StorageFileBubbleContent(
     }
 
     val action: (@Composable () -> Unit)? = when {
+        // Saved is a pure status indicator — nothing to tap, nothing left to do.
+        saved -> ({ FileCardAction(Icons.Filled.Check, GREEN.copy(alpha = 0.7f), 0.06f, null) })
         ready -> ({ FileCardAction(Icons.Filled.Save, GREEN.copy(alpha = 0.7f), 0.06f) { transfers?.onSave(file.transferId, file.fileName) } })
         uploading -> ({ FileCardAction(Icons.Filled.ArrowUpward, Color.White.copy(alpha = 0.25f), 0.04f, null) })
         downloading -> ({ FileCardAction(Icons.Filled.ArrowDownward, Color.White.copy(alpha = 0.25f), 0.04f, null) })

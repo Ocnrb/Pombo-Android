@@ -125,7 +125,9 @@ class MediaController(
         val bytesPerSecond: Long?,
         val seeders: Int,
         val done: Boolean,
-        val failure: String? = null
+        val failure: String? = null,
+        /** Network activity is stopped but the partial bytes are kept — see [pauseDownload]. */
+        val paused: Boolean = false
     )
 
     // ==================== state ====================
@@ -174,6 +176,8 @@ class MediaController(
 
         @Volatile var discovery: Job? = null
         @Volatile var failed: String? = null
+        /** Set by [pauseDownload] — stops [pump] from issuing new requests. */
+        @Volatile var paused: Boolean = false
     }
 
     private val incoming = ConcurrentHashMap<String, Transfer>()
@@ -284,6 +288,39 @@ class MediaController(
         _progress.value = _progress.value - fileId
         Log.i(TAG, "download cancelled $fileId")
         return transfer.messageStreamId to transfer.isDm
+    }
+
+    /**
+     * Pauses a running download: stops seeder discovery and in-flight piece
+     * requests, but — unlike [cancelDownload] — keeps the transfer entry and
+     * its [PieceStore] bytes untouched, so [resumeDownload] can pick up
+     * exactly where this left off.
+     */
+    fun pauseDownload(fileId: String) {
+        val transfer = incoming[fileId] ?: return
+        if (transfer.paused) return
+        transfer.paused = true
+        transfer.discovery?.cancel()
+        transfer.discovery = null
+        transfer.inFlight.values.forEach { it.cancel() }
+        transfer.inFlight.clear()
+        emitProgress(transfer)
+        Log.i(TAG, "download paused $fileId")
+    }
+
+    /**
+     * Resumes a download paused by [pauseDownload]: relaunches seeder
+     * discovery and immediately re-fills the request window from whatever
+     * is already known — nothing is re-fetched that [PieceStore] already has.
+     */
+    fun resumeDownload(fileId: String) {
+        val transfer = incoming[fileId] ?: return
+        if (!transfer.paused) return
+        transfer.paused = false
+        emitProgress(transfer)
+        transfer.discovery = scope.launch { discoverSeeders(transfer) }
+        pump(transfer)
+        Log.i(TAG, "download resumed $fileId")
     }
 
     /**
@@ -550,7 +587,7 @@ class MediaController(
      * polling loop.
      */
     private fun pump(transfer: Transfer) {
-        if (transfer.failed != null) return
+        if (transfer.failed != null || transfer.paused) return
         synchronized(transfer) {
             for (index in transfer.store.missingPieces()) {
                 if (!transfer.window.hasRoom(transfer.inFlight.size)) return
@@ -1063,7 +1100,8 @@ class MediaController(
                 bytesPerSecond = rateOf(transfer),
                 seeders = transfer.seeders.size,
                 done = done,
-                failure = transfer.failed
+                failure = transfer.failed,
+                paused = transfer.paused
             )
         )
     }

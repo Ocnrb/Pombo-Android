@@ -141,6 +141,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
 
     /** Shared caches exposed to the UI so lists paint before the network answers. */
     val channelImages get() = manager.channelImages
+    val channelImagesPending get() = manager.channelImagesPending
     val channelPreviews get() = previewStore.previews
 
     /** Warms a channel's image + preview for the list (cache-first, deduped). */
@@ -1120,6 +1121,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     private val _accounts = MutableStateFlow(store.accounts())
     val accounts: StateFlow<List<com.pombo.android.identity.WalletStore.Account>> = _accounts.asStateFlow()
 
+    /** Another stored account's display name, for Profile's account list — no need to switch to it. */
+    fun usernameFor(address: String): String? = store.usernameFor(address)
+
     private val _addingAccount = MutableStateFlow(false)
     val addingAccount: StateFlow<Boolean> = _addingAccount.asStateFlow()
 
@@ -1132,6 +1136,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     /** Deferred sync kick after a bridge connect (cancelled by a re-connect). */
     private var autoSyncKickJob: kotlinx.coroutines.Job? = null
     private val AUTO_SYNC_CONNECT_DELAY_MS = 5_000L
+
+    /** Lets Explore's own bridge-connect-gated image resends dispatch first on a cold start. */
+    private val BRIDGE_CONNECT_BACKGROUND_DELAY_MS = 1_500L
 
     /**
      * The Graph API key. Empty means the shared default key that ships with the
@@ -1364,8 +1371,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         manager.closeCurrent()
         applyStorageScope(address, guest = false)
         // Leaving guest mode is part of switching: without these the session is
-        // the real account but the UI still calls it a guest, keeping the
-        // "Guest mode — data not saved" label under the pill nav.
+        // the real account but the UI still calls it a guest.
         _isGuest.value = false
         _hasWallet.value = true
         _address.value = store.address
@@ -1405,6 +1411,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     /** Whether a storage download has landed on disk, ready to save. */
     fun storageFileReady(transferId: String) = manager.storageCompletedFile(transferId) != null
 
+    // Auto-save bookkeeping: which completed transfers already had saveFile/
+    // saveStorageFile run for them, so a bubble doesn't re-trigger the
+    // MediaStore write on every recomposition. Persisted (plain prefs, not
+    // sensitive — just fileIds) because unlike the web's in-memory blob URLs,
+    // a seeded/completed file's "local, ready" state survives an app
+    // restart here — without persistence, every relaunch would look like a
+    // fresh completion and re-save every already-saved file again.
+    private val savedFilesPrefs = app.getSharedPreferences("pombo_saved_files", android.content.Context.MODE_PRIVATE)
+
+    private val _savedFileIds = MutableStateFlow(savedFilesPrefs.getStringSet("fileIds", emptySet()) ?: emptySet())
+    val savedFileIds: StateFlow<Set<String>> = _savedFileIds.asStateFlow()
+    private fun markFileSaved(fileId: String) {
+        val next = _savedFileIds.value + fileId
+        _savedFileIds.value = next
+        savedFilesPrefs.edit().putStringSet("fileIds", next).apply()
+    }
+
+    private val _savedTransferIds = MutableStateFlow(savedFilesPrefs.getStringSet("transferIds", emptySet()) ?: emptySet())
+    val savedTransferIds: StateFlow<Set<String>> = _savedTransferIds.asStateFlow()
+    private fun markTransferSaved(transferId: String) {
+        val next = _savedTransferIds.value + transferId
+        _savedTransferIds.value = next
+        savedFilesPrefs.edit().putStringSet("transferIds", next).apply()
+    }
+
     /** File + channel names for a storage transfer (Active Transfers list). */
     fun storageTransferInfo(transferId: String) = manager.storageTransferInfo(transferId)
 
@@ -1439,6 +1470,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                         ?: throw java.io.IOException("No external storage")
                     java.io.File(dir, fileName).outputStream().use { out -> file.inputStream().use { it.copyTo(out) } }
                 }
+                markTransferSaved(transferId)
                 toast("Saved $fileName", com.pombo.android.ui.ToastKind.SUCCESS)
             } catch (e: Exception) {
                 toast("Save failed: ${e.message}", com.pombo.android.ui.ToastKind.ERROR)
@@ -1453,6 +1485,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         manager.media.seeds
 
     fun cancelTransfer(fileId: String) = manager.cancelTransfer(fileId)
+    fun pauseTransfer(fileId: String) = manager.pauseTransfer(fileId)
+    fun resumeTransfer(fileId: String) = manager.resumeTransfer(fileId)
     fun stopSeeding(fileId: String) = manager.stopSeeding(fileId)
 
     /** Starts fetching the file announced by [messageId] in the open channel. */
@@ -1504,8 +1538,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                     ok = out.outputStream().use { manager.media.exportTo(fileId, it) }
                     if (!ok) out.delete()
                 }
-                if (ok) toast("Saved $fileName", com.pombo.android.ui.ToastKind.SUCCESS)
-                else toast("Could not read the downloaded file", com.pombo.android.ui.ToastKind.ERROR)
+                if (ok) {
+                    markFileSaved(fileId)
+                    toast("Saved $fileName", com.pombo.android.ui.ToastKind.SUCCESS)
+                } else toast("Could not read the downloaded file", com.pombo.android.ui.ToastKind.ERROR)
             } catch (e: Exception) {
                 toast("Save failed: ${e.message}", com.pombo.android.ui.ToastKind.ERROR)
             }
@@ -2261,7 +2297,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
                     }
                     launch {
                         manager.ensureChannelImage(
-                            com.pombo.android.core.StreamConstants.deriveAdminId(info.streamId)
+                            com.pombo.android.core.StreamConstants.deriveAdminId(info.streamId),
+                            label = info.displayName
                         )
                         val preview = previewStore.dedup(info.streamId) {
                             manager.fetchLatestPreview(info.streamId)
@@ -2792,16 +2829,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
 
     override fun onBridgeConnected(address: String) {
         _status.value = NetStatus.CONNECTED
-        // force: a (re)connect rebuilds the bridge's JS world, so whatever the
-        // previous session subscribed no longer exists there. This is the one
-        // place the inbox replay is supposed to run.
-        manager.subscribeMyInbox(force = true)
+        // Immediate: the only one of this group with something on screen
+        // waiting for it (an open channel resubscribing) — null on a cold
+        // start, so this is a no-op exactly when Explore owns the screen.
         manager.resubscribeCurrent()
-        // hasInbox() needs a live client, so the check only means anything once
-        // the bridge is connected — re-run it here, not just on identity change.
-        refreshDmInbox()
-        // Catch up on what happened in the other channels while we were away.
-        scanChannelsActivity()
+        // The rest is bookkeeping nothing on screen is blocked on. On a cold
+        // start Explore's own channel-image resends are queued on this same
+        // bridge-connect gate (they awaitConnected() too) — firing inbox
+        // replay, activity scan and the inbox check in the same tick used to
+        // have them all compete for the bridge with what the user is actually
+        // looking at. A short stagger lets Explore's burst dispatch first.
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(BRIDGE_CONNECT_BACKGROUND_DELAY_MS)
+            // force: a (re)connect rebuilds the bridge's JS world, so whatever
+            // the previous session subscribed no longer exists there. This is
+            // the one place the inbox replay is supposed to run.
+            manager.subscribeMyInbox(force = true)
+            // hasInbox() needs a live client, so the check only means anything
+            // once the bridge is connected — re-run it here, not just on
+            // identity change.
+            refreshDmInbox()
+            // Catch up on what happened in the other channels while we were away.
+            scanChannelsActivity()
+        }
         // Push relay housekeeping: republish rows after an FCM token rotation
         // (they hold a dead token until then) and at the web's 6h cadence.
         viewModelScope.launch { push.refreshRegistrationsIfDue() }

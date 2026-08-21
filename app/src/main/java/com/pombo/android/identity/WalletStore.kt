@@ -114,6 +114,9 @@ class WalletStore(context: Context) {
 
     private fun usernameKey(): String = KEY_USERNAME + "_" + (address?.lowercase() ?: "none")
 
+    /** Peeks another stored account's username without switching to it (Profile's account list). */
+    fun usernameFor(otherAddress: String): String? = prefs.getString(KEY_USERNAME + "_" + otherAddress.lowercase(), null)
+
     private companion object {
         const val KEY_PK = "pk"                 // legacy
         const val KEY_ADDRESS = "address"       // legacy

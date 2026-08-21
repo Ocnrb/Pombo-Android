@@ -1,4 +1,4 @@
-package com.pombo.android
+﻿package com.pombo.android
 
 import android.util.Log
 import com.pombo.android.bridge.PomboBridge
@@ -518,7 +518,14 @@ class ChannelManager(
     val presenceReady: StateFlow<Boolean> = _presenceReady.asStateFlow()
 
     // Moderation (ADMIN_STATE on -3/P0). Latest-wins by rev; owner-authored only.
-    data class Pin(val targetId: String, val text: String, val sender: String)
+    /**
+     * [senderName]/[ensName] mirror the web's pin snapshot fields (web
+     * channels.js pinMessage) — frozen at pin time, same as [text]/[sender].
+     */
+    data class Pin(
+        val targetId: String, val text: String, val sender: String,
+        val senderName: String? = null, val ensName: String? = null
+    )
     private val _pins = MutableStateFlow<List<Pin>>(emptyList())
     val pins: StateFlow<List<Pin>> = _pins.asStateFlow()
     private val _hiddenIds = MutableStateFlow<Set<String>>(emptySet())
@@ -872,6 +879,9 @@ class ChannelManager(
     /** Every known channel image, keyed by admin stream id (shared cache). */
     val channelImages: StateFlow<Map<String, ByteArray>> = imageStore.images
 
+    /** Admin stream ids with an image fetch in flight — spinner vs fallback-avatar signal. */
+    val channelImagesPending: StateFlow<Set<String>> = imageStore.pending
+
     /** Decoded channel image for the open channel, or null when unset. */
     private val _channelImage = MutableStateFlow<ByteArray?>(null)
     val channelImage: StateFlow<ByteArray?> = _channelImage.asStateFlow()
@@ -882,10 +892,19 @@ class ChannelManager(
      * the list and Explore. Cache-first with a background refresh, one network
      * round-trip per channel thanks to the store's inflight dedup.
      */
-    fun ensureChannelImage(adminStreamId: String, password: String? = null) {
+    fun ensureChannelImage(adminStreamId: String, password: String? = null, label: String = adminStreamId) {
         if (adminStreamId.isEmpty()) return
         scope.launch {
-            imageStore.dedup(adminStreamId) { fetchChannelImage(adminStreamId, password) }
+            // One shot used to be it: a transient resend timeout or an empty
+            // read during the bridge-connect burst (Explore's own fetches all
+            // land in the same tick, see AppViewModel.onBridgeConnected) meant
+            // that channel's card never got another chance this session. 3
+            // tries, spaced apart, without hammering the bridge further.
+            repeat(3) { attempt ->
+                val result = imageStore.dedup(adminStreamId) { fetchChannelImage(adminStreamId, password, label) }
+                if (result != null || attempt == 2) return@launch
+                delay(2_500L * (attempt + 1))
+            }
         }
     }
 
@@ -897,6 +916,7 @@ class ChannelManager(
     private suspend fun resendImagePayload(
         adminStreamId: String,
         password: String?,
+        label: String = adminStreamId,
         timeoutMs: Long = 30_000
     ): JSONObject? {
         bridge.awaitConnected()
@@ -909,18 +929,22 @@ class ChannelManager(
             .put("partition", StreamConstants.ADMIN_CHANNEL_IMAGE)
             .put("last", 1)
             .put("recoverSigner", true), timeoutMs)
-        val arr = res.optJSONArray("messages") ?: return null
-        if (arr.length() == 0) return null
+        val arr = res.optJSONArray("messages")
+        if (arr == null) { Log.w(TAG, "channelImage $label ($adminStreamId): no messages array in resend response"); return null }
+        if (arr.length() == 0) { Log.w(TAG, "channelImage $label ($adminStreamId): resend returned 0 entries"); return null }
         val entry = arr.getJSONObject(arr.length() - 1)
         val meta = entry.optJSONObject("meta") ?: JSONObject()
         val contentAny = entry.opt("content")
         var data: JSONObject = when (contentAny) {
             is JSONObject -> contentAny
             is String -> {
-                val pwd = password ?: return null
-                try { JSONObject(PomboCrypto.decryptString(contentAny, pwd)) } catch (e: Exception) { return null }
+                val pwd = password
+                if (pwd == null) { Log.w(TAG, "channelImage $label ($adminStreamId): content is sealed, no password to open it"); return null }
+                try { JSONObject(PomboCrypto.decryptString(contentAny, pwd)) } catch (e: Exception) {
+                    Log.w(TAG, "channelImage $label ($adminStreamId): password decrypt failed: ${e.message}"); return null
+                }
             }
-            else -> return null
+            else -> { Log.w(TAG, "channelImage $label ($adminStreamId): content is neither object nor string (${contentAny?.javaClass})"); return null }
         }
         // Native/gated: CHANNEL_IMAGE arrives as an epoch envelope (N-A)
         if (com.pombo.android.core.EpochKeyCrypto.isEpochEnvelope(data)) {
@@ -930,15 +954,19 @@ class ChannelManager(
             // — the epoch state only loads on open, so without this the image
             // stays undecryptable everywhere but inside the channel.
             epochKeys.loadPersistedState(messageStreamId)
-            data = epochKeys.tryDecrypt(messageStreamId, keysId, data) ?: return null
+            data = epochKeys.tryDecrypt(messageStreamId, keysId, data)
+                ?: run { Log.w(TAG, "channelImage $label ($adminStreamId): epoch envelope present but key unavailable/decrypt failed"); return null }
         }
-        if (data.optString("type") != "CHANNEL_IMAGE") return null
+        if (data.optString("type") != "CHANNEL_IMAGE") {
+            Log.w(TAG, "channelImage $label ($adminStreamId): entry type is '${data.optString("type")}', not CHANNEL_IMAGE"); return null
+        }
         if (gatedChannel != null) {
             // Gated: the transport publisher is the CLONE for everyone —
             // authority is the recovered envelope signer, and gatedAuthor
             // already enforces signer == namespace admin on -3 (D10c: never
             // fall back to the transport publisher).
-            gatedAuthor(gatedChannel, adminStreamId, meta) ?: return null
+            gatedAuthor(gatedChannel, adminStreamId, meta)
+                ?: run { Log.w(TAG, "channelImage $label ($adminStreamId): gatedAuthor check failed"); return null }
         } else {
             // Unknown channels (Explore) may be gated storefronts: the clone
             // publishes for every member, so a non-owner transport publisher
@@ -947,15 +975,18 @@ class ChannelManager(
             val senderId = meta.optString("publisherId").lowercase()
             val owner = adminStreamId.substringBefore('/').lowercase()
             if (senderId.isNotEmpty() && senderId != owner
-                && meta.optString("signer").lowercase() != owner) return null
+                && meta.optString("signer").lowercase() != owner) {
+                Log.w(TAG, "channelImage $label ($adminStreamId): authority check failed (sender=$senderId signer=${meta.optString("signer").lowercase()} owner=$owner)")
+                return null
+            }
         }
         return data
     }
 
     /** Returns the decoded bytes and caches them; null when unset/invalid. */
-    private suspend fun fetchChannelImage(adminStreamId: String, password: String?): ByteArray? {
+    private suspend fun fetchChannelImage(adminStreamId: String, password: String?, label: String = adminStreamId): ByteArray? {
         return try {
-            val data = resendImagePayload(adminStreamId, password) ?: return null
+            val data = resendImagePayload(adminStreamId, password, label) ?: return null
 
             val hash = data.optString("hash")
             // Unchanged payload: keep what we have and skip the decode.
@@ -978,7 +1009,10 @@ class ChannelManager(
             if (bytes.size > IMAGE_MAX_ASSEMBLED_BYTES) return null
             imageStore.put(adminStreamId, hash.ifEmpty { actual }, bytes, ts)
             bytes
-        } catch (e: Exception) { null }
+        } catch (e: Exception) {
+            Log.w(TAG, "channelImage $label ($adminStreamId): fetch threw ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
     }
 
     /**
@@ -1067,7 +1101,7 @@ class ChannelManager(
         repeat(5) {
             kotlinx.coroutines.delay(3_000)
             val remote = try {
-                resendImagePayload(channel.adminStreamId, channel.password, 10_000)?.optString("hash")
+                resendImagePayload(channel.adminStreamId, channel.password, timeoutMs = 10_000)?.optString("hash")
             } catch (e: Exception) { null }
             if (remote == hash) return true
         }
@@ -2655,7 +2689,10 @@ class ChannelManager(
             _pins.value = (0 until arr.length()).mapNotNull { idx ->
                 val p = arr.optJSONObject(idx) ?: return@mapNotNull null
                 val snap = p.optJSONObject("snapshot")
-                Pin(p.optString("targetId"), snap?.optString("text") ?: "", snap?.optString("sender") ?: "")
+                Pin(
+                    p.optString("targetId"), snap?.optString("text") ?: "", snap?.optString("sender") ?: "",
+                    senderName = snap?.optStringOrNull("senderName"), ensName = snap?.optStringOrNull("ensName")
+                )
             }
         }
     }
@@ -2677,7 +2714,9 @@ class ChannelManager(
             .put("hiddenMessageIds", JSONArray(_hiddenIds.value.toList()))
             .put("pins", JSONArray(_pins.value.map {
                 JSONObject().put("targetId", it.targetId).put("pinnedAt", System.currentTimeMillis())
-                    .put("snapshot", JSONObject().put("sender", it.sender).put("text", it.text))
+                    .put("snapshot", JSONObject().put("sender", it.sender).put("text", it.text)
+                        .put("senderName", it.senderName ?: JSONObject.NULL)
+                        .put("ensName", it.ensName ?: JSONObject.NULL))
             }))
         val msg = JSONObject()
             .put("type", "ADMIN_STATE").put("rev", rev)
@@ -2740,7 +2779,7 @@ class ChannelManager(
             val msg = _messages.value.find { it.id == messageId }
                 ?: throw IllegalStateException("Message not found")
             if (_pins.value.any { it.targetId == messageId }) return
-            _pins.value + Pin(messageId, msg.text, msg.sender)
+            _pins.value + Pin(messageId, msg.text, msg.sender, senderName = msg.senderName, ensName = msg.ensName)
         } else {
             _pins.value.filterNot { it.targetId == messageId }
         }
@@ -6219,6 +6258,12 @@ class ChannelManager(
             }
         }
     }
+
+    /** Pauses a running download from the Active Transfers list — keeps its bytes. */
+    fun pauseTransfer(fileId: String) = media.pauseDownload(fileId)
+
+    /** Resumes a download [pauseTransfer] stopped, from wherever it left off. */
+    fun resumeTransfer(fileId: String) = media.resumeDownload(fileId)
 
     /** Stops serving a file, durably, from the Active Transfers list. */
     fun stopSeeding(fileId: String) {

@@ -30,6 +30,15 @@ class ChannelImageStore(context: Context) {
     private val _images = MutableStateFlow<Map<String, ByteArray>>(emptyMap())
     val images: StateFlow<Map<String, ByteArray>> = _images.asStateFlow()
 
+    /**
+     * adminStreamIds with a fetch in flight — lets a list (Explore) tell "no
+     * image yet, still looking" from "confirmed no image" apart, web parity
+     * (ExploreUI's _exploreResolvedImages): the former shows a spinner, the
+     * latter falls back straight to the generated avatar.
+     */
+    private val _pending = MutableStateFlow<Set<String>>(emptySet())
+    val pending: StateFlow<Set<String>> = _pending.asStateFlow()
+
     private val hashes = HashMap<String, String>()
     // Payload ts of what we hold, in-memory only (disk entries restart at 0).
     // Lets fetches drop a LAGGING storage read: right after a publish the
@@ -96,6 +105,7 @@ class ChannelImageStore(context: Context) {
         if (existing != null) return existing.await()
         val deferred = CompletableDeferred<ByteArray?>()
         synchronized(inflight) { inflight[adminStreamId] = deferred }
+        _pending.value = _pending.value + adminStreamId
         return try {
             val result = fetch()
             deferred.complete(result)
@@ -105,6 +115,7 @@ class ChannelImageStore(context: Context) {
             null
         } finally {
             synchronized(inflight) { inflight.remove(adminStreamId) }
+            _pending.value = _pending.value - adminStreamId
         }
     }
 }

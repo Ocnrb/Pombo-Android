@@ -21,7 +21,9 @@ import androidx.compose.foundation.content.hasMediaType
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.clearText
+import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -237,22 +239,26 @@ fun PomboApp(vm: AppViewModel) {
         // to the transfer state, rather than each opening its own.
         val transfers by vm.fileProgress.collectAsState()
         val uploads by vm.uploadStats.collectAsState()
-        val fileTransfers = remember(transfers, uploads) {
+        val savedFileIds by vm.savedFileIds.collectAsState()
+        val fileTransfers = remember(transfers, uploads, savedFileIds) {
             object : com.pombo.android.ui.FileTransfers {
                 override fun progressFor(fileId: String) = transfers[fileId]
                 override fun uploadsFor(fileId: String) = uploads[fileId]
                 override fun isSeeding(fileId: String) = vm.isSeedingFile(fileId)
+                override fun isSaved(fileId: String) = savedFileIds.contains(fileId)
                 override fun onDownload(messageId: String) = vm.downloadFile(messageId)
                 override fun onSave(fileId: String, fileName: String) = vm.saveFile(fileId, fileName)
             }
         }
         val storageUploads by vm.storageUploads.collectAsState()
         val storageDownloads by vm.storageDownloads.collectAsState()
-        val storageTransfers = remember(storageUploads, storageDownloads) {
+        val savedTransferIds by vm.savedTransferIds.collectAsState()
+        val storageTransfers = remember(storageUploads, storageDownloads, savedTransferIds) {
             object : com.pombo.android.ui.StorageTransfers {
                 override fun uploadFor(transferId: String) = storageUploads[transferId]
                 override fun downloadFor(transferId: String) = storageDownloads[transferId]
                 override fun completedFor(transferId: String) = vm.storageFileReady(transferId)
+                override fun isSaved(transferId: String) = savedTransferIds.contains(transferId)
                 override fun onDownload(messageId: String) = vm.downloadStorageFile(messageId)
                 override fun onSave(transferId: String, fileName: String) = vm.saveStorageFile(transferId, fileName)
             }
@@ -1765,7 +1771,7 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
                 Spacer(Modifier.height(20.dp))
                 Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.05f)))
                 Spacer(Modifier.height(16.dp))
-                SectionLabel("Message Storage")
+                SectionLabel("Storage Provider")
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(
                         Triple("streamr", "Pombo", Icons.Outlined.Public),
@@ -1866,6 +1872,7 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
                 }
 
                 // Retention slider — web #storage-days-input, range 1..365.
+                // Above 30 days the effective value snaps to exact months.
                 Spacer(Modifier.height(16.dp))
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text(
@@ -1880,7 +1887,7 @@ internal fun CreateChannelDialog(vm: AppViewModel, onDismiss: () -> Unit, onCrea
                 }
                 androidx.compose.material3.Slider(
                     value = storageDays,
-                    onValueChange = { storageDays = it },
+                    onValueChange = { storageDays = snapRetentionDays(it.roundToInt()).toFloat() },
                     valueRange = 1f..365f,
                     colors = androidx.compose.material3.SliderDefaults.colors(
                         thumbColor = PomboColors.Accent,
@@ -2046,7 +2053,7 @@ fun CreateDmInboxDialog(
 
                 // ---- Message storage (same controls as the channel dialog) ----
                 Text(
-                    "MESSAGE STORAGE", color = Color.White.copy(alpha = 0.70f),
+                    "STORAGE PROVIDER", color = Color.White.copy(alpha = 0.70f),
                     fontSize = 12.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.8.sp
                 )
                 Spacer(Modifier.height(10.dp))
@@ -2158,7 +2165,7 @@ fun CreateDmInboxDialog(
                 }
                 androidx.compose.material3.Slider(
                     value = storageDays,
-                    onValueChange = { storageDays = it },
+                    onValueChange = { storageDays = snapRetentionDays(it.roundToInt()).toFloat() },
                     valueRange = 1f..365f,
                     colors = androidx.compose.material3.SliderDefaults.colors(
                         thumbColor = PomboColors.Accent,
@@ -2225,6 +2232,18 @@ private fun retentionLabel(days: Int): String = when {
     days < 30 -> "$days days"
     days < 365 -> (days / 30.0).roundToInt().let { if (it == 1) "1 month" else "$it months" }
     else -> "1 year"
+}
+
+/**
+ * Retention slider stays a proportional 1-365 day range (so dragging to the
+ * middle lands near 6 months). Above the 30-day mark the effective value is
+ * magnet-snapped to the nearest exact month so the label never shows an
+ * ambiguous in-between day count. Mirrors web's utils/retention.js.
+ */
+private fun snapRetentionDays(days: Int): Int = when {
+    days <= 30 -> days
+    days >= 365 -> 365
+    else -> (days / 30.0).roundToInt() * 30
 }
 
 /**
@@ -2530,6 +2549,11 @@ fun ChatScreen(vm: AppViewModel) {
     // the list. Same action as the header's arrow.
     androidx.activity.compose.BackHandler(enabled = !showInfo) { vm.closeChannel() }
     var replyTarget by remember { mutableStateOf<UiMessage?>(null) }
+    // Edit happens in the main composer, not inline in the bubble (web
+    // parity, 2026-08-21 user call): tapping "Edit" pre-fills this shared
+    // field and the send button commits to editMessage instead of sendMessage.
+    var editTarget by remember { mutableStateOf<UiMessage?>(null) }
+    val composerInput = rememberTextFieldState()
     val listState = rememberLazyListState()
     val ch = channel ?: return
 
@@ -3048,8 +3072,12 @@ fun ChatScreen(vm: AppViewModel) {
                         onActivate = { id -> activeId = if (activeId == id) null else id },
                         isContact = { addr -> contacts.any { it.address.equals(addr, ignoreCase = true) } },
                         onReact = { id, emoji, add -> vm.toggleReaction(id, emoji, add) },
-                        onReply = { m -> replyTarget = m; activeId = null },
-                        onEdit = { id, text -> vm.editMessage(id, text) },
+                        onReply = { m -> editTarget = null; replyTarget = m; activeId = null },
+                        onEdit = { m ->
+                            replyTarget = null
+                            editTarget = m
+                            composerInput.setTextAndPlaceCursorAtEnd(m.text)
+                        },
                         onDelete = { id -> vm.deleteMessage(id) },
                         onPin = { id, pin -> vm.pinMessage(id, pin) },
                         onHide = { id, hide -> vm.hideMessage(id, hide) },
@@ -3187,7 +3215,14 @@ fun ChatScreen(vm: AppViewModel) {
                     Column(Modifier.weight(1f)) {
                         if (first.sender.isNotEmpty()) {
                             Text(
-                                ensNames[first.sender.lowercase()] ?: shortAddress(first.sender),
+                                // Web parity (PinnedBannerUI._buildPreviewParts):
+                                // live ENS cache first (resolves after pin time),
+                                // then the frozen snapshot's ENS, then its display
+                                // name, then the truncated address.
+                                ensNames[first.sender.lowercase()]
+                                    ?: first.ensName
+                                    ?: first.senderName
+                                    ?: shortAddress(first.sender),
                                 color = PomboColors.Accent,
                                 fontSize = 13.sp, lineHeight = 16.sp,
                                 fontWeight = FontWeight.SemiBold,
@@ -3258,12 +3293,37 @@ fun ChatScreen(vm: AppViewModel) {
                         color = Color.White.copy(alpha = 0.60f), fontSize = 12.sp, fontWeight = FontWeight.Medium
                     )
                     Text(
-                        if (target.isImage) "[Media]" else target.text.take(100),
+                        if (target.isImage || target.file != null || target.storageFile != null) "[Media]"
+                        else target.text.take(100),
                         color = Color.White.copy(alpha = 0.50f), fontSize = 13.sp, maxLines = 1
                     )
                 }
                 IconButton(onClick = { replyTarget = null }, modifier = Modifier.size(32.dp)) {
                     Icon(Icons.Filled.Close, contentDescription = "Cancel reply", tint = Color.White.copy(alpha = 0.40f), modifier = Modifier.size(16.dp))
+                }
+            }
+        }
+
+        // Edit bar above the composer (web #edit-bar) — no text preview on
+        // the web either, just the label; the composer itself carries the text.
+        if (editTarget != null) {
+            Row(
+                Modifier.fillMaxWidth().background(PomboColors.Surface)
+                    .padding(start = 12.dp, end = 8.dp, top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.width(2.dp).height(30.dp).background(PomboColors.Accent.copy(alpha = 0.5f)))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "Editing message",
+                    color = Color.White.copy(alpha = 0.60f), fontSize = 12.sp, fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(
+                    onClick = { editTarget = null; composerInput.clearText() },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(Icons.Filled.Close, contentDescription = "Cancel edit", tint = Color.White.copy(alpha = 0.40f), modifier = Modifier.size(16.dp))
                 }
             }
         }
@@ -3281,6 +3341,7 @@ fun ChatScreen(vm: AppViewModel) {
         val canPost = (!ch.readOnly || ch.createdBy?.equals(myAddr, ignoreCase = true) == true) &&
             !subExpired
         ChatComposer(
+            input = composerInput,
             canPost = canPost,
             disabledPlaceholder = if (subExpired) "Subscription expired — renew to write"
                 else "This channel is read-only",
@@ -3290,10 +3351,16 @@ fun ChatScreen(vm: AppViewModel) {
             onPickFile = { vm.sendFile(it) },
             onPickStorageFile = { vm.sendStorageFile(it) },
             onSend = { text ->
-                vm.sendMessage(text, replyTarget?.let {
-                    com.pombo.android.ReplyRef(it.id, it.sender, it.senderName ?: it.ensName, it.text)
-                })
-                replyTarget = null
+                val et = editTarget
+                if (et != null) {
+                    vm.editMessage(et.id, text)
+                    editTarget = null
+                } else {
+                    vm.sendMessage(text, replyTarget?.let {
+                        com.pombo.android.ReplyRef(it.id, it.sender, it.senderName ?: it.ensName, it.text)
+                    })
+                    replyTarget = null
+                }
             }
         )
     }
@@ -3387,6 +3454,9 @@ private fun TypingIndicator(name: String) {
 )
 @Composable
 private fun ChatComposer(
+    // Hoisted to the caller (web parity): editing a message pre-fills and
+    // reuses this same field instead of opening a separate one inline.
+    input: TextFieldState,
     canPost: Boolean,
     disabledPlaceholder: String = "This channel is read-only",
     onTyping: () -> Unit,
@@ -3400,7 +3470,6 @@ private fun ChatComposer(
     // TextFieldState pipeline advertises accepted MIME types to the IME via
     // contentReceiver — with the old field, Gboard greyed its GIFs out with
     // "can't insert this content here".
-    val input = rememberTextFieldState()
     LaunchedEffect(Unit) {
         var first = true
         androidx.compose.runtime.snapshotFlow { input.text.toString() }.collect {
@@ -5505,7 +5574,8 @@ private fun MessageGroup(
     isContact: (String) -> Boolean,
     onReact: (String, String, Boolean) -> Unit,
     onReply: (UiMessage) -> Unit,
-    onEdit: (String, String) -> Unit,
+    /** Starts editing this message in the composer (web parity) — no commit here. */
+    onEdit: (UiMessage) -> Unit,
     onDelete: (String) -> Unit,
     onPin: (String, Boolean) -> Unit,
     onHide: (String, Boolean) -> Unit,
@@ -5655,7 +5725,7 @@ private fun MessageGroup(
                     onActivate = { onActivate(msg.id) },
                     onReact = { emoji, add -> onReact(msg.id, emoji, add) },
                     onReply = { onReply(msg) },
-                    onEdit = { text -> onEdit(msg.id, text) },
+                    onEdit = { onEdit(msg) },
                     onDelete = { onDelete(msg.id) },
                     onPin = { pin -> onPin(msg.id, pin) },
                     onHide = { hide -> onHide(msg.id, hide) },
@@ -5697,7 +5767,8 @@ private fun MessageBubble(
     onActivate: () -> Unit,
     onReact: (String, Boolean) -> Unit,
     onReply: () -> Unit,
-    onEdit: (String) -> Unit,
+    /** Starts editing this message in the composer (web parity) — no commit here. */
+    onEdit: () -> Unit,
     onDelete: () -> Unit,
     onPin: (Boolean) -> Unit = {},
     onHide: (Boolean) -> Unit = {},
@@ -5735,8 +5806,6 @@ private fun MessageBubble(
     var menuAt by remember { mutableStateOf(androidx.compose.ui.unit.IntOffset.Zero) }
     var bubbleOrigin by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
     var picker by remember { mutableStateOf(false) }
-    var editing by remember { mutableStateOf(false) }
-    var editText by remember { mutableStateOf(msg.text) }
     var confirmBan by remember { mutableStateOf(false) }
     var confirmBlock by remember { mutableStateOf(false) }
     var lightbox by remember { mutableStateOf(false) }
@@ -5908,23 +5977,18 @@ private fun MessageBubble(
                                     fontSize = 12.sp, fontWeight = FontWeight.Medium
                                 )
                                 Text(
-                                    r.text.take(50) + if (r.text.length > 50) "..." else "",
+                                    // A quoted media message carries no text
+                                    // over the wire (web parity) — blank means
+                                    // media, never a legitimate empty message.
+                                    if (r.text.isBlank()) "[Media]"
+                                    else r.text.take(50) + if (r.text.length > 50) "..." else "",
                                     color = Color.White.copy(alpha = 0.50f),
                                     fontSize = 13.sp, maxLines = 1
                                 )
                             }
                         }
                     }
-                    if (editing) {
-                        OutlinedTextField(
-                            value = editText, onValueChange = { editText = it },
-                            colors = pomboFieldColors(), modifier = Modifier.widthIn(max = 260.dp)
-                        )
-                        Row {
-                            TextButton(onClick = { editing = false; onEdit(editText) }) { Text("Save", color = PomboColors.Accent) }
-                            TextButton(onClick = { editing = false; editText = msg.text }) { Text("Cancel", color = PomboColors.TextDim) }
-                        }
-                    } else if (msg.file != null) {
+                    if (msg.file != null) {
                         com.pombo.android.ui.FileBubbleContent(
                             file = msg.file,
                             messageId = msg.id,
@@ -6074,13 +6138,15 @@ private fun MessageBubble(
                         // routed through the admin stream below, so moderation
                         // stays the single source of truth (web showDelete =
                         // isSelf && !isAdminUser, MessageContextMenuUI.js:231).
-                        val showEdit = msg.mine && !msg.isImage
+                        // Web: showEdit = isSelf && dataset.type === 'text' — files
+                        // and images are excluded too, not just images.
+                        val showEdit = msg.mine && !msg.isImage && msg.file == null && msg.storageFile == null
                         val showOwnerDelete = msg.mine && !canModerate
                         if (showEdit || showOwnerDelete) {
                             com.pombo.android.ui.ContextMenuDivider()
                             if (showEdit) com.pombo.android.ui.ContextMenuItem(
                                 "Edit Message", Icons.Outlined.Edit
-                            ) { menu = false; editing = true }
+                            ) { menu = false; onEdit() }
                             if (showOwnerDelete) com.pombo.android.ui.ContextMenuItem(
                                 "Delete Message", Icons.Outlined.Delete,
                                 iconTint = red, labelColor = red

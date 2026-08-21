@@ -38,10 +38,17 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MailOutline
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.ui.draw.rotate
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Campaign
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
+import androidx.compose.material.icons.outlined.Home
+import androidx.compose.material.icons.outlined.Public
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.layout.onSizeChanged
@@ -112,7 +119,7 @@ import com.pombo.android.ui.Avatar
 import com.pombo.android.ui.theme.PomboColors
 
 private enum class Tab(val label: String, val icon: ImageVector) {
-    CHATS("Chats", Icons.Outlined.ChatBubbleOutline),
+    CHATS("Home", Icons.Outlined.Home),
     EXPLORE("Explore", Icons.Outlined.Explore),
     CONTACTS("Contacts", Icons.Outlined.People),
     SETTINGS("Settings", Icons.Outlined.Settings),
@@ -161,6 +168,13 @@ fun MainShell(vm: AppViewModel) {
     var settingsMenu by remember { mutableStateOf(false) }
     /** Centre x of the Settings pill item, reported by PillNav. */
     var settingsAnchorX by remember { mutableFloatStateOf(0f) }
+    // Explore now offers two destinations (2026-08-21): Threads (today's
+    // channel Explore) and Live Streams (not built yet — locked). The pill
+    // tap opens a picker instead of navigating straight to Threads, same
+    // pattern as Settings' panel picker.
+    var exploreMenu by remember { mutableStateOf(false) }
+    /** Centre x of the Explore pill item, reported by PillNav. */
+    var exploreAnchorX by remember { mutableFloatStateOf(0f) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     // Back gesture = navigate back, not leave the app. Declared innermost-last,
@@ -170,6 +184,7 @@ fun MainShell(vm: AppViewModel) {
     val homeTab = if (guestNow) Tab.EXPLORE else Tab.CHATS
     androidx.activity.compose.BackHandler(enabled = tab != homeTab) { tab = homeTab }
     androidx.activity.compose.BackHandler(enabled = settingsMenu) { settingsMenu = false }
+    androidx.activity.compose.BackHandler(enabled = exploreMenu) { exploreMenu = false }
 
     var showImportKey by remember { mutableStateOf(false) }
     // Web walletFlows: "Create New Account" opens the avatar/name wizard, not
@@ -219,7 +234,7 @@ fun MainShell(vm: AppViewModel) {
                 // adds the clearance as contentPadding instead, so the last card
                 // can still be scrolled clear of the glass. Reserving it out here
                 // for every tab left a dead black band under the pill.
-                .padding(bottom = if (tab == Tab.EXPLORE) 0.dp else 32.dp + PILL_NAV_HEIGHT)
+                .padding(bottom = if (tab == Tab.EXPLORE) 0.dp else PILL_NAV_BOTTOM_OFFSET + PILL_NAV_HEIGHT)
         ) {
             when (tab) {
                 Tab.CHATS -> ChatsTab(vm, onCreate = { showCreate = true }, onJoin = { showJoin = true }, onConnect = { showConnect = true })
@@ -230,11 +245,11 @@ fun MainShell(vm: AppViewModel) {
             }
         }
 
-        // Tap-anywhere-else closes the settings dropdown. Declared before the
-        // pill Column, so it is drawn under both the menu and the pill and
-        // catches only the taps that miss them.
-        if (settingsMenu) {
-            Box(Modifier.fillMaxSize().clickableNoRipple { settingsMenu = false })
+        // Tap-anywhere-else closes the settings/explore dropdown. Declared
+        // before the pill Column, so it is drawn under both the menu and the
+        // pill and catches only the taps that miss them.
+        if (settingsMenu || exploreMenu) {
+            Box(Modifier.fillMaxSize().clickableNoRipple { settingsMenu = false; exploreMenu = false })
         }
 
         // Floating pill nav + guest label underneath (web: .pill-guest-label).
@@ -246,7 +261,7 @@ fun MainShell(vm: AppViewModel) {
             Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
-                .padding(bottom = 32.dp),
+                .padding(bottom = PILL_NAV_BOTTOM_OFFSET),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             if (settingsMenu) {
@@ -282,32 +297,65 @@ fun MainShell(vm: AppViewModel) {
                     }
                 }
             }
+            if (exploreMenu) {
+                // Same anchoring approach as the Settings dropdown above,
+                // centred on the Explore pill item instead.
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                val screenW = with(density) {
+                    androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
+                }
+                var menuW by remember { mutableFloatStateOf(0f) }
+                val margin = with(density) { 8.dp.toPx() }
+                Box(Modifier.fillMaxWidth()) {
+                    Box(
+                        Modifier
+                            .align(Alignment.CenterStart)
+                            .offset {
+                                val x = (exploreAnchorX - menuW / 2f)
+                                    .coerceIn(margin, (screenW - menuW - margin).coerceAtLeast(margin))
+                                androidx.compose.ui.unit.IntOffset(x.toInt(), 0)
+                            }
+                            .onSizeChanged { menuW = it.width.toFloat() }
+                    ) {
+                        ExploreDropdown {
+                            exploreMenu = false
+                            tab = Tab.EXPLORE
+                            vm.setChatOrigin(com.pombo.android.AppViewModel.ChatOrigin.EXPLORE)
+                        }
+                    }
+                }
+            }
             PillNav(
                 current = tab,
                 address = vm.address.collectAsState().value,
                 ensAvatarUrl = vm.ensAvatars.collectAsState().value[vm.address.collectAsState().value?.lowercase()],
                 onSettingsAnchor = { settingsAnchorX = it },
+                onExploreAnchor = { exploreAnchorX = it },
                 onSelect = { picked ->
-                    if (picked == Tab.SETTINGS) {
-                        // Settings only offers its panel list — navigation happens
-                        // when a panel is picked, not on the pill tap itself.
-                        settingsMenu = !settingsMenu
-                    } else {
-                        settingsMenu = false
-                        tab = picked
-                        // Remember where the user is, so a chat opened next
-                        // returns to this tab.
-                        vm.setChatOrigin(
-                            if (picked == Tab.EXPLORE) com.pombo.android.AppViewModel.ChatOrigin.EXPLORE
-                            else com.pombo.android.AppViewModel.ChatOrigin.CHATS
-                        )
+                    when (picked) {
+                        Tab.SETTINGS -> {
+                            // Settings only offers its panel list — navigation
+                            // happens when a panel is picked, not on the tap itself.
+                            exploreMenu = false
+                            settingsMenu = !settingsMenu
+                        }
+                        Tab.EXPLORE -> {
+                            // Explore now offers Threads / Live Streams — same
+                            // picker-first pattern as Settings (2026-08-21).
+                            settingsMenu = false
+                            exploreMenu = !exploreMenu
+                        }
+                        else -> {
+                            settingsMenu = false
+                            exploreMenu = false
+                            tab = picked
+                            // Remember where the user is, so a chat opened next
+                            // returns to this tab.
+                            vm.setChatOrigin(com.pombo.android.AppViewModel.ChatOrigin.CHATS)
+                        }
                     }
                 }
             )
-            if (isGuest) {
-                Spacer(Modifier.height(6.dp))
-                Text("Guest mode — data not saved", color = PomboColors.Accent, fontSize = 11.sp)
-            }
         }
 
         // Full-screen panel drawn INSIDE this window (last child = on top), not
@@ -331,6 +379,8 @@ private fun PillNav(
     onSelect: (Tab) -> Unit,
     /** Centre x of the Settings item, in root coordinates. */
     onSettingsAnchor: (Float) -> Unit = {},
+    /** Centre x of the Explore item, in root coordinates. */
+    onExploreAnchor: (Float) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     // .pill-nav-inner: rgba(255,255,255,0.06) fill, 0.08 border, radius 2rem,
@@ -370,11 +420,13 @@ private fun PillNav(
             } else {
                 PillItem(
                     t.label, t.icon, active = current == t,
-                    // The settings dropdown is centred on THIS icon, so its
-                    // centre has to travel out of the pill's own layout.
-                    modifier = if (t == Tab.SETTINGS) {
-                        Modifier.onGloballyPositioned { onSettingsAnchor(it.boundsInRoot().center.x) }
-                    } else Modifier
+                    // The settings/explore dropdowns centre on THIS icon, so
+                    // its centre has to travel out of the pill's own layout.
+                    modifier = when (t) {
+                        Tab.SETTINGS -> Modifier.onGloballyPositioned { onSettingsAnchor(it.boundsInRoot().center.x) }
+                        Tab.EXPLORE -> Modifier.onGloballyPositioned { onExploreAnchor(it.boundsInRoot().center.x) }
+                        else -> Modifier
+                    }
                 ) { onSelect(t) }
             }
         }
@@ -392,7 +444,7 @@ private fun PillItem(
     Column(
         modifier
             .clickableNoRipple(onClick)
-            .background(if (active) PomboColors.Accent.copy(alpha = 0.12f) else Color.Transparent, RoundedCornerShape(24.dp))
+            .background(if (active) PomboColors.Accent.copy(alpha = 0.22f) else Color.Transparent, RoundedCornerShape(24.dp))
             .padding(horizontal = 12.dp, vertical = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(2.dp)
@@ -562,13 +614,21 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
                         if (invites.isNotEmpty()) {
                             Box(
                                 Modifier.align(Alignment.TopEnd)
-                                    .size(14.dp)
+                                    .size(16.dp)
                                     .background(PomboColors.Accent, CircleShape),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     if (invites.size > 9) "9+" else invites.size.toString(),
-                                    color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold
+                                    color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold,
+                                    lineHeight = 8.sp,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                    // Default line-height metrics push single-digit
+                                    // text a couple px low in a circle this tight —
+                                    // the classic Compose includeFontPadding offset.
+                                    style = androidx.compose.ui.text.TextStyle(
+                                        platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false)
+                                    )
                                 )
                             }
                         }
@@ -663,7 +723,11 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
                                         badge = "mesh", name = p.fileName,
                                         sub = com.pombo.android.ui.formatBytes(p.received) + " of " +
                                             com.pombo.android.ui.formatBytes(p.total) + if (speed.isEmpty()) "" else " · $speed",
-                                        onCancel = { vm.cancelTransfer(p.fileId) }
+                                        onCancel = { vm.cancelTransfer(p.fileId) },
+                                        paused = p.paused,
+                                        onPauseToggle = {
+                                            if (p.paused) vm.resumeTransfer(p.fileId) else vm.pauseTransfer(p.fileId)
+                                        }
                                     )
                                 }
                                 activeSeeds.forEach { seed ->
@@ -720,14 +784,7 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
             }
         }
 
-        Text(
-            "CHANNELS",
-            color = Color.White.copy(alpha = 0.30f),
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-            letterSpacing = 0.15.em,
-            modifier = Modifier.padding(start = 14.dp, top = 8.dp, bottom = 4.dp)
-        )
+        Spacer(Modifier.height(8.dp))
 
         // Filter tabs (All / Personal / Communities) — active gets an orange underline
         Box(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
@@ -868,7 +925,12 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
 
         if (!isGuest) {
             // Extra bottom room so the button clears the floating pill nav
-            // instead of sitting against it.
+            // instead of sitting against it. Independent of PILL_NAV_BOTTOM_OFFSET
+            // on purpose: the wrapper's own bottom padding (MainScreen) already
+            // reserves exactly enough to reach the pill's top edge regardless of
+            // that offset's value, so this is the ENTIRE gap between the two —
+            // tying it to the offset (as a 2026-08-21 edit briefly did) shrank it
+            // to the point the button sat flush against the pill.
             Box(
                 Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 28.dp),
                 contentAlignment = Alignment.Center
@@ -899,7 +961,9 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
  * One row of the Active Transfers list — shared by mesh and storage transfers.
  * The transport badge (MESH/STORAGE) distinguishes them, and storage rows prefix
  * their stats with the channel name (they survive channel switches). [onCancel]
- * null hides the cancel affordance (storage has no cancel API yet).
+ * null hides the cancel affordance (storage has no cancel API yet). [onPauseToggle]
+ * null hides the pause/resume affordance (only mesh downloads have it so far);
+ * [paused] picks which of the two icons shows.
  */
 @Composable
 private fun TransferRow(
@@ -908,7 +972,9 @@ private fun TransferRow(
     badge: String,
     name: String,
     sub: String,
-    onCancel: (() -> Unit)?
+    onCancel: (() -> Unit)?,
+    paused: Boolean = false,
+    onPauseToggle: (() -> Unit)? = null
 ) {
     Row(
         Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
@@ -925,8 +991,17 @@ private fun TransferRow(
                 )
             }
             Text(
-                sub, color = Color.White.copy(alpha = 0.40f), fontSize = 10.sp, maxLines = 1,
+                if (paused) "Paused · $sub" else sub,
+                color = Color.White.copy(alpha = 0.40f), fontSize = 10.sp, maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+        }
+        if (onPauseToggle != null) {
+            Icon(
+                if (paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                contentDescription = if (paused) "Resume" else "Pause",
+                tint = Color.White.copy(alpha = 0.45f),
+                modifier = Modifier.size(15.dp).clickableNoRipple { onPauseToggle() }
             )
         }
         if (onCancel != null) {
@@ -1138,8 +1213,9 @@ internal enum class SettingsPanel(val label: String, val icon: ImageVector, val 
     CONTENT("Content", Icons.Outlined.SmartDisplay, 0),
     PRIVACY("Privacy", Icons.Outlined.Shield, 1),
     SECURITY("Security", Icons.Outlined.Lock, 1),
-    DM_INBOX("DM Inbox", Icons.Outlined.MailOutline, 1),
-    ABOUT("About", Icons.Outlined.Info, 2)
+    DM_INBOX("DM Inbox", Icons.Outlined.MailOutline, 1)
+    // ABOUT moved to the Profile screen (2026-08-21) — see AboutPanel's call
+    // site in ProfileTab.
 }
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
@@ -1186,7 +1262,6 @@ private fun SettingsTab(vm: AppViewModel, pagerState: androidx.compose.foundatio
                     SettingsPanel.PRIVACY -> PrivacyPanel(vm)
                     SettingsPanel.API -> ApiPanel(vm)
                     SettingsPanel.CONTENT -> ContentPanel(vm)
-                    SettingsPanel.ABOUT -> AboutPanel()
                 }
             }
         }
@@ -2676,36 +2751,55 @@ private fun HoldToConfirmButton(label: String, onConfirm: () -> Unit) {
     }
 }
 
+/**
+ * Reached from a plain "About" button on Profile (2026-08-21), not an inline
+ * text block — the disclaimer is a legal notice, copied verbatim from the
+ * web's #settings-panel-about rather than paraphrased.
+ */
 @Composable
-private fun AboutPanel() {
-    // Web #settings-panel-about: one Disclaimer block, verbatim. The blurb we
-    // had here was ours, not the web's, and this text is a legal notice — it
-    // gets copied exactly rather than paraphrased.
-    SettingsSection {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-                Icons.Outlined.Info, contentDescription = null,
-                tint = Color.White.copy(alpha = 0.90f), modifier = Modifier.size(16.dp)
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                "Disclaimer",
-                color = Color.White.copy(alpha = 0.90f), fontSize = 14.sp,
-                fontWeight = FontWeight.Medium
-            )
+private fun AboutDialog(onDismiss: () -> Unit) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        // Same frame as AddContactDialog: a 1px hairline border and matching
+        // corner radius — the bare M3 surface is true black on true black and
+        // reads as text floating with no box around it at all.
+        modifier = Modifier.border(1.dp, PomboColors.Border, RoundedCornerShape(16.dp)),
+        shape = RoundedCornerShape(16.dp),
+        containerColor = PomboColors.Surface,
+        titleContentColor = PomboColors.Text,
+        textContentColor = PomboColors.Text,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Outlined.Info, contentDescription = null,
+                    tint = PomboColors.Text, modifier = Modifier.size(16.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Disclaimer", fontSize = 15.sp, fontWeight = FontWeight.Medium)
+            }
+        },
+        text = {
+            Column(Modifier.padding(top = 4.dp)) {
+                Text(
+                    "Pombo provides access to decentralized communication protocols. " +
+                        "You assume full legal responsibility for your actions within your " +
+                        "jurisdiction. We disclaim all liability and reserve the right to " +
+                        "restrict access to specific channels via this interface.",
+                    color = PomboColors.Text, fontSize = 14.sp, lineHeight = 22.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Justify
+                )
+                Spacer(Modifier.height(16.dp))
+                Text("pombo.cc", color = PomboColors.TextDim, fontSize = 13.sp)
+            }
+        },
+        // Web parity + AddContactDialog's own "Cancel": a neutral dismiss, not
+        // an accent call-to-action — About has nothing to confirm.
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) {
+                Text("Close", color = PomboColors.TextDim)
+            }
         }
-        Spacer(Modifier.height(12.dp))
-        Text(
-            "Pombo provides access to decentralized communication protocols. " +
-                "You assume full legal responsibility for your actions within your " +
-                "jurisdiction. We disclaim all liability and reserve the right to " +
-                "restrict access to specific channels via this interface.",
-            color = Color.White.copy(alpha = 0.90f), fontSize = 14.sp, lineHeight = 22.sp,
-            textAlign = androidx.compose.ui.text.style.TextAlign.Justify
-        )
-        Spacer(Modifier.height(16.dp))
-        Text("pombo.cc", color = Color.White.copy(alpha = 0.50f), fontSize = 13.sp)
-    }
+    )
 }
 
 /**
@@ -2740,6 +2834,60 @@ private fun SyncDevicesRow(vm: AppViewModel) {
             if (syncing) "Syncing your data" else "Sync Devices",
             color = Color.White.copy(alpha = 0.60f), fontSize = 13.sp
         )
+    }
+}
+
+/**
+ * Explore's picker (2026-08-21): same anatomy as [SettingsDropdown] — opens
+ * upward from the Explore pill item. Live Streams is a new channel type that
+ * does not exist yet, so it renders locked with a "Soon" badge and does
+ * nothing on tap, same behaviour the user asked for.
+ */
+@Composable
+private fun ExploreDropdown(onPickThreads: () -> Unit) {
+    Column(
+        Modifier
+            .padding(bottom = 6.dp)
+            .width(220.dp)
+            .background(Color(0xFF16161B).copy(alpha = 0.92f), RoundedCornerShape(16.dp))
+            .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(16.dp))
+            .padding(8.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth()
+                .background(Color.White.copy(alpha = 0.08f), RoundedCornerShape(8.dp))
+                .clickableNoRipple(onPickThreads)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Outlined.ChatBubbleOutline, contentDescription = null,
+                tint = Color.White.copy(alpha = 0.90f), modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Threads", color = Color.White.copy(alpha = 0.90f), fontSize = 13.sp)
+        }
+        Row(
+            Modifier.fillMaxWidth()
+                .padding(top = 2.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Filled.PlayArrow, contentDescription = null,
+                tint = Color.White.copy(alpha = 0.35f), modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Live Streams", color = Color.White.copy(alpha = 0.35f), fontSize = 13.sp, modifier = Modifier.weight(1f))
+            Text(
+                "SOON",
+                color = Color.White.copy(alpha = 0.40f), fontSize = 9.sp, fontWeight = FontWeight.SemiBold,
+                letterSpacing = 0.03.em,
+                modifier = Modifier
+                    .background(Color.White.copy(alpha = 0.08f), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 7.dp, vertical = 3.dp)
+            )
+        }
     }
 }
 
@@ -2824,9 +2972,7 @@ private fun ProfileTab(vm: AppViewModel, onAddAccount: () -> Unit) {
     val address by vm.address.collectAsState()
     val username by vm.username.collectAsState()
     val accounts by vm.accounts.collectAsState()
-    val hasDmInbox by vm.hasDmInbox.collectAsState()
     val isGuest by vm.isGuest.collectAsState()
-    LaunchedEffect(address) { vm.refreshDmInbox() }
 
     Column(Modifier.fillMaxSize().verticalScroll(androidx.compose.foundation.rememberScrollState()).padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         // Display precedence everywhere: ENS name → username → address.
@@ -2898,7 +3044,9 @@ private fun ProfileTab(vm: AppViewModel, onAddAccount: () -> Unit) {
                         )
                         Spacer(Modifier.width(10.dp))
                         Text(
-                            ensNames[acc.address.lowercase()] ?: shortAddr(acc.address),
+                            ensNames[acc.address.lowercase()]
+                                ?: vm.usernameFor(acc.address)
+                                ?: shortAddr(acc.address),
                             color = PomboColors.Text, fontSize = 13.sp, modifier = Modifier.weight(1f)
                         )
                         if (isCurrent) Text("current", color = PomboColors.Success, fontSize = 11.sp)
@@ -2914,24 +3062,6 @@ private fun ProfileTab(vm: AppViewModel, onAddAccount: () -> Unit) {
         ) {
             ProfileAction("Add account", onClick = onAddAccount)
             androidx.compose.material3.HorizontalDivider(color = PomboColors.Border)
-            // Only an offer while there is nothing to offer — the inbox is a
-            // one-time on-chain setup, so once it exists the row is noise (and
-            // tapping it would just pay gas to recreate what is already there).
-            var showDmSetup by remember { mutableStateOf(false) }
-            if (!hasDmInbox) {
-                ProfileAction("Set up DM inbox (enables receiving DMs)") { showDmSetup = true }
-                androidx.compose.material3.HorizontalDivider(color = PomboColors.Border)
-            }
-            if (showDmSetup) CreateDmInboxDialog(
-                vm,
-                onDismiss = { showDmSetup = false },
-                onCreate = { provider, custom, days -> vm.setupDmInbox(provider, custom, days) }
-            )
-            val syncing by vm.sync.syncing.collectAsState()
-            ProfileAction(if (syncing) "Syncing your data" else "Sync devices") {
-                if (!syncing) vm.syncNow()
-            }
-            androidx.compose.material3.HorizontalDivider(color = PomboColors.Border)
             // Leaves the account behind rather than erasing it: `disconnect()`
             // calls WalletStore.clear(), which drops the current account's key
             // for good. Destroying an account belongs in Settings → Security,
@@ -2939,6 +3069,21 @@ private fun ProfileTab(vm: AppViewModel, onAddAccount: () -> Unit) {
             // away in the profile menu.
             ProfileAction("Browse as guest") { vm.browseAsGuest() }
         }
+        // Moved out of Settings (2026-08-21 user call): About is app-level, not
+        // account-scoped, and this screen is what "the avatar" means on Android —
+        // Settings keeps it on the web only because a guest's route there is
+        // cheap and reworking the web dropdown for this was not worth it. A
+        // button behind its own dialog, not an inline text block on the main
+        // screen — the disclaimer is long enough to want its own space.
+        Spacer(Modifier.height(20.dp))
+        var showAbout by remember { mutableStateOf(false) }
+        Column(
+            Modifier.fillMaxWidth().background(PomboColors.Surface, RoundedCornerShape(12.dp))
+                .border(1.dp, PomboColors.Border, RoundedCornerShape(12.dp))
+        ) {
+            ProfileAction("About") { showAbout = true }
+        }
+        if (showAbout) AboutDialog(onDismiss = { showAbout = false })
     }
 }
 
@@ -2965,6 +3110,7 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
     // Preview sender labels resolve ENS at render (the name lands after the fetch).
     val ensNames by vm.ensNames.collectAsState()
     var query by remember { mutableStateOf("") }
+    var searchExpanded by remember { mutableStateOf(false) }
     var category by remember { mutableStateOf("All") }
     /** Web #explore-language-filter: "" is All Languages. */
     var language by remember { mutableStateOf("") }
@@ -2978,6 +3124,7 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
 
     val isGuest by vm.isGuest.collectAsState()
     val exploreImages by vm.channelImages.collectAsState()
+    val exploreImagesPending by vm.channelImagesPending.collectAsState()
     val nsfw by vm.nsfwEnabled.collectAsState()
     // Web rebuilds the template without the NSFW/Adult chips when the setting
     // turns off — an active selection of one of them resets with it.
@@ -3022,78 +3169,139 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
                 ) { Icon(Icons.Filled.Add, contentDescription = "Create channel", tint = Color.White, modifier = Modifier.size(16.dp)) }
             }
         }
-        Text(
-            "EXPLORE",
-            color = Color.White.copy(alpha = 0.30f), fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
-            letterSpacing = 0.15.em, modifier = Modifier.padding(start = 14.dp, top = 8.dp, bottom = 4.dp)
-        )
-        Column(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
-        // Search + language filter share one row, as in the web template.
-        // The input is `bg-white/5 border-white/10 pl-10 pr-4 py-2.5 rounded-xl
-        // text-sm` — about 40px tall. An OutlinedTextField forces a 56dp
-        // minimum, which is why this box towered over the web's.
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(
-                Modifier.weight(1f)
-                    .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp))
-                    .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(12.dp))
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    Icons.Outlined.Search, contentDescription = null,
-                    tint = Color.White.copy(alpha = 0.30f), modifier = Modifier.size(16.dp)
-                )
-                Spacer(Modifier.width(8.dp))
-                androidx.compose.foundation.text.BasicTextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    singleLine = true,
-                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = Color.White),
-                    cursorBrush = androidx.compose.ui.graphics.SolidColor(PomboColors.Accent),
-                    modifier = Modifier.weight(1f),
-                    decorationBox = { inner ->
-                        if (query.isEmpty()) Text(
-                            "Search channels...",
-                            color = Color.White.copy(alpha = 0.30f), fontSize = 14.sp
-                        )
-                        inner()
-                    }
-                )
+        // Only PomboHeader stays fixed — the section label, search, filters
+        // and chips now scroll away with the list as one continuous region
+        // (2026-08-20 user call: was a separate static block above the
+        // LazyColumn, unlike every other row here which already scrolled).
+        val shownExplore = items.filter { c ->
+            val matchesQuery = query.isBlank() ||
+                c.name.contains(query, true) || c.description.contains(query, true)
+            val matchesCategory = category == "All" || c.category.equals(categoryValue(category), true)
+            // Web `filterChannels` (N-D semantics): password channels live
+            // behind the Private chip — their access is a secret shared
+            // out-of-band; everything else, public AND gate-backed
+            // (gated/paid), is a storefront and lists in the main view.
+            val matchesType = if (privateOnly) c.type == "password" else c.type != "password"
+            // Access markers: Open = public; Gated vs Paid split by the gate
+            // MODE (unresolved counts as Gated until the cached read lands).
+            val matchesAccess = when (accessFilter) {
+                "open" -> c.type == "public"
+                "gated" -> c.type == "gated" && c.gateMode != 3
+                "paid" -> c.type == "gated" && c.gateMode == 3
+                else -> true
             }
-            ExploreLanguageFilter(language) { language = it }
+            // Web filterChannels: NSFW/Adult channels stay hidden unless that
+            // very category is selected or "Show Sensitive Content" is on.
+            val sensitive = c.category.equals("nsfw", true) || c.category.equals("adult", true)
+            val nsfwOk = nsfw || category == "NSFW" || category == "Adult" || !sensitive
+            // Web: the language filter only applies once a specific one is
+            // picked; "All Languages" is the empty value.
+            val matchesLanguage = language.isEmpty() || c.language.equals(language, true)
+            matchesQuery && (privateOnly || matchesCategory) && matchesType && matchesAccess && nsfwOk && matchesLanguage
         }
-        Spacer(Modifier.height(10.dp))
-
-        // Access-type markers (N-D): Open / Gated / Paid — exclusive
-        // toggles, none active shows every type. Gated vs Paid is the
-        // on-chain gate MODE, resolved per card by loadExplore's lazy pass.
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                start = 14.dp, end = 14.dp, bottom = PILL_NAV_BOTTOM_OFFSET + PILL_NAV_HEIGHT + 12.dp
+            )
         ) {
-            listOf("open" to "Open", "gated" to "Gated", "paid" to "Paid").forEachIndexed { i, (value, label) ->
-                if (i > 0) Text(
-                    "|", color = Color.White.copy(alpha = 0.15f), fontSize = 14.sp,
-                    modifier = Modifier.padding(horizontal = 4.dp)
-                )
-                val active = accessFilter == value
-                Text(
-                    label,
-                    color = if (active) Color.Black else Color.White.copy(alpha = 0.50f),
-                    fontSize = 14.sp,
-                    fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
-                    modifier = Modifier
-                        .background(if (active) Color.White else Color.Transparent, RoundedCornerShape(6.dp))
-                        .clickableNoRipple {
-                            accessFilter = if (active) "" else value
-                            // Password view and the markers are disjoint universes
-                            if (accessFilter.isNotEmpty()) privateOnly = false
-                        }
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                )
+        item {
+        Spacer(Modifier.height(8.dp))
+        // Access filters left, search + language icons right (2026-08-21
+        // user call, was bookended). Search collapses to an icon and expands
+        // into a field only when tapped; language drops the "All Languages"
+        // text label for an icon-only trigger. Expanded search takes the row
+        // on its own — filters + language move to a second row, same as the
+        // web.
+        val accessFilterPills: @Composable () -> Unit = {
+            // Access-type markers (N-D): Open / Gated / Paid — exclusive
+            // toggles, none active shows every type. Gated vs Paid is the
+            // on-chain gate MODE, resolved per card by loadExplore's lazy pass.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                listOf("open" to "Open", "gated" to "Gated", "paid" to "Paid").forEachIndexed { i, (value, label) ->
+                    if (i > 0) Text(
+                        "|", color = Color.White.copy(alpha = 0.15f), fontSize = 14.sp,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
+                    val active = accessFilter == value
+                    Text(
+                        label,
+                        color = if (active) Color.Black else Color.White.copy(alpha = 0.50f),
+                        fontSize = 14.sp,
+                        fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
+                        modifier = Modifier
+                            .background(if (active) Color.White else Color.Transparent, RoundedCornerShape(6.dp))
+                            .clickableNoRipple {
+                                accessFilter = if (active) "" else value
+                                // Password view and the markers are disjoint universes
+                                if (accessFilter.isNotEmpty()) privateOnly = false
+                            }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
             }
+        }
+
+        val searchFocusRequester = remember { FocusRequester() }
+        LaunchedEffect(searchExpanded) { if (searchExpanded) searchFocusRequester.requestFocus() }
+        // Search expands in place, between the pills and the language icon —
+        // it never pushes the pills to a second row (2026-08-21 user call).
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            accessFilterPills()
+            Spacer(Modifier.width(8.dp))
+            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                if (searchExpanded) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .background(Color.White.copy(alpha = 0.06f), RoundedCornerShape(11.dp))
+                            .border(1.dp, PomboColors.Accent.copy(alpha = 0.4f), RoundedCornerShape(11.dp))
+                            .padding(horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Outlined.Search, contentDescription = null,
+                            tint = PomboColors.Accent, modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        androidx.compose.foundation.text.BasicTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            singleLine = true,
+                            textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = Color.White),
+                            cursorBrush = androidx.compose.ui.graphics.SolidColor(PomboColors.Accent),
+                            modifier = Modifier.weight(1f).height(38.dp).focusRequester(searchFocusRequester)
+                                .wrapContentHeight(Alignment.CenterVertically),
+                            decorationBox = { inner ->
+                                if (query.isEmpty()) Text(
+                                    "Search",
+                                    color = Color.White.copy(alpha = 0.30f), fontSize = 14.sp
+                                )
+                                inner()
+                            }
+                        )
+                        Icon(
+                            Icons.Filled.Close, contentDescription = "Close search",
+                            tint = Color.White.copy(alpha = 0.40f),
+                            modifier = Modifier.size(16.dp).clickableNoRipple { searchExpanded = false; query = "" }
+                        )
+                    }
+                } else {
+                    Box(
+                        Modifier.size(38.dp)
+                            .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(11.dp))
+                            .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(11.dp))
+                            .clickableNoRipple { searchExpanded = true },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Outlined.Search, contentDescription = "Search channels",
+                            tint = Color.White.copy(alpha = 0.5f), modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            ExploreLanguageFilter(language) { language = it }
         }
         Spacer(Modifier.height(10.dp))
 
@@ -3127,78 +3335,50 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
             )
         }
         Spacer(Modifier.height(12.dp))
-
-        val shown = items.filter { c ->
-            val matchesQuery = query.isBlank() ||
-                c.name.contains(query, true) || c.description.contains(query, true)
-            val matchesCategory = category == "All" || c.category.equals(categoryValue(category), true)
-            // Web `filterChannels` (N-D semantics): password channels live
-            // behind the Private chip — their access is a secret shared
-            // out-of-band; everything else, public AND gate-backed
-            // (gated/paid), is a storefront and lists in the main view.
-            val matchesType = if (privateOnly) c.type == "password" else c.type != "password"
-            // Access markers: Open = public; Gated vs Paid split by the gate
-            // MODE (unresolved counts as Gated until the cached read lands).
-            val matchesAccess = when (accessFilter) {
-                "open" -> c.type == "public"
-                "gated" -> c.type == "gated" && c.gateMode != 3
-                "paid" -> c.type == "gated" && c.gateMode == 3
-                else -> true
-            }
-            // Web filterChannels: NSFW/Adult channels stay hidden unless that
-            // very category is selected or "Show Sensitive Content" is on.
-            val sensitive = c.category.equals("nsfw", true) || c.category.equals("adult", true)
-            val nsfwOk = nsfw || category == "NSFW" || category == "Adult" || !sensitive
-            // Web: the language filter only applies once a specific one is
-            // picked; "All Languages" is the empty value.
-            val matchesLanguage = language.isEmpty() || c.language.equals(language, true)
-            matchesQuery && (privateOnly || matchesCategory) && matchesType && matchesAccess && nsfwOk && matchesLanguage
-        }
+        } // end header item (label, search, access filters, category chips)
 
         when {
             // Web: spinner + "Loading channels..." while the list is empty.
-            loading && items.isEmpty() -> Column(
-                Modifier.weight(1f).fillMaxWidth().padding(vertical = 48.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                androidx.compose.material3.CircularProgressIndicator(
-                    color = Color.White.copy(alpha = 0.40f), strokeWidth = 2.dp,
-                    modifier = Modifier.size(28.dp)
-                )
-                Spacer(Modifier.height(12.dp))
-                Text("Loading channels...", color = Color.White.copy(alpha = 0.40f), fontSize = 14.sp)
+            loading && items.isEmpty() -> item {
+                Column(
+                    Modifier.fillMaxWidth().padding(vertical = 48.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    androidx.compose.material3.CircularProgressIndicator(
+                        color = Color.White.copy(alpha = 0.40f), strokeWidth = 2.dp,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Text("Loading channels...", color = Color.White.copy(alpha = 0.40f), fontSize = 14.sp)
+                }
             }
-            shown.isEmpty() -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text("No channels found", color = Color.White.copy(alpha = 0.40f), fontSize = 14.sp)
+            shownExplore.isEmpty() -> item {
+                Box(Modifier.fillMaxWidth().padding(vertical = 48.dp), contentAlignment = Alignment.Center) {
+                    Text("No channels found", color = Color.White.copy(alpha = 0.40f), fontSize = 14.sp)
+                }
             }
-            else -> LazyColumn(
-                Modifier.weight(1f).fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                // Clearance for the floating pill the list scrolls under.
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    bottom = 32.dp + PILL_NAV_HEIGHT + 12.dp
-                )
-            ) {
-                items(shown, key = { it.messageStreamId }) { ch ->
-                    // Web parity: an Explore tap previews the channel; joining
-                    // only happens through the Join button in the chat header.
-                    ExploreCard(
-                        ch,
-                        image = exploreImages[com.pombo.android.core.StreamConstants.deriveAdminId(ch.messageStreamId)],
-                        ensNames = ensNames
-                    ) {
-                        // Protected channels need the password before anything
-                        // can be decrypted, so ask up front (web JoinChannelUI).
-                        // Gated routes by mode: TOKEN/NFT holders get a real
-                        // preview (browse before committing); PAID and
-                        // non-holders go through the join flow (entry screen).
-                        when {
-                            ch.type == "password" -> passwordFor = ch
-                            ch.type == "gated" -> vm.openGatedExplore(ch)
-                            else -> vm.previewChannel(ch)
-                        }
+            else -> items(shownExplore, key = { it.messageStreamId }) { ch ->
+                // Web parity: an Explore tap previews the channel; joining
+                // only happens through the Join button in the chat header.
+                val adminStreamId = com.pombo.android.core.StreamConstants.deriveAdminId(ch.messageStreamId)
+                ExploreCard(
+                    ch,
+                    image = exploreImages[adminStreamId],
+                    imagePending = adminStreamId in exploreImagesPending,
+                    ensNames = ensNames
+                ) {
+                    // Protected channels need the password before anything
+                    // can be decrypted, so ask up front (web JoinChannelUI).
+                    // Gated routes by mode: TOKEN/NFT holders get a real
+                    // preview (browse before committing); PAID and
+                    // non-holders go through the join flow (entry screen).
+                    when {
+                        ch.type == "password" -> passwordFor = ch
+                        ch.type == "gated" -> vm.openGatedExplore(ch)
+                        else -> vm.previewChannel(ch)
                     }
                 }
+                Spacer(Modifier.height(10.dp))
             }
         }
         }
@@ -3217,6 +3397,15 @@ private fun ExploreTab(vm: AppViewModel, onCreate: () -> Unit, onConnect: () -> 
  */
 private val PILL_NAV_HEIGHT = 58.dp
 
+/**
+ * The pill's clearance from the (nav-bar-padded) bottom edge. Was 2rem,
+ * matching web's `#mobile-pill-nav { bottom: 2rem }`; brought down on both
+ * platforms per user call (2026-08-21) — still clear of the edge, just less
+ * floaty. Every "clear the pill" padding below derives from this so they
+ * cannot drift out of sync with the pill's actual position.
+ */
+private val PILL_NAV_BOTTOM_OFFSET = 20.dp
+
 private val EXPLORE_CATEGORIES = listOf(
     "All", "General", "News", "Crypto", "Finance", "Politics", "Science",
     "Gaming", "Sports", "Health", "Tech & AI", "Entertainment", "Education", "Comedy"
@@ -3229,8 +3418,10 @@ private fun categoryValue(label: String): String = when (label) {
 }
 
 /**
- * Web #explore-language-filter — a `<select>` styled like the search input.
- * Same option list and the same empty value for "All Languages".
+ * Web #explore-language-filter — icon-only trigger (2026-08-20/21 redesign,
+ * was a full "All Languages" text label + chevron). Same option list, same
+ * empty value for "All Languages", and a highlighted ring when a specific
+ * language is picked so the collapsed icon still signals an active filter.
  */
 @Composable
 private fun ExploreLanguageFilter(selected: String, onPick: (String) -> Unit) {
@@ -3244,23 +3435,19 @@ private fun ExploreLanguageFilter(selected: String, onPick: (String) -> Unit) {
         )
     }
     var open by remember { mutableStateOf(false) }
+    val active = selected.isNotEmpty()
     Box {
-        Row(
-            Modifier
-                .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp))
-                .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(12.dp))
-                .clickableNoRipple { open = true }
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically
+        Box(
+            Modifier.size(38.dp)
+                .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(11.dp))
+                .border(1.dp, if (active) PomboColors.Accent.copy(alpha = 0.5f) else Color.White.copy(alpha = 0.10f), RoundedCornerShape(11.dp))
+                .clickableNoRipple { open = true },
+            contentAlignment = Alignment.Center
         ) {
-            Text(
-                options.firstOrNull { it.first == selected }?.second ?: "All Languages",
-                color = Color.White.copy(alpha = 0.80f), fontSize = 14.sp, maxLines = 1
-            )
-            Spacer(Modifier.width(4.dp))
             Icon(
-                Icons.Filled.KeyboardArrowDown, contentDescription = null,
-                tint = Color.White.copy(alpha = 0.40f), modifier = Modifier.size(16.dp)
+                Icons.Outlined.Public, contentDescription = "Language filter",
+                tint = if (active) PomboColors.Accent else Color.White.copy(alpha = 0.5f),
+                modifier = Modifier.size(16.dp)
             )
         }
         androidx.compose.material3.DropdownMenu(
@@ -3297,6 +3484,8 @@ private val Number.exp get() = (toFloat() * EXPLORE_TEXT_SCALE).sp
 private fun ExploreCard(
     ch: com.pombo.android.ExploreChannel,
     image: ByteArray?,
+    /** True while this channel's image fetch is still in flight (web: _exploreResolvedImages). */
+    imagePending: Boolean = false,
     /** Resolved ENS names (address -> name) for the preview's sender label. */
     ensNames: Map<String, String> = emptyMap(),
     onOpen: () -> Unit
@@ -3313,8 +3502,12 @@ private fun ExploreCard(
     ) {
         Row(verticalAlignment = Alignment.Top) {
             // Channel thumb: `rounded-full`, 56×56, avatar fallback at 0.5.
-            if (image != null) {
-                androidx.compose.foundation.Image(
+            // Web parity: a spinner while the fetch is still in flight, the
+            // generated avatar only once it has genuinely come back empty —
+            // without the distinction this flashed straight to the fallback
+            // avatar and then swapped to the real image a moment later.
+            when {
+                image != null -> androidx.compose.foundation.Image(
                     bitmap = remember(image) {
                         android.graphics.BitmapFactory.decodeByteArray(image, 0, image.size).asImageBitmap()
                     },
@@ -3322,8 +3515,16 @@ private fun ExploreCard(
                     contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                     modifier = Modifier.size(56.dp).clip(CircleShape)
                 )
-            } else {
-                Avatar(ch.messageStreamId, size = 56.dp, cornerRadiusFraction = 0.5)
+                imagePending -> Box(
+                    Modifier.size(56.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.04f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    androidx.compose.material3.CircularProgressIndicator(
+                        color = Color.White.copy(alpha = 0.40f), strokeWidth = 2.dp,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                else -> Avatar(ch.messageStreamId, size = 56.dp, cornerRadiusFraction = 0.5)
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
@@ -3457,11 +3658,7 @@ private fun ContactsTab(vm: AppViewModel) {
                 contentAlignment = Alignment.Center
             ) { Icon(Icons.Filled.Add, contentDescription = "Add contact", tint = Color.White, modifier = Modifier.size(16.dp)) }
         }
-        Text(
-            "CONTACTS",
-            color = Color.White.copy(alpha = 0.30f), fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
-            letterSpacing = 0.15.em, modifier = Modifier.padding(start = 14.dp, top = 8.dp, bottom = 8.dp)
-        )
+        Spacer(Modifier.height(8.dp))
         Column(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
 
         if (contacts.isEmpty()) {

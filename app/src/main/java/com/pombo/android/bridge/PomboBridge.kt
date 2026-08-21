@@ -8,6 +8,7 @@ import android.util.Base64
 import android.util.Log
 import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -146,6 +147,26 @@ class PomboBridge(
                         } catch (e: Exception) { null }
                     }
                     return null
+                }
+
+                /**
+                 * Without overriding this, WebView's own crash handling aborts the
+                 * WHOLE APP the moment the renderer dies (crashpad: "Render
+                 * process crash wasn't handled by all associated webviews,
+                 * triggering application crash") — returning true here is what
+                 * stops that. reconnect() reloads the bridge fresh in the same
+                 * WebView instance; every pending bridge.call() unwinds via
+                 * failAllPending() exactly like an explicit reconnect() would, so
+                 * callers see a rejected call instead of a hang.
+                 */
+                override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                    Log.w(
+                        "PomboBridge",
+                        "WebView render process gone (crashed=${detail.didCrash()}, " +
+                            "priority=${detail.rendererPriorityAtExit()}) — reconnecting bridge"
+                    )
+                    reconnect()
+                    return true
                 }
             }
             // JS console -> logcat; without this, errors inside the WebView are
