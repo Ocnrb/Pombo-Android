@@ -127,7 +127,16 @@ class MediaController(
         val done: Boolean,
         val failure: String? = null,
         /** Network activity is stopped but the partial bytes are kept — see [pauseDownload]. */
-        val paused: Boolean = false
+        val paused: Boolean = false,
+        /** The channel this download belongs to — Active Transfers rows navigate here on tap. */
+        val messageStreamId: String = "",
+        /**
+         * True when [done] was reached by DOWNLOADING. [seedSentFile] publishes
+         * a synthetic done Progress so the sender's own bubble renders green —
+         * that one stays false, so the bubble's auto-save (receiver-side by
+         * design) can tell the two apart.
+         */
+        val downloaded: Boolean = false
     )
 
     // ==================== state ====================
@@ -324,20 +333,96 @@ class MediaController(
     }
 
     /**
-     * Stops serving a file and forgets it durably: registry entry and piece
-     * files go with it, so it does not come back on the next channel open.
-     * Returns the seed's stream and DM flag for the same reason as
-     * [cancelDownload].
+     * Stops SERVING a file — the bytes and the registry entry stay, marked
+     * inactive, so the Transfers list can offer a reseed without a
+     * re-download. Channel opens skip inactive entries (see [restoreSeedsFor]);
+     * only [deleteSeed] actually forgets the file. Returns the seed's stream
+     * and DM flag for the same reason as [cancelDownload].
      */
     fun stopSeeding(fileId: String): Pair<String, Boolean>? {
         val seed = seeding.remove(fileId) ?: return null
         seed.store.close()
+        registry.setActive(fileId, false)
+        _progress.value = _progress.value - fileId
+        emitSeeds()
+        Log.i(TAG, "stopped seeding $fileId (${seed.fileName}) — bytes kept")
+        return seed.messageStreamId to seed.isDm
+    }
+
+    /**
+     * Deletes a seed for good: registry entry and piece files go with it —
+     * what [stopSeeding] used to mean. Works on active and inactive seeds
+     * alike (an inactive one has no [seeding] entry, only the registry's).
+     */
+    fun deleteSeed(fileId: String): Pair<String, Boolean>? {
+        val seed = seeding.remove(fileId)
+        seed?.store?.close()
+        val entry = registry.get(fileId)
         registry.remove(fileId)
         PieceStore.delete(transferDir(), fileId)
         _progress.value = _progress.value - fileId
         emitSeeds()
-        Log.i(TAG, "stopped seeding $fileId (${seed.fileName})")
-        return seed.messageStreamId to seed.isDm
+        Log.i(TAG, "deleted seed $fileId")
+        val streamId = seed?.messageStreamId ?: entry?.messageStreamId ?: return null
+        return streamId to (seed?.isDm ?: entry?.isDm ?: false)
+    }
+
+    /**
+     * Files held complete on disk but not currently served: user-stopped
+     * seeds and seeds of channels not opened this session (restore only runs
+     * on channel open — the one moment the password is in hand).
+     */
+    fun inactiveSeeds(): List<SeedInfo> =
+        registry.all()
+            .filter { !seeding.containsKey(it.fileId) && !incoming.containsKey(it.fileId) }
+            .map { SeedInfo(it.fileId, it.fileName, it.fileSize, it.messageStreamId, it.isDm) }
+
+    /**
+     * Re-activates an inactive seed from the registry: verifies the bytes are
+     * still complete on disk, flips the entry back to active, brings the
+     * media partitions up and announces — the reverse of [stopSeeding], no
+     * re-download involved. False when the entry or its bytes are gone
+     * (the registry self-heals by dropping it).
+     */
+    suspend fun reseedRegistered(fileId: String, password: String?): Boolean {
+        if (seeding.containsKey(fileId) || incoming.containsKey(fileId)) return true
+        val entry = registry.get(fileId) ?: return false
+        val store = try {
+            PieceStore.open(transferDir(), fileId, entry.fileSize)
+        } catch (e: Exception) {
+            registry.remove(fileId)
+            return false
+        }
+        if (!store.isComplete()) {
+            store.close()
+            registry.remove(fileId)
+            return false
+        }
+        registry.setActive(fileId, true)
+        ensureMediaPartitions(entry.ephemeralStreamId, password)
+        if (entry.isDm) myDmEphemeralId()?.let { ensureMediaPartitions(it, null) }
+        seeding[fileId] = SeedFile(
+            fileId = entry.fileId,
+            messageStreamId = entry.messageStreamId,
+            ephemeralStreamId = entry.ephemeralStreamId,
+            isDm = entry.isDm,
+            password = password,
+            store = store,
+            pieceCount = entry.pieceCount,
+            fileName = entry.fileName
+        )
+        emitSeeds()
+        transport.publishMediaSignal(
+            entry.ephemeralStreamId,
+            JSONObject()
+                .put("type", MediaWire.SIGNAL_SOURCE_ANNOUNCE)
+                .put("fileId", entry.fileId)
+                .put("pieceCount", entry.pieceCount),
+            password,
+            entry.isDm
+        )
+        Log.i(TAG, "reseeding $fileId (${entry.fileName})")
+        return true
     }
 
     private fun recordUpload(fileId: String, requester: String?, bytes: Int) {
@@ -1005,6 +1090,9 @@ class MediaController(
         }
         for (entry in registry.entriesFor(messageStreamId)) {
             if (seeding.containsKey(entry.fileId) || incoming.containsKey(entry.fileId)) continue
+            // A user-stopped seed stays stopped across channel opens — only
+            // an explicit reseed (Transfers list) flips it back.
+            if (!entry.active) continue
             try {
                 val store = PieceStore.open(transferDir(), entry.fileId, entry.fileSize)
                 if (!store.isComplete()) {
@@ -1101,7 +1189,9 @@ class MediaController(
                 seeders = transfer.seeders.size,
                 done = done,
                 failure = transfer.failed,
-                paused = transfer.paused
+                paused = transfer.paused,
+                messageStreamId = transfer.messageStreamId,
+                downloaded = true
             )
         )
     }

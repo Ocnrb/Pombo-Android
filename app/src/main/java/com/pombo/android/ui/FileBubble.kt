@@ -168,9 +168,14 @@ fun FileBubbleContent(
     val pct = if (downloading && progress != null && progress.total > 0)
         (progress.received.toFloat() / progress.total).coerceIn(0f, 1f) else 0f
 
-    // Saving is automatic once the bytes are here.
-    LaunchedEffect(localFile, saved) {
-        if (localFile && !saved) transfers?.onSave(file.fileId, file.fileName)
+    // Saving is automatic once a DOWNLOAD completes — gated on
+    // Progress.downloaded, not done alone: seedSentFile publishes a synthetic
+    // done Progress so the SENDER's bubble renders green, and auto-saving off
+    // that would drop unrequested copies into the sender's Downloads. The web
+    // has the same boundary for free — its auto-save runs in onFileComplete.
+    val downloadDone = progress?.done == true && progress.downloaded
+    LaunchedEffect(downloadDone, saved) {
+        if (downloadDone && !saved) transfers?.onSave(file.fileId, file.fileName)
     }
 
     val totalSize = formatBytes(file.fileSize)
@@ -254,7 +259,11 @@ fun StorageFileBubbleContent(
 
     val uploading = up != null && up.stage != "done" && up.error == null
     val downloading = dl?.status == "downloading"
-    val active = uploading || downloading
+    // Paused shows as a halted transfer (static bar + "Paused" line), NOT as
+    // idle: the default state would invite a fresh download tap while the
+    // engine still holds the partial. Controls stay in the Transfers list.
+    val pausedDl = dl?.status == "paused"
+    val active = uploading || downloading || pausedDl
     val ready = completed
     val totalSize = formatBytes(file.originalSize)
 
@@ -271,13 +280,17 @@ fun StorageFileBubbleContent(
         dlErr != null -> dlErr to ""
         uploading && up != null -> storageUploadDetail(up)
         downloading && dl != null -> storageDownloadDetail(dl)
+        pausedDl && dl != null -> {
+            val transferred = if (dl.total > 0) formatBytes(dl.received.toLong() * dl.fileSize / dl.total) else "0 B"
+            "Paused · ${dl.percent}% · $transferred of ${formatBytes(dl.fileSize)}" to ""
+        }
         else -> totalSize to ""
     }
     val isError = upErr != null || dlErr != null
 
     val pct = when {
         uploading && up != null && up.percent in 0..100 -> up.percent / 100f
-        downloading && dl != null && dl.total > 0 -> (dl.received.toFloat() / dl.total).coerceIn(0f, 1f)
+        (downloading || pausedDl) && dl != null && dl.total > 0 -> (dl.received.toFloat() / dl.total).coerceIn(0f, 1f)
         else -> 0f
     }
 
@@ -286,7 +299,7 @@ fun StorageFileBubbleContent(
         saved -> ({ FileCardAction(Icons.Filled.Check, GREEN.copy(alpha = 0.7f), 0.06f, null) })
         ready -> ({ FileCardAction(Icons.Filled.Save, GREEN.copy(alpha = 0.7f), 0.06f) { transfers?.onSave(file.transferId, file.fileName) } })
         uploading -> ({ FileCardAction(Icons.Filled.ArrowUpward, Color.White.copy(alpha = 0.25f), 0.04f, null) })
-        downloading -> ({ FileCardAction(Icons.Filled.ArrowDownward, Color.White.copy(alpha = 0.25f), 0.04f, null) })
+        downloading || pausedDl -> ({ FileCardAction(Icons.Filled.ArrowDownward, Color.White.copy(alpha = 0.25f), 0.04f, null) })
         !mine -> ({ FileCardAction(Icons.Filled.ArrowDownward, Color.White.copy(alpha = 0.6f), 0.06f) { transfers?.onDownload(messageId) } })
         else -> null
     }

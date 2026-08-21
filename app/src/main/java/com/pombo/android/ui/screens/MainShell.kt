@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.MailOutline
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.rotate
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Campaign
@@ -598,12 +599,16 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
                     // web an invite only ever exists as a transient toast; here
                     // unanswered ones stay reachable until accepted/dismissed.
                     val invites by vm.pendingInvites.collectAsState()
+                    val dismissedInvites by vm.dismissedInvites.collectAsState()
                     var invitesOpen by remember { mutableStateOf(false) }
+                    // false = pending only (default on every open); true appends
+                    // dismissed invites, dimmed, with Accept still available.
+                    var showAllInvites by remember { mutableStateOf(false) }
                     Box {
                         Box(
                             Modifier.size(32.dp)
                                 .background(Color.White.copy(alpha = 0.08f), CircleShape)
-                                .clickableNoRipple { invitesOpen = true },
+                                .clickableNoRipple { showAllInvites = false; invitesOpen = true },
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
@@ -635,52 +640,73 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
                         androidx.compose.material3.DropdownMenu(
                             expanded = invitesOpen,
                             onDismissRequest = { invitesOpen = false },
-                            modifier = Modifier
-                                .background(Color(0xFF16161B), RoundedCornerShape(12.dp))
-                                .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(12.dp))
-                                .widthIn(min = 230.dp, max = 300.dp)
+                            // End-aligned to the bell, the right edge stops 40dp
+                            // short of the screen's (8dp spacer + 32dp join
+                            // button) — at this width that reads as floating
+                            // mid-screen. The offset walks it to the margin.
+                            offset = androidx.compose.ui.unit.DpOffset(40.dp, 0.dp),
+                            // Shape/color/border belong on the menu's own surface:
+                            // a rounded background on the content leaves the
+                            // surface's square corners showing behind it.
+                            shape = RoundedCornerShape(12.dp),
+                            containerColor = Color(0xFF16161B),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.10f)),
+                            // FIXED width: transfer stats redraw every second and a
+                            // wrap-content menu visibly breathes with each repaint.
+                            modifier = Modifier.width(320.dp)
                         ) {
-                            Text(
-                                "CHANNEL INVITES",
-                                color = Color.White.copy(alpha = 0.35f),
-                                fontSize = 10.sp, fontWeight = FontWeight.SemiBold,
-                                letterSpacing = 0.1.em,
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
-                            )
-                            if (invites.isEmpty()) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Text(
-                                    "No pending invites",
+                                    "CHANNEL INVITES",
+                                    color = Color.White.copy(alpha = 0.35f),
+                                    fontSize = 10.sp, fontWeight = FontWeight.SemiBold,
+                                    letterSpacing = 0.1.em,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    "Pending",
+                                    color = Color.White.copy(alpha = if (showAllInvites) 0.30f else 0.70f),
+                                    fontSize = 10.sp, fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.clickableNoRipple { showAllInvites = false }
+                                )
+                                Text("·", color = Color.White.copy(alpha = 0.20f), fontSize = 10.sp, modifier = Modifier.padding(horizontal = 5.dp))
+                                Text(
+                                    "All",
+                                    color = Color.White.copy(alpha = if (showAllInvites) 0.70f else 0.30f),
+                                    fontSize = 10.sp, fontWeight = FontWeight.Medium,
+                                    // The deep replay backfills historical invites
+                                    // (once per session) the moment the view can
+                                    // actually show them.
+                                    modifier = Modifier.clickableNoRipple { showAllInvites = true; vm.fetchAllInvites() }
+                                )
+                            }
+                            val visibleDismissed = if (showAllInvites) dismissedInvites else emptyList()
+                            if (invites.isEmpty() && visibleDismissed.isEmpty()) {
+                                Text(
+                                    if (showAllInvites) "No invites" else "No pending invites",
                                     color = Color.White.copy(alpha = 0.40f), fontSize = 13.sp,
                                     modifier = Modifier.padding(horizontal = 14.dp)
                                         .padding(bottom = 12.dp)
                                 )
-                            } else invites.asReversed().forEach { invite ->
-                                Column(Modifier.padding(horizontal = 14.dp, vertical = 6.dp)) {
-                                    Text(
-                                        invite.name, color = PomboColors.Text,
-                                        fontSize = 13.sp, fontWeight = FontWeight.Medium
+                            } else {
+                                invites.asReversed().forEach { invite ->
+                                    InviteRow(
+                                        invite = invite, dimmed = false,
+                                        onAccept = { invitesOpen = false; vm.acceptInvite(invite) },
+                                        onDismiss = { vm.dismissInvite(invite.inviteId) }
                                     )
-                                    Text(
-                                        "From: ${invite.from.take(6)}…${invite.from.takeLast(4)}",
-                                        color = Color.White.copy(alpha = 0.40f), fontSize = 11.sp
+                                }
+                                // Dismissed rows: dimmed, Accept only — the "All"
+                                // view exists to recover a mis-tapped dismiss.
+                                visibleDismissed.forEach { invite ->
+                                    InviteRow(
+                                        invite = invite, dimmed = true,
+                                        onAccept = { invitesOpen = false; vm.acceptInvite(invite) },
+                                        onDismiss = null
                                     )
-                                    Spacer(Modifier.height(6.dp))
-                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Box(
-                                            Modifier.background(Color.White.copy(alpha = 0.90f), RoundedCornerShape(6.dp))
-                                                .clickableNoRipple { invitesOpen = false; vm.acceptInvite(invite) }
-                                                .padding(horizontal = 12.dp, vertical = 4.dp)
-                                        ) {
-                                            Text("Accept", color = Color(0xFF0A0A0A), fontSize = 11.sp, fontWeight = FontWeight.Medium)
-                                        }
-                                        Box(
-                                            Modifier.background(Color.White.copy(alpha = 0.10f), RoundedCornerShape(6.dp))
-                                                .clickableNoRipple { vm.dismissInvite(invite.inviteId) }
-                                                .padding(horizontal = 12.dp, vertical = 4.dp)
-                                        ) {
-                                            Text("Dismiss", color = Color.White.copy(alpha = 0.70f), fontSize = 11.sp, fontWeight = FontWeight.Medium)
-                                        }
-                                    }
                                 }
                             }
 
@@ -691,23 +717,45 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
                             val activeSeeds by vm.activeSeeds.collectAsState()
                             val storageUploads by vm.storageUploads.collectAsState()
                             val storageDownloads by vm.storageDownloads.collectAsState()
+                            val storagePhases by vm.storageTransferPhases.collectAsState()
                             val activeDownloads = transferProgress.values
                                 .filter { !it.done && it.failure == null }
                             val activeStorageUp = storageUploads.values.filter { it.stage != "done" && it.error == null }
-                            val activeStorageDown = storageDownloads.values.filter { it.status == "downloading" }
+                            val activeStorageDown = storageDownloads.values.filter { it.status == "downloading" || it.status == "paused" }
                             androidx.compose.material3.HorizontalDivider(
                                 color = Color.White.copy(alpha = 0.08f),
                                 modifier = Modifier.padding(vertical = 4.dp)
                             )
-                            Text(
-                                "ACTIVE TRANSFERS",
-                                color = Color.White.copy(alpha = 0.35f),
-                                fontSize = 10.sp, fontWeight = FontWeight.SemiBold,
-                                letterSpacing = 0.1.em,
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
-                            )
+                            // Inactive = complete on disk but not served (user-stopped,
+                            // or the channel was not opened this session). Recomputed
+                            // off activeSeeds plus a manual bump: deleting an INACTIVE
+                            // seed touches no StateFlow, so nothing else would refresh.
+                            var showInactiveSeeds by remember { mutableStateOf(false) }
+                            var inactiveRefresh by remember { mutableStateOf(0) }
+                            val inactiveSeeds = remember(showInactiveSeeds, activeSeeds, inactiveRefresh) {
+                                if (showInactiveSeeds) vm.inactiveSeeds() else emptyList()
+                            }
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "TRANSFERS",
+                                    color = Color.White.copy(alpha = 0.35f),
+                                    fontSize = 10.sp, fontWeight = FontWeight.SemiBold,
+                                    letterSpacing = 0.1.em,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    if (showInactiveSeeds) "Hide inactive" else "Show inactive",
+                                    color = Color.White.copy(alpha = if (showInactiveSeeds) 0.70f else 0.30f),
+                                    fontSize = 10.sp, fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.clickableNoRipple { showInactiveSeeds = !showInactiveSeeds }
+                                )
+                            }
                             if (activeDownloads.isEmpty() && activeSeeds.isEmpty() &&
-                                activeStorageUp.isEmpty() && activeStorageDown.isEmpty()
+                                activeStorageUp.isEmpty() && activeStorageDown.isEmpty() &&
+                                inactiveSeeds.isEmpty()
                             ) {
                                 Text(
                                     "No active transfers",
@@ -721,13 +769,18 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
                                     TransferRow(
                                         icon = Icons.Filled.ArrowDownward, iconTint = PomboColors.Accent,
                                         badge = "mesh", name = p.fileName,
-                                        sub = com.pombo.android.ui.formatBytes(p.received) + " of " +
-                                            com.pombo.android.ui.formatBytes(p.total) + if (speed.isEmpty()) "" else " · $speed",
+                                        // Mesh pause is synchronous (timers cleared on the spot),
+                                        // so "Paused" is confirmed the moment the flag flips — no
+                                        // pausing/resuming gap to name, unlike the storage rows.
+                                        sub = (if (p.paused) "Paused · " else "") +
+                                            com.pombo.android.ui.formatBytes(p.received) + " of " +
+                                            com.pombo.android.ui.formatBytes(p.total) + if (speed.isEmpty() || p.paused) "" else " · $speed",
                                         onCancel = { vm.cancelTransfer(p.fileId) },
                                         paused = p.paused,
                                         onPauseToggle = {
                                             if (p.paused) vm.resumeTransfer(p.fileId) else vm.pauseTransfer(p.fileId)
-                                        }
+                                        },
+                                        onRowClick = { vm.openChannel(p.messageStreamId) }
                                     )
                                 }
                                 activeSeeds.forEach { seed ->
@@ -739,7 +792,8 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
                                         sub = com.pombo.android.ui.formatBytes(seed.fileSize) +
                                             (if (rate.isEmpty()) "" else " · ↑ $rate") +
                                             (if (up != null && up.leechers > 0) " · ${up.leechers} peer${if (up.leechers == 1) "" else "s"}" else ""),
-                                        onCancel = { vm.stopSeeding(seed.fileId) }
+                                        onCancel = { vm.stopSeeding(seed.fileId) },
+                                        onRowClick = { vm.openChannel(seed.messageStreamId) }
                                     )
                                 }
                                 // Storage-node transfers — survive a channel switch, so they carry
@@ -754,20 +808,60 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
                                         icon = Icons.Filled.ArrowUpward, iconTint = Color(0xFF8B5CF6),
                                         badge = "storage", name = info?.fileName ?: u.transferId.take(8),
                                         sub = (info?.channelName?.let { "$it · " } ?: "") + stats,
-                                        onCancel = null
+                                        onCancel = null,
+                                        onRowClick = info?.messageStreamId?.let { streamId -> { vm.openChannel(streamId) } }
                                     )
                                 }
                                 activeStorageDown.forEach { d ->
                                     val info = vm.storageTransferInfo(d.transferId)
+                                    // The tap-to-confirmation gap (cancellation is cooperative):
+                                    // "pausing" until the engine's status flips to paused,
+                                    // "resuming" until it flips back to downloading. The icon
+                                    // tracks the REQUEST, the text names the gap.
+                                    val transferPhase = storagePhases[d.transferId]
+                                    val pausing = transferPhase == "pausing" && d.status == "downloading"
+                                    val resuming = transferPhase == "resuming" && d.status != "downloading"
+                                    val paused = pausing || (d.status == "paused" && !resuming)
                                     val transferred = if (d.total > 0)
                                         com.pombo.android.ui.formatBytes(d.received.toLong() * d.fileSize / d.total) else "0 B"
                                     val sp = com.pombo.android.ui.formatSpeed(d.bytesPerSec)
-                                    val stats = d.phase ?: ("${d.percent}% · $transferred" + if (sp.isEmpty()) "" else " · $sp")
+                                    val base = "${d.percent}% · $transferred"
+                                    val stats = d.phase ?: when {
+                                        pausing -> "$base · Pausing…"
+                                        resuming -> "$base · Resuming…"
+                                        d.status == "paused" -> "Paused · $base"
+                                        else -> base + if (sp.isEmpty()) "" else " · $sp"
+                                    }
                                     TransferRow(
                                         icon = Icons.Filled.ArrowDownward, iconTint = Color(0xFF8B5CF6),
                                         badge = "storage", name = info?.fileName ?: d.transferId.take(8),
                                         sub = (info?.channelName?.let { "$it · " } ?: "") + stats,
-                                        onCancel = null
+                                        onCancel = { vm.cancelStorageTransfer(d.transferId) },
+                                        paused = paused,
+                                        onPauseToggle = {
+                                            if (paused) vm.resumeStorageTransfer(d.transferId) else vm.pauseStorageTransfer(d.transferId)
+                                        },
+                                        onRowClick = info?.messageStreamId?.let { streamId -> { vm.openChannel(streamId) } }
+                                    )
+                                }
+                                // Inactive seeds: play = reseed (needs the channel's
+                                // password, so only offered while still a member),
+                                // X = delete for good.
+                                inactiveSeeds.forEach { seed ->
+                                    val member = channels.any { it.messageStreamId == seed.messageStreamId }
+                                    TransferRow(
+                                        icon = Icons.Filled.ArrowUpward, iconTint = Color.White.copy(alpha = 0.30f),
+                                        badge = "mesh", name = seed.fileName.ifEmpty { seed.fileId.take(8) },
+                                        sub = com.pombo.android.ui.formatBytes(seed.fileSize) + " · Inactive",
+                                        onCancel = { vm.deleteSeed(seed.fileId); inactiveRefresh++ },
+                                        paused = true,
+                                        onPauseToggle = if (member) {
+                                            { vm.reseedFile(seed.fileId, seed.messageStreamId); inactiveRefresh++ }
+                                        } else null,
+                                        onRowClick = if (member) {
+                                            { vm.openChannel(seed.messageStreamId) }
+                                        } else null,
+                                        dimmed = true
                                     )
                                 }
                                 Spacer(Modifier.height(8.dp))
@@ -958,12 +1052,64 @@ private fun ChatsTab(vm: AppViewModel, onCreate: () -> Unit, onJoin: () -> Unit,
 }
 
 /**
+ * One row of the bell's Channel Invites list. [dimmed] renders the dismissed
+ * variant of the "All" view; [onDismiss] null hides the Dismiss button (a
+ * dismissed invite can only be accepted or left alone).
+ */
+@Composable
+private fun InviteRow(
+    invite: com.pombo.android.ChannelManager.PendingInvite,
+    dimmed: Boolean,
+    onAccept: () -> Unit,
+    onDismiss: (() -> Unit)?
+) {
+    Column(
+        Modifier
+            .alpha(if (dimmed) 0.5f else 1f)
+            .padding(horizontal = 14.dp, vertical = 6.dp)
+    ) {
+        Text(
+            invite.name, color = PomboColors.Text,
+            fontSize = 13.sp, fontWeight = FontWeight.Medium
+        )
+        Text(
+            "From: ${invite.from.take(6)}…${invite.from.takeLast(4)}",
+            color = Color.White.copy(alpha = 0.40f), fontSize = 11.sp
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Box(
+                Modifier.background(Color.White.copy(alpha = 0.90f), RoundedCornerShape(6.dp))
+                    .clickableNoRipple(onAccept)
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+            ) {
+                Text("Accept", color = Color(0xFF0A0A0A), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+            }
+            if (onDismiss != null) {
+                Box(
+                    Modifier.background(Color.White.copy(alpha = 0.10f), RoundedCornerShape(6.dp))
+                        .clickableNoRipple(onDismiss)
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                ) {
+                    Text("Dismiss", color = Color.White.copy(alpha = 0.70f), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                }
+            }
+        }
+    }
+}
+
+/**
  * One row of the Active Transfers list — shared by mesh and storage transfers.
  * The transport badge (MESH/STORAGE) distinguishes them, and storage rows prefix
  * their stats with the channel name (they survive channel switches). [onCancel]
- * null hides the cancel affordance (storage has no cancel API yet). [onPauseToggle]
- * null hides the pause/resume affordance (only mesh downloads have it so far);
- * [paused] picks which of the two icons shows.
+ * null hides the cancel affordance (storage uploads have no cancel — the
+ * chunks already published cannot be unpublished). [onPauseToggle]
+ * null hides the pause/resume affordance; [paused] picks which of the two icons
+ * shows — status text ("Paused"/"Pausing…"/…) is the caller's to put in [sub],
+ * since only the caller knows the request-vs-confirmed gap (storage rows).
+ * [onRowClick], when given, opens
+ * the transfer's channel — the action icons have their own clickable modifiers
+ * so a tap on Pause/Cancel does not also fire the row's navigation.
  */
 @Composable
 private fun TransferRow(
@@ -974,10 +1120,15 @@ private fun TransferRow(
     sub: String,
     onCancel: (() -> Unit)?,
     paused: Boolean = false,
-    onPauseToggle: (() -> Unit)? = null
+    onPauseToggle: (() -> Unit)? = null,
+    onRowClick: (() -> Unit)? = null,
+    dimmed: Boolean = false
 ) {
     Row(
-        Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+        Modifier
+            .alpha(if (dimmed) 0.5f else 1f)
+            .then(if (onRowClick != null) Modifier.clickableNoRipple(onRowClick) else Modifier)
+            .padding(horizontal = 14.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
@@ -991,8 +1142,7 @@ private fun TransferRow(
                 )
             }
             Text(
-                if (paused) "Paused · $sub" else sub,
-                color = Color.White.copy(alpha = 0.40f), fontSize = 10.sp, maxLines = 1,
+                sub, color = Color.White.copy(alpha = 0.40f), fontSize = 10.sp, maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
             )
         }

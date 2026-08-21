@@ -174,7 +174,7 @@ class StorageMedia(
     /** Receiver-bubble download snapshot. */
     data class DownloadProgress(
         val transferId: String,
-        val status: String,          // downloading | complete | error
+        val status: String,          // downloading | complete | error | paused
         val percent: Int,
         val received: Int,
         val total: Int,
@@ -195,6 +195,18 @@ class StorageMedia(
     /** transferId -> completed file on disk (staged bytes or inflated output), for saving. */
     private val completed = ConcurrentHashMap<String, File>()
     fun completedFile(transferId: String): File? = completed[transferId]
+
+    /**
+     * Forgets a download's partial state for good: staged bytes and progress
+     * entry both go. The cancel counterpart of the pause path (whose
+     * CancellationException branch deliberately KEEPS the staging) — the
+     * caller cancels the Job first and calls this after it unwinds.
+     */
+    fun discardDownload(transferId: String) {
+        StorageStagingStore.delete(transferDir(), transferId)
+        _downloads.update { it - transferId }
+        Log.i(TAG, "storage download discarded: $transferId")
+    }
     fun isDownloading(transferId: String): Boolean = _downloads.value[transferId]?.status == "downloading"
 
     /**
@@ -1011,7 +1023,14 @@ class StorageMedia(
 
         // Row handler: synchronous (writeChunk + StateFlow update are non-suspend),
         // so it doubles as read-side backpressure — the HTTP parser blocks on it.
+        val downloadJob = kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]
         val onRow: (StorageHttp.Row) -> Unit = onRow@{ row ->
+            // The reads are blocking HTTP with no suspension points, so a
+            // cancelled Job (pause/cancel) needs a synchronous escape hatch —
+            // this throw aborts the window mid-read instead of draining it.
+            if (downloadJob?.isActive == false) {
+                throw kotlinx.coroutines.CancellationException("storage download cancelled")
+            }
             val c = row.content ?: return@onRow
             val opened = try { opener(c, row.timestamp) } catch (e: Exception) { return@onRow }   // warm-up ping / foreign / tampered / key not held yet
             val u = StorageWire.unpackChunkPayload(opened) ?: return@onRow
@@ -1089,6 +1108,16 @@ class StorageMedia(
                 staging.close()
                 Log.w(TAG, "Incomplete storage download: ${staging.completedChunks()}/$total preserved on disk")
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // pauseStorageTransfer() cancelling this Job lands here too — not a
+            // failure, so the staging stays on disk (same as the "incomplete"
+            // branch above) and the status reflects a deliberate pause rather
+            // than an error.
+            status = "paused"
+            val done = staging.completedChunks()
+            _downloads.update { it + (tid to DownloadProgress(tid, status, if (total > 0) done * 100 / total else 0, done, total, bytesReceived, meta.originalSize, null, null)) }
+            runCatching { staging.close() }
+            throw e
         } catch (e: Exception) {
             status = "error"
             _downloads.update { it + (tid to DownloadProgress(tid, status, 0, staging.completedChunks(), total, bytesReceived, meta.originalSize, null, null, e.message)) }
@@ -1134,7 +1163,13 @@ class StorageMedia(
         coroutineScope {
             repeat(min(StorageMediaConfig.DOWNLOAD_CONCURRENCY, windows.size)) {
                 launch(Dispatchers.IO) {
-                    while (true) {
+                    // isActive, not `true`: the reads below are BLOCKING HTTP —
+                    // no suspension points — so a cancelled Job (pause/cancel)
+                    // would otherwise grind through every remaining window
+                    // before the cancellation could take effect. The row
+                    // handler in downloadFile aborts mid-window for the same
+                    // reason; this check catches the between-windows gap.
+                    while (isActive) {
                         val idx = next.getAndIncrement()
                         if (idx >= windows.size) break
                         val w = windows[idx]
@@ -1142,6 +1177,10 @@ class StorageMedia(
                         try {
                             StorageHttp.directFetchRange(base, sid, w.partition, w.from, w.to, onRow)
                             endpoints.noteSuccess(base)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            // Not an endpoint failure — the read was aborted
+                            // on purpose (see downloadFile's row handler).
+                            throw e
                         } catch (e: Exception) {
                             endpoints.noteFailure(base)
                             Log.w(TAG, "storage download window P${w.partition} @ $base failed: ${e.message}")

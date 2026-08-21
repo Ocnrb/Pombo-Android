@@ -681,10 +681,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
             manager.openChannel(channel.messageStreamId)
             autoEnableChannelPush(channel)
         }
-        manager.dismissInvite(invite.inviteId)
+        // Resolved, not dismissed — dismissInvite would file it into the
+        // retained "All" list as if the user had swiped it away.
+        manager.resolveInvite(invite.inviteId)
     }
 
     fun dismissInvite(inviteId: String) = manager.dismissInvite(inviteId)
+
+    /** Dismissed invites retained for the bell's "All" view. */
+    val dismissedInvites: StateFlow<List<ChannelManager.PendingInvite>> = manager.dismissedInvites
+
+    /** Deep P3 replay backing the "All" view — once per session, see [ChannelManager.fetchAllInvites]. */
+    fun fetchAllInvites() = manager.fetchAllInvites()
 
     /**
      * An invite link opened from outside the app (deep link). Parsed here so a
@@ -1445,6 +1453,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
         manager.downloadStorageFile(messageId)
     }
 
+    /** Pauses a running storage download from the Active Transfers list — keeps its bytes. */
+    fun pauseStorageTransfer(transferId: String) = manager.pauseStorageTransfer(transferId)
+
+    /** Cancels a storage download — partial bytes deleted, unlike pause. */
+    fun cancelStorageTransfer(transferId: String) = manager.cancelStorageTransfer(transferId)
+
+    /** Resumes a storage download [pauseStorageTransfer] stopped. */
+    fun resumeStorageTransfer(transferId: String) {
+        ensureTransferService()
+        manager.resumeStorageTransfer(transferId)
+    }
+
+    /** transferId -> "pausing"/"resuming" — see [ChannelManager.storageTransferPhase]. */
+    val storageTransferPhases: StateFlow<Map<String, String>> = manager.storageTransferPhase
+
     /** Copies a completed storage download into the public Downloads collection (see [saveFile]). */
     fun saveStorageFile(transferId: String, fileName: String) {
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -1488,6 +1511,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app), PomboBridge.Listen
     fun pauseTransfer(fileId: String) = manager.pauseTransfer(fileId)
     fun resumeTransfer(fileId: String) = manager.resumeTransfer(fileId)
     fun stopSeeding(fileId: String) = manager.stopSeeding(fileId)
+    fun deleteSeed(fileId: String) = manager.deleteSeed(fileId)
+    fun reseedFile(fileId: String, messageStreamId: String) = manager.reseedFile(fileId, messageStreamId)
+    fun inactiveSeeds() = manager.inactiveSeeds()
 
     /** Starts fetching the file announced by [messageId] in the open channel. */
     fun downloadFile(messageId: String) {

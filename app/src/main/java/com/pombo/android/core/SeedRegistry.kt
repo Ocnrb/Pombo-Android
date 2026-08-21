@@ -28,7 +28,13 @@ class SeedRegistry(private val dir: () -> File) {
         val pieceCount: Int,
         val fileSize: Long,
         val fileName: String,
-        val completedAt: Long
+        val completedAt: Long,
+        /**
+         * False when the user pressed "stop seeding": the bytes stay on disk
+         * (delete is a separate, explicit action) but channel opens must not
+         * re-serve the file — only an explicit reseed flips this back.
+         */
+        val active: Boolean = true
     )
 
     companion object {
@@ -67,7 +73,8 @@ class SeedRegistry(private val dir: () -> File) {
                         pieceCount = pieceCount,
                         fileSize = fileSize,
                         fileName = o.optString("fileName"),
-                        completedAt = o.optLong("completedAt", 0L)
+                        completedAt = o.optLong("completedAt", 0L),
+                        active = o.optBoolean("active", true)
                     )
                 }
             }
@@ -85,6 +92,15 @@ class SeedRegistry(private val dir: () -> File) {
 
     fun remove(fileId: String) = synchronized(lock) {
         if (entries().remove(fileId) != null) persist()
+    }
+
+    fun get(fileId: String): Entry? = synchronized(lock) { entries()[fileId] }
+
+    fun setActive(fileId: String, active: Boolean) = synchronized(lock) {
+        val entry = entries()[fileId] ?: return
+        if (entry.active == active) return
+        entries()[fileId] = entry.copy(active = active)
+        persist()
     }
 
     /** Entries for one stream — the set a channel rehydrates on open. */
@@ -120,6 +136,7 @@ class SeedRegistry(private val dir: () -> File) {
                     .put("fileSize", e.fileSize)
                     .put("fileName", e.fileName)
                     .put("completedAt", e.completedAt)
+                    .put("active", e.active)
             )
         }
         try {

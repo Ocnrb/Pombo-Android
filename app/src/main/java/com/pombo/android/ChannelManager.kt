@@ -1,4 +1,4 @@
-﻿package com.pombo.android
+package com.pombo.android
 
 import android.util.Log
 import com.pombo.android.bridge.PomboBridge
@@ -3298,6 +3298,23 @@ class ChannelManager(
         }
     }
 
+    /** Once per session — the "All" toggle is a filter, not a refresh button. */
+    @Volatile private var deepInviteCatchUpDone = false
+
+    /**
+     * On-demand DEEP replay of P3, for the bell's "All" view: the same
+     * idempotent funnel as the connect-time [catchUpInvites], just a much
+     * larger window — so historical invites resurface, answered ones landing
+     * in the dismissed list via [handleNotification]'s backfill and
+     * never-answered ones back in pending.
+     */
+    fun fetchAllInvites() {
+        if (deepInviteCatchUpDone) return
+        deepInviteCatchUpDone = true
+        val inbox = myInboxId ?: return
+        scope.launch { catchUpInvites(inbox, last = 100) }
+    }
+
     /**
      * Replays recent P3 invites from the inbox's storage node — a deliberate
      * improvement over the web, where an invite sent while no tab was open is
@@ -3305,7 +3322,7 @@ class ChannelManager(
      * drops duplicates, answered invites (dismissed ledger) and joined
      * channels, so re-running this on each connect is idempotent.
      */
-    private suspend fun catchUpInvites(inbox: String) {
+    private suspend fun catchUpInvites(inbox: String, last: Int = 20) {
         val res = try {
             // Undecryptable entries cost a full key-request timeout each while
             // the drain-side recovery registers keys and replays, so give this
@@ -3313,7 +3330,7 @@ class ChannelManager(
             bridge.call("resend", JSONObject()
                 .put("streamId", inbox)
                 .put("partition", StreamConstants.P_NOTIFICATIONS)
-                .put("last", 20)
+                .put("last", last)
                 .put("budgetMs", 35_000), 45_000)
         } catch (e: Exception) {
             android.util.Log.d("PomboInvites", "catchUp failed: ${e.message}")
@@ -3463,12 +3480,35 @@ class ChannelManager(
         val password: String?
     )
 
+    /** Dismissed invites retained in full for the bell's "All" view, newest first. */
+    private val _dismissedInvites = MutableStateFlow<List<PendingInvite>>(emptyList())
+    val dismissedInvites: StateFlow<List<PendingInvite>> = _dismissedInvites.asStateFlow()
+
     fun dismissInvite(inviteId: String) {
+        val invite = _pendingInvites.value.firstOrNull { it.inviteId == inviteId }
         _pendingInvites.value = _pendingInvites.value.filterNot { it.inviteId == inviteId }
         // Ledger it: the P3 catch-up replays recent invites from storage on
         // every connect, and an answered one must not resurface.
         inviteStore.markDismissed(inviteId)
+        // Retained in full: a dismiss can be a mis-tap, so the "All" view
+        // still offers Accept on it.
+        invite?.let { inviteStore.recordDismissed(storedOf(it)) }
         persistInvites()
+        reloadDismissedInvites()
+    }
+
+    /**
+     * The accept path's removal: the invite is RESOLVED, not dismissed — it
+     * must not linger in the "All" view (and accepting one FROM that view
+     * consumes its dismissed record). The id ledger entry is still written:
+     * replay suppression applies to answered invites of either kind.
+     */
+    fun resolveInvite(inviteId: String) {
+        _pendingInvites.value = _pendingInvites.value.filterNot { it.inviteId == inviteId }
+        inviteStore.markDismissed(inviteId)
+        inviteStore.removeDismissedRecord(inviteId)
+        persistInvites()
+        reloadDismissedInvites()
     }
 
     /** Restores invites received while the app was closed (P3 has no replay). */
@@ -3476,14 +3516,22 @@ class ChannelManager(
         _pendingInvites.value = inviteStore.load().map {
             PendingInvite(it.inviteId, it.from, it.streamId, it.name, it.type, it.password)
         }
+        reloadDismissedInvites()
     }
 
+    private fun reloadDismissedInvites() {
+        _dismissedInvites.value = inviteStore.dismissedInvites().map {
+            PendingInvite(it.inviteId, it.from, it.streamId, it.name, it.type, it.password)
+        }
+    }
+
+    private fun storedOf(invite: PendingInvite) =
+        com.pombo.android.data.InviteStore.StoredInvite(
+            invite.inviteId, invite.from, invite.streamId, invite.name, invite.type, invite.password
+        )
+
     private fun persistInvites() {
-        inviteStore.save(_pendingInvites.value.map {
-            com.pombo.android.data.InviteStore.StoredInvite(
-                it.inviteId, it.from, it.streamId, it.name, it.type, it.password
-            )
-        })
+        inviteStore.save(_pendingInvites.value.map { storedOf(it) })
     }
 
     /** Opens and files an incoming P3 notification (open first — sealed sender). */
@@ -3515,12 +3563,31 @@ class ChannelManager(
         val streamId = ch.optString("streamId").ifEmpty { return }
         val inviteId = decrypted.optString("inviteId").ifEmpty { streamId }
         if (_pendingInvites.value.any { it.inviteId == inviteId }) return
-        if (inviteStore.isDismissed(inviteId)) {
-            android.util.Log.d("PomboInvites", "drop invite $inviteId: already answered")
-            return
-        }
+        // Membership first: an invite to a channel we are in is moot whether
+        // it was answered or not — it must not backfill the dismissed list.
         if (_channels.value.any { it.messageStreamId == streamId }) {
             android.util.Log.d("PomboInvites", "drop invite for $streamId: already a member")
+            return
+        }
+        if (inviteStore.isDismissed(inviteId)) {
+            // Suppressed as pending — but the id ledger predates full record
+            // retention, so a replayed invite dismissed back then has content
+            // the store never kept. File it now, and the "All" view can offer
+            // those historical dismissals too.
+            if (inviteStore.dismissedInvites().none { it.inviteId == inviteId }) {
+                inviteStore.recordDismissed(
+                    com.pombo.android.data.InviteStore.StoredInvite(
+                        inviteId = inviteId,
+                        from = senderId,
+                        streamId = streamId,
+                        name = ch.optString("name").ifEmpty { streamId.substringAfter('/') },
+                        type = ch.optString("type").ifEmpty { "public" },
+                        password = if (ch.isNull("password")) null else ch.optString("password").ifEmpty { null }
+                    )
+                )
+                reloadDismissedInvites()
+            }
+            android.util.Log.d("PomboInvites", "drop invite $inviteId: already answered")
             return
         }
         _pendingInvites.value = _pendingInvites.value + PendingInvite(
@@ -6057,7 +6124,16 @@ class ChannelManager(
         val channelName: String,
         val messageStreamId: String,
         /** Upload-only: re-inserted if the user returns to the channel mid-upload. */
-        val uploadBubble: UiMessage? = null
+        val uploadBubble: UiMessage? = null,
+        /**
+         * Download-only: the announce + its timestamp, cached so
+         * [resumeStorageTransfer] can restart the transfer without the
+         * channel being open — the Active Transfers list it is called from
+         * lives outside any open channel, so [_messages] (scoped to whichever
+         * channel is on screen) is not a safe place to look this up from.
+         */
+        val meta: com.pombo.android.core.StorageMedia.StorageFileMetadata? = null,
+        val timestamp: Long = 0L
     )
 
     /**
@@ -6067,6 +6143,21 @@ class ChannelManager(
      * progress snapshots do not carry them.
      */
     private val storageTransferChannel = java.util.concurrent.ConcurrentHashMap<String, StorageTransferInfo>()
+
+    /** transferId -> the Job running its download, so pauseStorageTransfer() can cancel just that one. */
+    private val storageDownloadJobs = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    /**
+     * transferId -> "pausing" | "resuming": the gap between a tap and the
+     * engine confirming it. Cancellation is cooperative — a Job mid
+     * network-read only unwinds once that read returns — so the download's
+     * own status can lag either tap by seconds. The Active Transfers row
+     * flips its icon and shows "Pausing…"/"Resuming…" off this map instead
+     * of waiting that lag out. Entries are cleared by the owning Job's
+     * completion handler (see [launchStorageDownload]).
+     */
+    private val _storageTransferPhase = MutableStateFlow<Map<String, String>>(emptyMap())
+    val storageTransferPhase: StateFlow<Map<String, String>> = _storageTransferPhase.asStateFlow()
 
     fun storageTransferInfo(transferId: String): StorageTransferInfo? = storageTransferChannel[transferId]
 
@@ -6190,16 +6281,26 @@ class ChannelManager(
     }
 
     /**
-     * Starts downloading the storage-shared file announced by [messageId] in the
-     * open channel. The engine handles resume and the completed-file handoff; the
-     * bubble reflects [storageMedia].downloads. Non-DM only for now.
+     * Runs the actual download for [meta] against [channel] as a tracked Job.
+     * Shared by [downloadStorageFile] (channel + announce come from whatever is
+     * on screen) and [resumeStorageTransfer] (both come from caches instead,
+     * since that one is called from outside any open channel).
+     *
+     * [waitFor], when given, is joined first — cancellation is cooperative, so
+     * a Job just cancel()led by [pauseStorageTransfer] can still be unwinding
+     * (its status not yet flipped to "paused") when the user immediately taps
+     * resume. Starting a fresh download while that is still true would hit
+     * downloadFile()'s own isDownloading() guard and silently do nothing, so
+     * resumeStorageTransfer waits for the old Job to fully finish first.
      */
-    fun downloadStorageFile(messageId: String) {
-        scope.launch {
-            val channel = _current.value ?: return@launch
-            val msg = _messages.value.firstOrNull { it.id == messageId } ?: return@launch
-            val meta = msg.storageFile ?: return@launch
-            storageTransferChannel[meta.transferId] = StorageTransferInfo(meta.fileName, channelDisplayName(channel), channel.messageStreamId)
+    private fun launchStorageDownload(
+        channel: Channel,
+        meta: com.pombo.android.core.StorageMedia.StorageFileMetadata,
+        timestamp: Long,
+        waitFor: kotlinx.coroutines.Job? = null
+    ): kotlinx.coroutines.Job {
+        val job = scope.launch {
+            waitFor?.join()
             try {
                 if (channel.type == "dm") {
                     // Chunks live on OUR own inbox (the sender published there); the
@@ -6209,7 +6310,7 @@ class ChannelManager(
                     val peer = channel.peerAddress ?: return@launch
                     val peerPk = peerPubKey(peer) ?: throw IllegalStateException("Peer public key unavailable")
                     storageMedia.downloadFile(
-                        channel.messageStreamId, meta, msg.timestamp, channel.password,
+                        channel.messageStreamId, meta, timestamp, channel.password,
                         isDm = true, dmInboxStreamId = "$me/Pombo-DM-1", peerPublicKey = peerPk
                     )
                 } else if (isEpochChannel(channel)) {
@@ -6220,7 +6321,7 @@ class ChannelManager(
                     // blocks on the row handler as backpressure.
                     val gated = channel.type == "gated"
                     storageMedia.downloadFile(
-                        channel.messageStreamId, meta, msg.timestamp, password = null,
+                        channel.messageStreamId, meta, timestamp, password = null,
                         epochOpener = { bytes, ts ->
                             kotlinx.coroutines.runBlocking {
                                 epochKeys.tryOpenBinary(
@@ -6231,12 +6332,95 @@ class ChannelManager(
                         }
                     )
                 } else {
-                    storageMedia.downloadFile(channel.messageStreamId, meta, msg.timestamp, channel.password)
+                    storageMedia.downloadFile(channel.messageStreamId, meta, timestamp, channel.password)
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "storage download failed: ${e.message}")
+                if (e !is kotlinx.coroutines.CancellationException) {
+                    Log.w(TAG, "storage download failed: ${e.message}")
+                }
             }
         }
+        job.invokeOnCompletion {
+            // Clear this transfer's pausing/resuming phase, but only while this
+            // Job is still the registered one: a pause's unwind finishing after
+            // resume already installed its successor must not wipe the
+            // successor's "resuming" marker.
+            if (storageDownloadJobs[meta.transferId] === job) {
+                _storageTransferPhase.value = _storageTransferPhase.value - meta.transferId
+            }
+        }
+        return job
+    }
+
+    /**
+     * Starts downloading the storage-shared file announced by [messageId] in the
+     * open channel. The engine handles resume and the completed-file handoff; the
+     * bubble reflects [storageMedia].downloads. Non-DM only for now.
+     */
+    fun downloadStorageFile(messageId: String) {
+        val channel = _current.value ?: return
+        val msg = _messages.value.firstOrNull { it.id == messageId } ?: return
+        val meta = msg.storageFile ?: return
+        if (storageDownloadJobs[meta.transferId]?.isActive == true) return
+        storageTransferChannel[meta.transferId] = StorageTransferInfo(
+            meta.fileName, channelDisplayName(channel), channel.messageStreamId,
+            meta = meta, timestamp = msg.timestamp
+        )
+        storageDownloadJobs[meta.transferId] = launchStorageDownload(channel, meta, msg.timestamp)
+    }
+
+    /**
+     * Pauses a running storage download from the Active Transfers list: cancels
+     * just its Job. [StorageMedia.downloadFile]'s own cancellation handling keeps
+     * the staged bytes on disk (see its CancellationException branch), so
+     * [resumeStorageTransfer] continues from here instead of starting over.
+     * The "pausing" phase flips first — cancellation is cooperative, so the
+     * download's own status can lag the tap by a network read's worth of time;
+     * the Job's completion handler clears it once the unwind confirms.
+     */
+    fun pauseStorageTransfer(transferId: String) {
+        val job = storageDownloadJobs[transferId] ?: return
+        if (!job.isActive) return
+        _storageTransferPhase.value = _storageTransferPhase.value + (transferId to "pausing")
+        job.cancel()
+    }
+
+    /**
+     * Cancels a storage download: "I do not want this", the mesh
+     * cancelDownload's meaning — unlike [pauseStorageTransfer], the staged
+     * bytes are deleted once the Job unwinds. Works on paused downloads too
+     * (their Job already finished; join returns at once).
+     */
+    fun cancelStorageTransfer(transferId: String) {
+        _storageTransferPhase.value = _storageTransferPhase.value - transferId
+        val job = storageDownloadJobs.remove(transferId)
+        job?.cancel()
+        scope.launch {
+            job?.join()
+            storageMedia.discardDownload(transferId)
+        }
+    }
+
+    /**
+     * Resumes a storage download [pauseStorageTransfer] stopped. Deliberately
+     * does NOT go through [downloadStorageFile]/[_messages] — the Active
+     * Transfers list this is called from lives outside any open channel (see
+     * [storageTransferChannel]'s doc comment), so the announce and channel are
+     * resolved from caches that survive a channel switch instead.
+     */
+    fun resumeStorageTransfer(transferId: String) {
+        val previous = storageDownloadJobs[transferId]
+        // isActive alone cannot tell "running" from "cancelled but still
+        // unwinding" — and the instant icon flip invites the user to tap
+        // resume during exactly that unwind. During "pausing" the resume must
+        // win: the successor Job joins [previous] before touching the engine,
+        // so the old run has fully released the transfer by the time it starts.
+        if (previous?.isActive == true && _storageTransferPhase.value[transferId] != "pausing") return
+        val info = storageTransferChannel[transferId] ?: return
+        val meta = info.meta ?: return
+        val channel = _channels.value.firstOrNull { it.messageStreamId == info.messageStreamId } ?: return
+        storageDownloadJobs[transferId] = launchStorageDownload(channel, meta, info.timestamp, waitFor = previous)
+        _storageTransferPhase.value = _storageTransferPhase.value + (transferId to "resuming")
     }
 
     /** The completed storage download's file on disk, or null (for saving). */
@@ -6265,7 +6449,7 @@ class ChannelManager(
     /** Resumes a download [pauseTransfer] stopped, from wherever it left off. */
     fun resumeTransfer(fileId: String) = media.resumeDownload(fileId)
 
-    /** Stops serving a file, durably, from the Active Transfers list. */
+    /** Stops SERVING a file (bytes kept, reseed offered) from the Transfers list. */
     fun stopSeeding(fileId: String) {
         scope.launch {
             channelSwitchMutex.withLock {
@@ -6273,6 +6457,38 @@ class ChannelManager(
             }
         }
     }
+
+    /** Deletes a seed's bytes and record for good — the destructive half of the old stop. */
+    fun deleteSeed(fileId: String) {
+        scope.launch {
+            channelSwitchMutex.withLock {
+                releaseMediaIfIdle(media.deleteSeed(fileId))
+            }
+        }
+    }
+
+    /**
+     * Re-activates an inactive seed from the Transfers list. The password
+     * comes from the channel store — the registry deliberately does not hold
+     * it — so a seed whose channel was left cannot be reseeded (the row
+     * should not be offered for those). Runs under the channel-switch mutex
+     * because it brings media partitions up.
+     */
+    fun reseedFile(fileId: String, messageStreamId: String) {
+        scope.launch {
+            channelSwitchMutex.withLock {
+                val password = _channels.value.firstOrNull { it.messageStreamId == messageStreamId }?.password
+                try {
+                    media.reseedRegistered(fileId, password)
+                } catch (e: Exception) {
+                    Log.w(TAG, "reseed failed for $fileId: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /** Files held complete on disk but not being served — the Transfers list's "inactive" rows. */
+    fun inactiveSeeds() = media.inactiveSeeds()
 
     /**
      * Drops the media partitions a finished/cancelled transfer was holding,

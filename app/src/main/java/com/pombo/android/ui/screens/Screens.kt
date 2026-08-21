@@ -2479,17 +2479,22 @@ internal fun JoinChannelDialog(onDismiss: () -> Unit, onJoin: (String, String?) 
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        // Same frame as AddContactDialog/AboutDialog: a 1px hairline border
+        // and matching corner radius — the bare M3 surface is true black on
+        // true black and reads as text floating with no box around it.
+        modifier = Modifier.border(1.dp, PomboColors.Border, RoundedCornerShape(16.dp)),
+        shape = RoundedCornerShape(16.dp),
         containerColor = PomboColors.Surface,
         titleContentColor = PomboColors.Text,
         textContentColor = PomboColors.Text,
         title = { Text("Join a channel") },
         text = {
             Column {
-                Text("Paste the channel stream ID (e.g. 0x…/name-1)", color = PomboColors.TextDim, fontSize = 12.sp)
+                Text("Paste the channel ID (e.g. 0x…/name-1)", color = PomboColors.TextDim, fontSize = 12.sp)
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = id, onValueChange = { id = it },
-                    label = { Text("Stream ID") }, colors = pomboFieldColors(),
+                    label = { Text("Channel ID") }, colors = pomboFieldColors(),
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(12.dp))
@@ -2556,6 +2561,19 @@ fun ChatScreen(vm: AppViewModel) {
     val composerInput = rememberTextFieldState()
     val listState = rememberLazyListState()
     val ch = channel ?: return
+
+    // These targets point at messages of ONE channel; this composable
+    // survives channel switches, so without this reset a send in channel B
+    // would commit an edit/reply against a message that lives in channel A.
+    // The composer only clears when it holds an edit's pre-filled text —
+    // an ordinary draft survives the switch, as it always has.
+    LaunchedEffect(ch.messageStreamId) {
+        if (editTarget != null) {
+            editTarget = null
+            composerInput.clearText()
+        }
+        replyTarget = null
+    }
 
     val isPreview by vm.isPreview.collectAsState()
     val hasMoreHistory by vm.hasMoreHistory.collectAsState()
@@ -2845,14 +2863,16 @@ fun ChatScreen(vm: AppViewModel) {
                 }
                 // Same visual language as the message context menu: #16161b,
                 // white-10% border, radius 12, compact rows with icons. The
-                // Material default was oversized and icon-less.
+                // Material default was oversized and icon-less. Shape/color/
+                // border go on the menu's own surface — a rounded background
+                // on the content leaves the surface's square corners showing.
                 DropdownMenu(
                     expanded = chMenu,
                     onDismissRequest = { chMenu = false },
-                    modifier = Modifier
-                        .background(Color(0xFF16161B), RoundedCornerShape(12.dp))
-                        .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(12.dp))
-                        .widthIn(min = 180.dp)
+                    shape = RoundedCornerShape(12.dp),
+                    containerColor = Color(0xFF16161B),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.10f)),
+                    modifier = Modifier.widthIn(min = 180.dp)
                 ) {
                     val headerClipboard = androidx.compose.ui.platform.LocalClipboardManager.current
                     // The panel this opens is titled "Channel Details" in the
@@ -3803,10 +3823,12 @@ private fun OnlineUsersDropdown(
     val ensAvatars by vm.ensAvatars.collectAsState()
     DropdownMenu(
         expanded = expanded, onDismissRequest = onDismiss,
-        modifier = Modifier
-            .background(Color(0xFF1E1E1E), RoundedCornerShape(12.dp))
-            .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(12.dp))
-            .width(224.dp).heightIn(max = 240.dp)
+        // Shape/color/border on the menu's own surface — a rounded background
+        // on the content leaves the surface's square corners showing behind.
+        shape = RoundedCornerShape(12.dp),
+        containerColor = Color(0xFF1E1E1E),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.10f)),
+        modifier = Modifier.width(224.dp).heightIn(max = 240.dp)
     ) {
         if (users.isEmpty()) {
             Text(
@@ -4679,10 +4701,12 @@ private fun MemberKebab(
 ) {
     DropdownMenu(
         expanded = expanded, onDismissRequest = onDismiss,
-        modifier = Modifier
-            .background(Color(0xFF16161B), RoundedCornerShape(12.dp))
-            .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(12.dp))
-            .width(230.dp)
+        // Shape/color/border on the menu's own surface — a rounded background
+        // on the content leaves the surface's square corners showing behind.
+        shape = RoundedCornerShape(12.dp),
+        containerColor = Color(0xFF16161B),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.10f)),
+        modifier = Modifier.width(230.dp)
     ) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
             Text("Member", color = Color.White.copy(alpha = 0.40f), fontSize = 11.sp)

@@ -26,7 +26,16 @@ class InviteStore(context: Context) {
 
     fun load(): List<StoredInvite> {
         if (scopeAddress.isNullOrEmpty()) return emptyList()
-        val raw = prefs.getString(key(), null) ?: return emptyList()
+        return parseInvites(prefs.getString(key(), null))
+    }
+
+    fun save(invites: List<StoredInvite>) {
+        if (scopeAddress.isNullOrEmpty()) return
+        prefs.edit().putString(key(), serializeInvites(invites)).apply()
+    }
+
+    private fun parseInvites(raw: String?): List<StoredInvite> {
+        if (raw == null) return emptyList()
         return try {
             val arr = JSONArray(raw)
             (0 until arr.length()).mapNotNull { i ->
@@ -45,8 +54,7 @@ class InviteStore(context: Context) {
         }
     }
 
-    fun save(invites: List<StoredInvite>) {
-        if (scopeAddress.isNullOrEmpty()) return
+    private fun serializeInvites(invites: List<StoredInvite>): String {
         val arr = JSONArray()
         invites.forEach {
             arr.put(
@@ -59,7 +67,7 @@ class InviteStore(context: Context) {
                     .put("password", it.password ?: JSONObject.NULL)
             )
         }
-        prefs.edit().putString(key(), arr.toString()).apply()
+        return arr.toString()
     }
 
     /**
@@ -90,6 +98,35 @@ class InviteStore(context: Context) {
 
     private fun dismissedKey(): String = "${DISMISSED}_${scopeAddress!!.lowercase()}"
 
+    /**
+     * Full records of dismissed invites, newest dismissal first — the bell's
+     * "All" view renders these so a mis-tapped dismiss stays acceptable.
+     * Separate from the id ledger above: the ledger remembers the last 200
+     * ids purely for replay suppression, this keeps the last
+     * [MAX_DISMISSED_RECORDS] complete, renderable invites.
+     */
+    fun dismissedInvites(): List<StoredInvite> {
+        if (scopeAddress.isNullOrEmpty()) return emptyList()
+        return parseInvites(prefs.getString(dismissedFullKey(), null))
+    }
+
+    fun recordDismissed(invite: StoredInvite) {
+        if (scopeAddress.isNullOrEmpty()) return
+        val list = dismissedInvites().filterNot { it.inviteId == invite.inviteId }.toMutableList()
+        list.add(0, invite)
+        while (list.size > MAX_DISMISSED_RECORDS) list.removeAt(list.size - 1)
+        prefs.edit().putString(dismissedFullKey(), serializeInvites(list)).apply()
+    }
+
+    /** Accepting an invite from the "All" view consumes its dismissed record. */
+    fun removeDismissedRecord(inviteId: String) {
+        if (scopeAddress.isNullOrEmpty()) return
+        val list = dismissedInvites().filterNot { it.inviteId == inviteId }
+        prefs.edit().putString(dismissedFullKey(), serializeInvites(list)).apply()
+    }
+
+    private fun dismissedFullKey(): String = "${DISMISSED_FULL}_${scopeAddress!!.lowercase()}"
+
     data class StoredInvite(
         val inviteId: String,
         val from: String,
@@ -102,5 +139,7 @@ class InviteStore(context: Context) {
     private companion object {
         const val KEY = "pending_invites"
         const val DISMISSED = "dismissed_invites"
+        const val DISMISSED_FULL = "dismissed_invites_full"
+        const val MAX_DISMISSED_RECORDS = 50
     }
 }
