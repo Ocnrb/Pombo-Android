@@ -1,5 +1,13 @@
 package com.pombo.android.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -26,6 +34,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -106,9 +115,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathOperation
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
@@ -265,65 +282,22 @@ fun MainShell(vm: AppViewModel) {
                 .padding(bottom = PILL_NAV_BOTTOM_OFFSET),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            if (settingsMenu) {
-                // Centred on the Settings icon (web anchors it to that pill
-                // item), not on the pill as a whole — but clamped so a menu
-                // wider than the space left of the icon cannot run off screen.
-                val density = androidx.compose.ui.platform.LocalDensity.current
-                val screenW = with(density) {
-                    androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
-                }
-                var menuW by remember { mutableFloatStateOf(0f) }
-                val margin = with(density) { 8.dp.toPx() }
-                Box(Modifier.fillMaxWidth()) {
-                    Box(
-                        Modifier
-                            .align(Alignment.CenterStart)
-                            .offset {
-                                val x = (settingsAnchorX - menuW / 2f)
-                                    .coerceIn(margin, (screenW - menuW - margin).coerceAtLeast(margin))
-                                androidx.compose.ui.unit.IntOffset(x.toInt(), 0)
-                            }
-                            .onSizeChanged { menuW = it.width.toFloat() }
-                    ) {
-                        SettingsDropdown(
-                            current = SettingsPanel.entries[settingsPager.currentPage],
-                            // Guests have no inbox to sync to, so the web hides this.
-                            syncRow = if (!isGuest) ({ SyncDevicesRow(vm) }) else null
-                        ) { panel ->
-                            settingsMenu = false
-                            tab = Tab.SETTINGS
-                            scope.launch { settingsPager.animateScrollToPage(panel.ordinal) }
-                        }
-                    }
+            PillMenuAnchor(visible = settingsMenu, anchorX = settingsAnchorX, width = 200.dp) {
+                SettingsDropdown(
+                    current = SettingsPanel.entries[settingsPager.currentPage],
+                    // Guests have no inbox to sync to, so the web hides this.
+                    syncRow = if (!isGuest) ({ SyncDevicesRow(vm) }) else null
+                ) { panel ->
+                    settingsMenu = false
+                    tab = Tab.SETTINGS
+                    scope.launch { settingsPager.animateScrollToPage(panel.ordinal) }
                 }
             }
-            if (exploreMenu) {
-                // Same anchoring approach as the Settings dropdown above,
-                // centred on the Explore pill item instead.
-                val density = androidx.compose.ui.platform.LocalDensity.current
-                val screenW = with(density) {
-                    androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
-                }
-                var menuW by remember { mutableFloatStateOf(0f) }
-                val margin = with(density) { 8.dp.toPx() }
-                Box(Modifier.fillMaxWidth()) {
-                    Box(
-                        Modifier
-                            .align(Alignment.CenterStart)
-                            .offset {
-                                val x = (exploreAnchorX - menuW / 2f)
-                                    .coerceIn(margin, (screenW - menuW - margin).coerceAtLeast(margin))
-                                androidx.compose.ui.unit.IntOffset(x.toInt(), 0)
-                            }
-                            .onSizeChanged { menuW = it.width.toFloat() }
-                    ) {
-                        ExploreDropdown {
-                            exploreMenu = false
-                            tab = Tab.EXPLORE
-                            vm.setChatOrigin(com.pombo.android.AppViewModel.ChatOrigin.EXPLORE)
-                        }
-                    }
+            PillMenuAnchor(visible = exploreMenu, anchorX = exploreAnchorX, width = 220.dp) {
+                ExploreDropdown {
+                    exploreMenu = false
+                    tab = Tab.EXPLORE
+                    vm.setChatOrigin(com.pombo.android.AppViewModel.ChatOrigin.EXPLORE)
                 }
             }
             PillNav(
@@ -368,6 +342,102 @@ fun MainShell(vm: AppViewModel) {
 
     if (showJoin) JoinChannelDialog(onDismiss = { showJoin = false }) { id, pwd ->
         vm.joinChannel(id, pwd); showJoin = false
+    }
+}
+
+/**
+ * Silhouette of a pill dropdown: rounded card plus a caret pointing down at
+ * [caretCenterX] (px, in the card's own coordinates). The two are united into
+ * one path so background and border treat them as a single surface — no seam
+ * where the caret meets the card. The caret clamps clear of the rounded
+ * corners; the card itself may be clamped to the screen edge, so the caret
+ * position is what keeps pointing at the pill icon.
+ */
+private fun pillMenuShape(
+    caretCenterX: Float,
+    caretHalfWidthPx: Float,
+    caretHeightPx: Float,
+    cornerRadiusPx: Float
+): GenericShape = GenericShape { size, _ ->
+    val bodyBottom = size.height - caretHeightPx
+    val body = Path().apply {
+        addRoundRect(RoundRect(0f, 0f, size.width, bodyBottom, CornerRadius(cornerRadiusPx)))
+    }
+    val cx = caretCenterX.coerceIn(
+        cornerRadiusPx + caretHalfWidthPx,
+        size.width - cornerRadiusPx - caretHalfWidthPx
+    )
+    val caret = Path().apply {
+        // Starts 1px inside the card so the union has real overlap to fuse.
+        moveTo(cx - caretHalfWidthPx, bodyBottom - 1f)
+        lineTo(cx, size.height)
+        lineTo(cx + caretHalfWidthPx, bodyBottom - 1f)
+        close()
+    }
+    addPath(Path.combine(PathOperation.Union, body, caret))
+}
+
+/**
+ * Anchored, animated shell shared by the pill's dropdown menus (web:
+ * .pill-settings-dropdown / dropdownOpenUp). Scales up from the caret tip —
+ * the menu visibly grows out of the icon that opened it — and the card clamps
+ * to the screen edge while the caret keeps following [anchorX].
+ */
+@Composable
+private fun PillMenuAnchor(
+    visible: Boolean,
+    /** Centre x of the owning pill icon, in root coordinates. */
+    anchorX: Float,
+    width: Dp,
+    content: @Composable () -> Unit
+) {
+    val density = LocalDensity.current
+    val screenW = with(density) {
+        androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
+    }
+    val menuW = with(density) { width.toPx() }
+    val margin = with(density) { 8.dp.toPx() }
+    val menuX = (anchorX - menuW / 2f).coerceIn(margin, (screenW - menuW - margin).coerceAtLeast(margin))
+    val origin = TransformOrigin(if (screenW > 0f) anchorX / screenW else 0.5f, 1f)
+    val rise = with(density) { 4.dp.roundToPx() }
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(tween(160)) +
+            scaleIn(tween(160), initialScale = 0.95f, transformOrigin = origin) +
+            slideInVertically(tween(160)) { rise },
+        exit = fadeOut(tween(120)) +
+            scaleOut(tween(120), targetScale = 0.95f, transformOrigin = origin) +
+            slideOutVertically(tween(120)) { rise }
+    ) {
+        val shape = remember(anchorX, menuX, menuW) {
+            with(density) {
+                pillMenuShape(
+                    caretCenterX = anchorX - menuX,
+                    caretHalfWidthPx = 8.dp.toPx(),
+                    caretHeightPx = 7.dp.toPx(),
+                    cornerRadiusPx = 16.dp.toPx()
+                )
+            }
+        }
+        Box(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
+            Box(
+                Modifier
+                    .offset { IntOffset(menuX.toInt(), 0) }
+                    .width(width)
+                    .shadow(16.dp, shape, clip = false)
+                    // Opaque, unlike the web's 0.97 + blur(20px): Compose has
+                    // no backdrop blur, and on a near-black ground even 1.5%
+                    // transmission leaves bright text behind readable through
+                    // the card.
+                    .background(Color(0xFF16161B), shape)
+                    .border(1.dp, Color.White.copy(alpha = 0.10f), shape)
+                    // Keep content out of the shape's caret band.
+                    .padding(bottom = 7.dp)
+                    .padding(8.dp)
+            ) {
+                content()
+            }
+        }
     }
 }
 
@@ -2995,14 +3065,8 @@ private fun SyncDevicesRow(vm: AppViewModel) {
  */
 @Composable
 private fun ExploreDropdown(onPickThreads: () -> Unit) {
-    Column(
-        Modifier
-            .padding(bottom = 6.dp)
-            .width(220.dp)
-            .background(Color(0xFF16161B).copy(alpha = 0.92f), RoundedCornerShape(16.dp))
-            .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(16.dp))
-            .padding(8.dp)
-    ) {
+    // Card chrome (shape, fill, caret, animation) lives in PillMenuAnchor.
+    Column {
         Row(
             Modifier.fillMaxWidth()
                 .background(Color.White.copy(alpha = 0.08f), RoundedCornerShape(8.dp))
@@ -3048,14 +3112,8 @@ private fun SettingsDropdown(
     syncRow: (@Composable () -> Unit)? = null,
     onPick: (SettingsPanel) -> Unit
 ) {
-    Column(
-        Modifier
-            .padding(bottom = 6.dp)
-            .width(200.dp)
-            .background(Color(0xFF16161B).copy(alpha = 0.92f), RoundedCornerShape(16.dp))
-            .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(16.dp))
-            .padding(8.dp)
-    ) {
+    // Card chrome (shape, fill, caret, animation) lives in PillMenuAnchor.
+    Column {
         SettingsPanel.entries.forEachIndexed { i, panel ->
             // Web: `<hr class="border-white/[0.06] my-0.5">` between sections.
             val previous = SettingsPanel.entries.getOrNull(i - 1)
