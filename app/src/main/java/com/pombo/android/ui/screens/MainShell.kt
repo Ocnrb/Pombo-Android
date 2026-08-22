@@ -115,6 +115,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.RoundRect
@@ -123,7 +124,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathOperation
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.text.font.FontWeight
@@ -345,36 +348,43 @@ fun MainShell(vm: AppViewModel) {
     }
 }
 
+/** Caret and corner geometry, shared by a pill menu's fill and its outline. */
+private val PILL_MENU_CARET_HALF_WIDTH = 8.dp
+private val PILL_MENU_CARET_HEIGHT = 7.dp
+private val PILL_MENU_CORNER = 16.dp
+
 /**
  * Silhouette of a pill dropdown: rounded card plus a caret pointing down at
  * [caretCenterX] (px, in the card's own coordinates). The two are united into
- * one path so background and border treat them as a single surface — no seam
- * where the caret meets the card. The caret clamps clear of the rounded
- * corners; the card itself may be clamped to the screen edge, so the caret
- * position is what keeps pointing at the pill icon.
+ * one path so fill and outline treat them as a single surface — no seam where
+ * the caret meets the card. The caret clamps clear of the rounded corners; the
+ * card itself may be clamped to the screen edge, so the caret position is what
+ * keeps pointing at the pill icon.
  */
-private fun pillMenuShape(
-    caretCenterX: Float,
-    caretHalfWidthPx: Float,
-    caretHeightPx: Float,
-    cornerRadiusPx: Float
-): GenericShape = GenericShape { size, _ ->
-    val bodyBottom = size.height - caretHeightPx
+private fun Density.pillMenuPath(
+    width: Float,
+    height: Float,
+    caretCenterX: Float
+): Path {
+    val caretHalfWidth = PILL_MENU_CARET_HALF_WIDTH.toPx()
+    val corner = PILL_MENU_CORNER.toPx()
+    val bodyBottom = height - PILL_MENU_CARET_HEIGHT.toPx()
     val body = Path().apply {
-        addRoundRect(RoundRect(0f, 0f, size.width, bodyBottom, CornerRadius(cornerRadiusPx)))
+        addRoundRect(RoundRect(0f, 0f, width, bodyBottom, CornerRadius(corner)))
     }
-    val cx = caretCenterX.coerceIn(
-        cornerRadiusPx + caretHalfWidthPx,
-        size.width - cornerRadiusPx - caretHalfWidthPx
-    )
+    val cx = caretCenterX.coerceIn(corner + caretHalfWidth, width - corner - caretHalfWidth)
     val caret = Path().apply {
         // Starts 1px inside the card so the union has real overlap to fuse.
-        moveTo(cx - caretHalfWidthPx, bodyBottom - 1f)
-        lineTo(cx, size.height)
-        lineTo(cx + caretHalfWidthPx, bodyBottom - 1f)
+        moveTo(cx - caretHalfWidth, bodyBottom - 1f)
+        lineTo(cx, height)
+        lineTo(cx + caretHalfWidth, bodyBottom - 1f)
         close()
     }
-    addPath(Path.combine(PathOperation.Union, body, caret))
+    return Path.combine(PathOperation.Union, body, caret)
+}
+
+private fun Density.pillMenuShape(caretCenterX: Float): GenericShape = GenericShape { size, _ ->
+    addPath(pillMenuPath(size.width, size.height, caretCenterX))
 }
 
 /**
@@ -409,16 +419,8 @@ private fun PillMenuAnchor(
             scaleOut(tween(120), targetScale = 0.95f, transformOrigin = origin) +
             slideOutVertically(tween(120)) { rise }
     ) {
-        val shape = remember(anchorX, menuX, menuW) {
-            with(density) {
-                pillMenuShape(
-                    caretCenterX = anchorX - menuX,
-                    caretHalfWidthPx = 8.dp.toPx(),
-                    caretHeightPx = 7.dp.toPx(),
-                    cornerRadiusPx = 16.dp.toPx()
-                )
-            }
-        }
+        val caretCenterX = anchorX - menuX
+        val shape = remember(caretCenterX, density) { with(density) { pillMenuShape(caretCenterX) } }
         Box(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
             Box(
                 Modifier
@@ -430,9 +432,19 @@ private fun PillMenuAnchor(
                     // transmission leaves bright text behind readable through
                     // the card.
                     .background(Color(0xFF16161B), shape)
-                    .border(1.dp, Color.White.copy(alpha = 0.10f), shape)
+                    // Stroked by hand rather than with Modifier.border: given a
+                    // generic path, border renders the outline at a fraction of
+                    // the requested alpha (measured 2/255 of lift for 0.10
+                    // white), which erased the hairline the web draws.
+                    .drawBehind {
+                        drawPath(
+                            pillMenuPath(size.width, size.height, caretCenterX),
+                            color = Color.White.copy(alpha = 0.10f),
+                            style = Stroke(1.dp.toPx())
+                        )
+                    }
                     // Keep content out of the shape's caret band.
-                    .padding(bottom = 7.dp)
+                    .padding(bottom = PILL_MENU_CARET_HEIGHT)
                     .padding(8.dp)
             ) {
                 content()
